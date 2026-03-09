@@ -149,9 +149,7 @@ async fn main() -> Result<()> {
         Command::Serve => {
             let includes = cli.include.clone();
             let (interval, coalesce_ms) = if cli.turbo {
-                eprintln!(
-                    "[vertigo-sync] turbo mode: 10ms coalesce, native fsevents"
-                );
+                eprintln!("[vertigo-sync] turbo mode: 10ms coalesce, native fsevents");
                 (Duration::from_millis(100), 10u64)
             } else {
                 (
@@ -260,8 +258,16 @@ fn command_event(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
         },
         paths: EventPaths {
             added: diff.added.iter().map(|entry| entry.path.clone()).collect(),
-            modified: diff.modified.iter().map(|entry| entry.path.clone()).collect(),
-            deleted: diff.deleted.iter().map(|entry| entry.path.clone()).collect(),
+            modified: diff
+                .modified
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect(),
+            deleted: diff
+                .deleted
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect(),
         },
     };
 
@@ -320,7 +326,10 @@ fn command_doctor(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&report)?);
 
-    if !report["determinism"]["deterministic"].as_bool().unwrap_or(false) {
+    if !report["determinism"]["deterministic"]
+        .as_bool()
+        .unwrap_or(false)
+    {
         bail!("doctor detected non-deterministic snapshots")
     }
 
@@ -360,7 +369,10 @@ fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
         } else {
             issue.path.clone()
         };
-        println!("{severity_tag}[{}]: {location}: {}", issue.rule, issue.message);
+        println!(
+            "{severity_tag}[{}]: {location}: {}",
+            issue.rule, issue.message
+        );
     }
 
     // Optionally run selene if available.
@@ -420,9 +432,7 @@ fn command_watch_native(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> 
         .unwrap_or_else(|| state_dir.to_path_buf());
 
     let coalesce_ms = if cli.turbo {
-        eprintln!(
-            "[vertigo-sync] turbo mode: 10ms coalesce, native fsevents"
-        );
+        eprintln!("[vertigo-sync] turbo mode: 10ms coalesce, native fsevents");
         10
     } else {
         cli.coalesce_ms
@@ -458,11 +468,7 @@ fn command_build(root: &Path, output: &Path, project: &Path) -> Result<()> {
     }
 
     // Build a snapshot to show what files would be included.
-    let fs_paths: Vec<String> = tree
-        .mappings
-        .iter()
-        .map(|m| m.fs_path.clone())
-        .collect();
+    let fs_paths: Vec<String> = tree.mappings.iter().map(|m| m.fs_path.clone()).collect();
     let snapshot = build_snapshot(root, &fs_paths)?;
     println!("  source files: {}", snapshot.entries.len());
     println!("  fingerprint:  {}", snapshot.fingerprint);

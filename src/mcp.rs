@@ -5,16 +5,27 @@
 //!
 //!   GET  /mcp/tools   — JSON array of tool definitions
 //!   POST /mcp/execute — Execute a tool by name with arguments
+//!
+//! ## Agent DSL Philosophy
+//!
+//! Every tool is composable. Agents build workflows from atomic operations:
+//!
+//!   vsync_source → vsync_validate_content → vsync_safe_write → vsync_diff
+//!
+//! Read ops are side-effect-free. Write ops rebuild the snapshot atomically.
+//! Validation ops work on content in memory without touching disk.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
 use regex::Regex;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::project::parse_project;
 use crate::validate;
@@ -33,23 +44,19 @@ fn param(name: &str, typ: &str, description: &str, required: bool) -> serde_json
     })
 }
 
-fn tool_def(
-    name: &str,
-    description: &str,
-    params: Vec<serde_json::Value>,
-) -> serde_json::Value {
+fn tool_def(name: &str, description: &str, params: Vec<serde_json::Value>) -> serde_json::Value {
     let mut properties = serde_json::Map::new();
     let mut required_fields: Vec<String> = Vec::new();
 
     for p in &params {
         let param_name = p["name"].as_str().unwrap_or_default().to_string();
         let mut schema = serde_json::Map::new();
-        schema.insert(
-            "type".to_string(),
-            p["type"].clone(),
-        );
+        schema.insert("type".to_string(), p["type"].clone());
         if let Some(desc) = p["description"].as_str() {
-            schema.insert("description".to_string(), serde_json::Value::String(desc.to_string()));
+            schema.insert(
+                "description".to_string(),
+                serde_json::Value::String(desc.to_string()),
+            );
         }
         if p["required"].as_bool().unwrap_or(false) {
             required_fields.push(param_name.clone());
@@ -79,6 +86,7 @@ fn tool_def(
 
 pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
     Json(vec![
+        // ── Existing tools ──────────────────────────────────────────
         tool_def(
             "vsync_health",
             "Check vertigo-sync server health and version",
@@ -149,18 +157,182 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
             "Search source files by content pattern (ripgrep-style)",
             vec![
                 param("pattern", "string", "Regex pattern to search for", true),
-                param(
-                    "glob",
-                    "string",
-                    "File glob filter (e.g. *.luau)",
-                    false,
-                ),
+                param("glob", "string", "File glob filter (e.g. *.luau)", false),
             ],
         ),
         tool_def(
             "vsync_stats",
             "Get source tree statistics (file count, total bytes, by extension)",
             vec![],
+        ),
+        // ── New: Read operations (composable) ───────────────────────
+        tool_def(
+            "vsync_ls",
+            "List files in a directory within the source tree",
+            vec![
+                param(
+                    "path",
+                    "string",
+                    "Relative directory path (e.g. src/Server/Services)",
+                    true,
+                ),
+                param(
+                    "recursive",
+                    "boolean",
+                    "Include subdirectories (default false)",
+                    false,
+                ),
+            ],
+        ),
+        tool_def(
+            "vsync_read_batch",
+            "Read multiple source files in one call",
+            vec![param(
+                "paths",
+                "array",
+                "Array of relative file paths to read",
+                true,
+            )],
+        ),
+        tool_def(
+            "vsync_file_info",
+            "Get metadata for a file (hash, size, last modified) without content",
+            vec![param("path", "string", "Relative file path", true)],
+        ),
+        tool_def(
+            "vsync_grep",
+            "Search source files with context lines (like rg -C)",
+            vec![
+                param("pattern", "string", "Regex pattern", true),
+                param("glob", "string", "File glob filter", false),
+                param(
+                    "context",
+                    "number",
+                    "Lines of context before/after match (default 2)",
+                    false,
+                ),
+                param(
+                    "max_results",
+                    "number",
+                    "Maximum results (default 100)",
+                    false,
+                ),
+            ],
+        ),
+        // ── New: Write operations (composable) ──────────────────────
+        tool_def(
+            "vsync_write",
+            "Write content to a single source file (UTF-8 text, no base64)",
+            vec![
+                param("path", "string", "Relative file path", true),
+                param("content", "string", "File content (UTF-8 text)", true),
+            ],
+        ),
+        tool_def(
+            "vsync_delete",
+            "Delete a source file",
+            vec![param(
+                "path",
+                "string",
+                "Relative file path to delete",
+                true,
+            )],
+        ),
+        tool_def(
+            "vsync_move",
+            "Move/rename a source file",
+            vec![
+                param("from", "string", "Current relative path", true),
+                param("to", "string", "New relative path", true),
+            ],
+        ),
+        tool_def(
+            "vsync_mkdir",
+            "Create a directory in the source tree",
+            vec![param(
+                "path",
+                "string",
+                "Relative directory path to create",
+                true,
+            )],
+        ),
+        // ── New: Validation operations (composable) ─────────────────
+        tool_def(
+            "vsync_validate_content",
+            "Validate Luau content without writing to disk",
+            vec![
+                param(
+                    "path",
+                    "string",
+                    "Virtual file path (for lint context)",
+                    true,
+                ),
+                param("content", "string", "Luau source content to validate", true),
+            ],
+        ),
+        tool_def(
+            "vsync_check_conflict",
+            "Check if a path would conflict (case-insensitive collision, etc)",
+            vec![param("path", "string", "Proposed file path", true)],
+        ),
+        // ── New: Pipeline operations (composable workflows) ─────────
+        tool_def(
+            "vsync_safe_write",
+            "Write file only if validation passes (atomic validate+write)",
+            vec![
+                param("path", "string", "Relative file path", true),
+                param("content", "string", "File content", true),
+                param(
+                    "require_strict",
+                    "boolean",
+                    "Require --!strict on line 1 (default true)",
+                    false,
+                ),
+            ],
+        ),
+        tool_def(
+            "vsync_describe_changes",
+            "Describe current uncommitted changes in natural language",
+            vec![param(
+                "since_hash",
+                "string",
+                "Previous snapshot hash (optional, uses earliest known)",
+                false,
+            )],
+        ),
+        tool_def(
+            "vsync_tree",
+            "Get source tree structure as indented text",
+            vec![
+                param(
+                    "path",
+                    "string",
+                    "Root path to start from (default: project root)",
+                    false,
+                ),
+                param(
+                    "depth",
+                    "number",
+                    "Maximum depth (default 3)",
+                    false,
+                ),
+            ],
+        ),
+        // ── New: Observability operations ───────────────────────────
+        tool_def(
+            "vsync_status",
+            "Get comprehensive sync status (connections, last event, latency, snapshot age)",
+            vec![],
+        ),
+        tool_def(
+            "vsync_events",
+            "Get recent sync events with sequence numbers",
+            vec![param(
+                "limit",
+                "number",
+                "Number of recent events (default 10)",
+                false,
+            )],
         ),
     ])
 }
@@ -181,6 +353,7 @@ pub async fn handle_mcp_execute(
     Json(req): Json<McpExecuteRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let result = match req.tool.as_str() {
+        // Existing tools
         "vsync_health" => exec_health(),
         "vsync_snapshot" => exec_snapshot(&state),
         "vsync_diff" => exec_diff(&state, &req.arguments),
@@ -193,17 +366,101 @@ pub async fn handle_mcp_execute(
         "vsync_project" => exec_project(&state),
         "vsync_search" => exec_search(&state, &req.arguments),
         "vsync_stats" => exec_stats(&state),
-        _ => Err((
-            StatusCode::NOT_FOUND,
-            format!("unknown tool: {}", req.tool),
-        )),
+        // New: Read operations
+        "vsync_ls" => exec_ls(&state, &req.arguments),
+        "vsync_read_batch" => exec_read_batch(&state, &req.arguments),
+        "vsync_file_info" => exec_file_info(&state, &req.arguments),
+        "vsync_grep" => exec_grep(&state, &req.arguments),
+        // New: Write operations
+        "vsync_write" => exec_write(&state, &req.arguments),
+        "vsync_delete" => exec_delete(&state, &req.arguments),
+        "vsync_move" => exec_move(&state, &req.arguments),
+        "vsync_mkdir" => exec_mkdir(&state, &req.arguments),
+        // New: Validation operations
+        "vsync_validate_content" => exec_validate_content(&req.arguments),
+        "vsync_check_conflict" => exec_check_conflict(&state, &req.arguments),
+        // New: Pipeline operations
+        "vsync_safe_write" => exec_safe_write(&state, &req.arguments),
+        "vsync_describe_changes" => exec_describe_changes(&state, &req.arguments),
+        "vsync_tree" => exec_tree(&state, &req.arguments),
+        // New: Observability operations
+        "vsync_status" => exec_status(&state),
+        "vsync_events" => exec_events(&state, &req.arguments),
+        _ => Err((StatusCode::NOT_FOUND, format!("unknown tool: {}", req.tool))),
     }?;
 
     Ok(Json(result))
 }
 
 // ---------------------------------------------------------------------------
-// Tool implementations
+// Path validation helper — reused by all tools that accept relative paths.
+// ---------------------------------------------------------------------------
+
+/// Validate a relative path is safe (no traversal, no absolute). Returns
+/// the resolved absolute path under `source_root`.
+fn validate_path(
+    source_root: &Path,
+    raw_path: &str,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let candidate = Path::new(raw_path);
+    if candidate.is_absolute() {
+        return Err((StatusCode::BAD_REQUEST, "absolute paths not allowed".into()));
+    }
+    for component in candidate.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err((StatusCode::BAD_REQUEST, "path traversal not allowed".into()));
+        }
+    }
+    Ok(source_root.join(candidate))
+}
+
+/// Canonicalize the project root for path safety checks.
+fn canon_root(state: &ServerState) -> Result<PathBuf, (StatusCode, String)> {
+    state
+        .root
+        .canonicalize()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// Rebuild the snapshot and update current + history in state. Returns the
+/// new fingerprint.
+fn rebuild_snapshot(state: &ServerState) -> Result<String, (StatusCode, String)> {
+    let new_snapshot = build_snapshot(&state.root, &state.includes)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let new_hash = new_snapshot.fingerprint.clone();
+    let new_arc = Arc::new(new_snapshot);
+
+    {
+        let mut lock = state
+            .current
+            .lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        *lock = Arc::clone(&new_arc);
+    }
+    {
+        let mut lock = state
+            .history
+            .lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        lock.insert(new_hash.clone(), new_arc);
+    }
+
+    Ok(new_hash)
+}
+
+/// Compute SHA-256 of bytes, return hex string.
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
+// ---------------------------------------------------------------------------
+// Existing tool implementations
 // ---------------------------------------------------------------------------
 
 fn exec_health() -> Result<serde_json::Value, (StatusCode, String)> {
@@ -226,9 +483,12 @@ fn exec_diff(
     state: &ServerState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let since_hash = args["since_hash"]
-        .as_str()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing required param: since_hash".into()))?;
+    let since_hash = args["since_hash"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: since_hash".into(),
+        )
+    })?;
 
     let old = {
         let lock = state
@@ -282,29 +542,15 @@ fn exec_source(
     state: &ServerState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let raw_path = args["path"]
-        .as_str()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing required param: path".into()))?;
+    let raw_path = args["path"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: path".into(),
+        )
+    })?;
 
-    let candidate = Path::new(raw_path);
-    if candidate.is_absolute() {
-        return Err((StatusCode::BAD_REQUEST, "absolute paths not allowed".into()));
-    }
-    for component in candidate.components() {
-        if matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
-            return Err((StatusCode::BAD_REQUEST, "path traversal not allowed".into()));
-        }
-    }
-
-    let source_root = state
-        .root
-        .canonicalize()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let target = source_root.join(candidate);
+    let source_root = canon_root(state)?;
+    let target = validate_path(&source_root, raw_path)?;
     let resolved = target
         .canonicalize()
         .map_err(|_| (StatusCode::NOT_FOUND, format!("file not found: {raw_path}")))?;
@@ -316,10 +562,7 @@ fn exec_source(
     let content = std::fs::read_to_string(&resolved)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = sha256_hex(content.as_bytes());
 
     Ok(serde_json::json!({
         "path": raw_path,
@@ -366,14 +609,14 @@ fn exec_patch(
     state: &ServerState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let patches = args["patches"]
-        .as_array()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing required param: patches (array)".into()))?;
+    let patches = args["patches"].as_array().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: patches (array)".into(),
+        )
+    })?;
 
-    let source_root = state
-        .root
-        .canonicalize()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let source_root = canon_root(state)?;
 
     let mut applied = 0usize;
     let mut errors: Vec<String> = Vec::new();
@@ -394,28 +637,13 @@ fn exec_patch(
             }
         };
 
-        // Validate path safety.
-        let candidate = Path::new(path_str);
-        if candidate.is_absolute() {
-            errors.push(format!("{path_str}: absolute paths not allowed"));
-            continue;
-        }
-        let mut traversal = false;
-        for component in candidate.components() {
-            if matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            ) {
-                traversal = true;
-                break;
+        let target = match validate_path(&source_root, path_str) {
+            Ok(t) => t,
+            Err((_, msg)) => {
+                errors.push(format!("{path_str}: {msg}"));
+                continue;
             }
-        }
-        if traversal {
-            errors.push(format!("{path_str}: path traversal not allowed"));
-            continue;
-        }
-
-        let target = source_root.join(candidate);
+        };
 
         match action {
             "write" => {
@@ -449,27 +677,7 @@ fn exec_patch(
         }
     }
 
-    // Rebuild snapshot after patches.
-    let new_snapshot = build_snapshot(&state.root, &state.includes)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let new_hash = new_snapshot.fingerprint.clone();
-    let new_arc = Arc::new(new_snapshot);
-
-    {
-        let mut lock = state
-            .current
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
-        *lock = Arc::clone(&new_arc);
-    }
-    {
-        let mut lock = state
-            .history
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
-        lock.insert(new_hash.clone(), new_arc);
-    }
+    let new_hash = rebuild_snapshot(state)?;
 
     Ok(serde_json::json!({
         "accepted": errors.is_empty(),
@@ -510,9 +718,12 @@ fn exec_search(
     state: &ServerState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let pattern_str = args["pattern"]
-        .as_str()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing required param: pattern".into()))?;
+    let pattern_str = args["pattern"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: pattern".into(),
+        )
+    })?;
 
     let glob_filter = args["glob"].as_str();
 
@@ -537,7 +748,984 @@ fn exec_stats(state: &ServerState) -> Result<serde_json::Value, (StatusCode, Str
 }
 
 // ---------------------------------------------------------------------------
-// Search implementation
+// New tool implementations: Read operations
+// ---------------------------------------------------------------------------
+
+fn exec_ls(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let raw_path = args["path"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: path".into(),
+        )
+    })?;
+    let recursive = args["recursive"].as_bool().unwrap_or(false);
+
+    let source_root = canon_root(state)?;
+    let target = validate_path(&source_root, raw_path)?;
+
+    if !target.is_dir() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("directory not found: {raw_path}"),
+        ));
+    }
+
+    // Verify the resolved dir is inside the project root.
+    let resolved = target
+        .canonicalize()
+        .map_err(|_| (StatusCode::NOT_FOUND, format!("directory not found: {raw_path}")))?;
+    if !resolved.starts_with(&source_root) {
+        return Err((StatusCode::BAD_REQUEST, "path traversal not allowed".into()));
+    }
+
+    let mut entries = Vec::new();
+    ls_dir(&resolved, &source_root, recursive, &mut entries, 0, 5000);
+
+    Ok(serde_json::json!({
+        "path": raw_path,
+        "recursive": recursive,
+        "count": entries.len(),
+        "entries": entries,
+    }))
+}
+
+/// Collect directory entries for `vsync_ls`.
+fn ls_dir(
+    dir: &Path,
+    root: &Path,
+    recursive: bool,
+    output: &mut Vec<serde_json::Value>,
+    current_depth: usize,
+    max_entries: usize,
+) {
+    let read = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    let mut items: Vec<_> = read.flatten().collect();
+    items.sort_by_key(|e| e.file_name());
+
+    for entry in items {
+        if output.len() >= max_entries {
+            return;
+        }
+
+        let path = entry.path();
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let rel = match path.strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let is_dir = meta.is_dir();
+        let size = if is_dir { 0 } else { meta.len() };
+
+        output.push(serde_json::json!({
+            "name": name,
+            "path": rel,
+            "is_dir": is_dir,
+            "size": size,
+        }));
+
+        if is_dir && recursive {
+            // Skip noise directories.
+            if matches!(
+                name.as_str(),
+                ".git" | "node_modules" | "target" | "__pycache__" | ".cache"
+            ) {
+                continue;
+            }
+            ls_dir(&path, root, true, output, current_depth + 1, max_entries);
+        }
+    }
+}
+
+fn exec_read_batch(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let paths = args["paths"].as_array().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: paths (array)".into(),
+        )
+    })?;
+
+    let source_root = canon_root(state)?;
+    let mut results: Vec<serde_json::Value> = Vec::new();
+
+    for path_val in paths {
+        let raw_path = match path_val.as_str() {
+            Some(p) => p,
+            None => {
+                results.push(serde_json::json!({
+                    "path": path_val,
+                    "error": "expected string path",
+                }));
+                continue;
+            }
+        };
+
+        let target = match validate_path(&source_root, raw_path) {
+            Ok(t) => t,
+            Err((_, msg)) => {
+                results.push(serde_json::json!({
+                    "path": raw_path,
+                    "error": msg,
+                }));
+                continue;
+            }
+        };
+
+        match std::fs::read_to_string(&target) {
+            Ok(content) => {
+                let hash = sha256_hex(content.as_bytes());
+                let bytes = content.len();
+                results.push(serde_json::json!({
+                    "path": raw_path,
+                    "content": content,
+                    "sha256": hash,
+                    "bytes": bytes,
+                }));
+            }
+            Err(e) => {
+                results.push(serde_json::json!({
+                    "path": raw_path,
+                    "error": format!("read error: {e}"),
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "count": results.len(),
+        "files": results,
+    }))
+}
+
+fn exec_file_info(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let raw_path = args["path"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: path".into(),
+        )
+    })?;
+
+    let source_root = canon_root(state)?;
+    let target = validate_path(&source_root, raw_path)?;
+
+    let meta = std::fs::metadata(&target)
+        .map_err(|_| (StatusCode::NOT_FOUND, format!("file not found: {raw_path}")))?;
+
+    if !meta.is_file() {
+        return Err((StatusCode::BAD_REQUEST, format!("not a file: {raw_path}")));
+    }
+
+    // Read content just for hash (don't return it — that's the point of file_info).
+    let content = std::fs::read(&target)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let hash = sha256_hex(&content);
+
+    let modified = meta
+        .modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let ext = Path::new(raw_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    Ok(serde_json::json!({
+        "path": raw_path,
+        "sha256": hash,
+        "bytes": meta.len(),
+        "modified_epoch": modified,
+        "extension": ext,
+    }))
+}
+
+fn exec_grep(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let pattern_str = args["pattern"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: pattern".into(),
+        )
+    })?;
+    let glob_filter = args["glob"].as_str();
+    let context = args["context"].as_u64().unwrap_or(2) as usize;
+    let max_results = args["max_results"].as_u64().unwrap_or(100) as usize;
+
+    let re = Regex::new(pattern_str)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid regex: {e}")))?;
+
+    let resolved_includes = crate::resolve_includes(&state.includes);
+    let mut results: Vec<serde_json::Value> = Vec::new();
+
+    for include in &resolved_includes {
+        let include_path = state.root.join(include);
+        if !include_path.exists() {
+            continue;
+        }
+        grep_dir(
+            &state.root,
+            &include_path,
+            &re,
+            glob_filter,
+            context,
+            &mut results,
+            max_results,
+        );
+        if results.len() >= max_results {
+            break;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "pattern": pattern_str,
+        "glob": glob_filter,
+        "context_lines": context,
+        "matches": results.len(),
+        "results": results,
+    }))
+}
+
+/// Recursive grep with context lines.
+fn grep_dir(
+    root: &Path,
+    dir: &Path,
+    re: &Regex,
+    glob_filter: Option<&str>,
+    context: usize,
+    results: &mut Vec<serde_json::Value>,
+    max: usize,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        if results.len() >= max {
+            return;
+        }
+
+        let path = entry.path();
+        if path.is_dir() {
+            let dir_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if matches!(
+                dir_name,
+                ".git" | "node_modules" | "target" | "__pycache__" | ".cache"
+            ) {
+                continue;
+            }
+            grep_dir(root, &path, re, glob_filter, context, results, max);
+            continue;
+        }
+
+        if !path.is_file() {
+            continue;
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+
+        if let Some(glob) = glob_filter {
+            if !matches_glob(file_name, glob) {
+                continue;
+            }
+        }
+
+        let rel_path = match path.strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let lines: Vec<&str> = content.lines().collect();
+        for (line_idx, line) in lines.iter().enumerate() {
+            if results.len() >= max {
+                return;
+            }
+            if re.is_match(line) {
+                let start = line_idx.saturating_sub(context);
+                let end = (line_idx + context + 1).min(lines.len());
+                let context_lines: Vec<serde_json::Value> = (start..end)
+                    .map(|i| {
+                        let l = lines[i];
+                        let truncated = if l.len() > 500 {
+                            format!("{}...", &l[..500])
+                        } else {
+                            l.to_string()
+                        };
+                        serde_json::json!({
+                            "line_number": i + 1,
+                            "text": truncated,
+                            "is_match": i == line_idx,
+                        })
+                    })
+                    .collect();
+
+                results.push(serde_json::json!({
+                    "path": rel_path,
+                    "match_line": line_idx + 1,
+                    "context": context_lines,
+                }));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// New tool implementations: Write operations
+// ---------------------------------------------------------------------------
+
+fn exec_write(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let raw_path = args["path"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: path".into(),
+        )
+    })?;
+    let content = args["content"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: content".into(),
+        )
+    })?;
+
+    let source_root = canon_root(state)?;
+    let target = validate_path(&source_root, raw_path)?;
+
+    // Ensure parent directory exists.
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir error: {e}")))?;
+    }
+
+    std::fs::write(&target, content.as_bytes())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write error: {e}")))?;
+
+    let hash = sha256_hex(content.as_bytes());
+    let new_hash = rebuild_snapshot(state)?;
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "path": raw_path,
+        "sha256": hash,
+        "bytes": content.len(),
+        "source_hash": new_hash,
+    }))
+}
+
+fn exec_delete(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let raw_path = args["path"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: path".into(),
+        )
+    })?;
+
+    let source_root = canon_root(state)?;
+    let target = validate_path(&source_root, raw_path)?;
+
+    let existed = target.exists();
+    if existed {
+        std::fs::remove_file(&target)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("delete error: {e}")))?;
+    }
+
+    let new_hash = rebuild_snapshot(state)?;
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "path": raw_path,
+        "existed": existed,
+        "source_hash": new_hash,
+    }))
+}
+
+fn exec_move(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let from = args["from"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: from".into(),
+        )
+    })?;
+    let to = args["to"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: to".into(),
+        )
+    })?;
+
+    let source_root = canon_root(state)?;
+    let from_target = validate_path(&source_root, from)?;
+    let to_target = validate_path(&source_root, to)?;
+
+    if !from_target.exists() {
+        return Err((StatusCode::NOT_FOUND, format!("source not found: {from}")));
+    }
+
+    if to_target.exists() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("destination already exists: {to}"),
+        ));
+    }
+
+    // Ensure destination parent exists.
+    if let Some(parent) = to_target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir error: {e}")))?;
+    }
+
+    std::fs::rename(&from_target, &to_target)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("rename error: {e}")))?;
+
+    let new_hash = rebuild_snapshot(state)?;
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "from": from,
+        "to": to,
+        "source_hash": new_hash,
+    }))
+}
+
+fn exec_mkdir(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let raw_path = args["path"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: path".into(),
+        )
+    })?;
+
+    let source_root = canon_root(state)?;
+    let target = validate_path(&source_root, raw_path)?;
+
+    let already_existed = target.is_dir();
+    std::fs::create_dir_all(&target)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir error: {e}")))?;
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "path": raw_path,
+        "created": !already_existed,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// New tool implementations: Validation operations
+// ---------------------------------------------------------------------------
+
+fn exec_validate_content(
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let raw_path = args["path"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: path".into(),
+        )
+    })?;
+    let content = args["content"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: content".into(),
+        )
+    })?;
+
+    let issues = validate::validate_file_content(raw_path, content);
+    let errors: Vec<_> = issues.iter().filter(|i| i.severity == "error").collect();
+    let warnings: Vec<_> = issues.iter().filter(|i| i.severity == "warning").collect();
+
+    Ok(serde_json::json!({
+        "path": raw_path,
+        "clean": errors.is_empty(),
+        "errors": errors.len(),
+        "warnings": warnings.len(),
+        "issues": issues,
+    }))
+}
+
+fn exec_check_conflict(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let raw_path = args["path"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: path".into(),
+        )
+    })?;
+
+    let source_root = canon_root(state)?;
+    let _target = validate_path(&source_root, raw_path)?;
+
+    // Collect all existing paths from snapshot to check case-insensitive collisions.
+    let lock = state
+        .current
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+
+    let proposed_lower = raw_path.to_lowercase();
+    let mut conflicts: Vec<serde_json::Value> = Vec::new();
+
+    for entry in &lock.entries {
+        // Exact duplicate.
+        if entry.path == raw_path {
+            conflicts.push(serde_json::json!({
+                "type": "exact_duplicate",
+                "existing_path": entry.path,
+            }));
+        }
+        // Case-insensitive collision.
+        else if entry.path.to_lowercase() == proposed_lower {
+            conflicts.push(serde_json::json!({
+                "type": "case_collision",
+                "existing_path": entry.path,
+                "proposed_path": raw_path,
+            }));
+        }
+    }
+
+    // Check for Roblox naming conflicts: init.server.luau vs init.client.luau
+    // in the same directory would confuse Rojo.
+    let proposed_file = Path::new(raw_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if proposed_file.starts_with("init.") {
+        let proposed_parent = Path::new(raw_path)
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        for entry in &lock.entries {
+            let entry_parent = Path::new(&entry.path)
+                .parent()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let entry_file = Path::new(&entry.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if entry_parent == proposed_parent
+                && entry_file.starts_with("init.")
+                && entry.path != raw_path
+            {
+                conflicts.push(serde_json::json!({
+                    "type": "rojo_init_conflict",
+                    "existing_path": entry.path,
+                    "proposed_path": raw_path,
+                    "detail": "Multiple init.* files in the same directory confuse Rojo",
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "path": raw_path,
+        "has_conflict": !conflicts.is_empty(),
+        "conflicts": conflicts,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// New tool implementations: Pipeline operations
+// ---------------------------------------------------------------------------
+
+fn exec_safe_write(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let raw_path = args["path"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: path".into(),
+        )
+    })?;
+    let content = args["content"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: content".into(),
+        )
+    })?;
+    let require_strict = args["require_strict"].as_bool().unwrap_or(true);
+
+    // Phase 1: Validate content in memory.
+    let issues = validate::validate_file_content(raw_path, content);
+    let errors: Vec<_> = issues.iter().filter(|i| i.severity == "error").collect();
+
+    // If require_strict is false, filter out the strict-mode error.
+    let blocking_errors: Vec<_> = if require_strict {
+        errors
+    } else {
+        errors
+            .into_iter()
+            .filter(|i| i.rule != "strict-mode")
+            .collect()
+    };
+
+    if !blocking_errors.is_empty() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "reason": "validation_failed",
+            "path": raw_path,
+            "errors": blocking_errors,
+            "all_issues": issues,
+        }));
+    }
+
+    // Phase 2: Check for path conflicts.
+    let source_root = canon_root(state)?;
+    let target = validate_path(&source_root, raw_path)?;
+
+    // Phase 3: Write to disk.
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir error: {e}")))?;
+    }
+
+    std::fs::write(&target, content.as_bytes())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write error: {e}")))?;
+
+    // Phase 4: Rebuild snapshot.
+    let hash = sha256_hex(content.as_bytes());
+    let new_source_hash = rebuild_snapshot(state)?;
+
+    let warnings: Vec<_> = issues.iter().filter(|i| i.severity == "warning").collect();
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "path": raw_path,
+        "sha256": hash,
+        "bytes": content.len(),
+        "source_hash": new_source_hash,
+        "warnings": warnings,
+    }))
+}
+
+fn exec_describe_changes(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let since_hash = args["since_hash"].as_str();
+
+    // Find the old snapshot — either the requested one, or the earliest in history.
+    let old = {
+        let lock = state
+            .history
+            .lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+
+        if let Some(hash) = since_hash {
+            lock.get(hash).cloned()
+        } else {
+            // Use the history_order to get the earliest snapshot.
+            let order = state
+                .history_order
+                .lock()
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+            order.front().and_then(|h| lock.get(h).cloned())
+        }
+    };
+
+    let old = match old {
+        Some(o) => o,
+        None => {
+            return Ok(serde_json::json!({
+                "description": "No previous snapshot available for comparison.",
+                "since_hash": since_hash,
+            }));
+        }
+    };
+
+    let current = {
+        let lock = state
+            .current
+            .lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        Arc::clone(&lock)
+    };
+
+    if old.fingerprint == current.fingerprint {
+        return Ok(serde_json::json!({
+            "description": "No changes since the reference snapshot.",
+            "since_hash": old.fingerprint,
+            "current_hash": current.fingerprint,
+        }));
+    }
+
+    let diff = diff_snapshots(&old, &current);
+
+    let mut lines: Vec<String> = Vec::new();
+    let total = diff.added.len() + diff.modified.len() + diff.deleted.len();
+    lines.push(format!(
+        "{} file(s) changed: {} added, {} modified, {} deleted.",
+        total,
+        diff.added.len(),
+        diff.modified.len(),
+        diff.deleted.len()
+    ));
+
+    for e in &diff.added {
+        lines.push(format!("  + {} ({} bytes)", e.path, e.bytes));
+    }
+    for e in &diff.modified {
+        let delta = e.current_bytes as i64 - e.previous_bytes as i64;
+        let sign = if delta >= 0 { "+" } else { "" };
+        lines.push(format!(
+            "  ~ {} ({}{} bytes)",
+            e.path, sign, delta
+        ));
+    }
+    for e in &diff.deleted {
+        lines.push(format!("  - {} ({} bytes removed)", e.path, e.bytes));
+    }
+
+    Ok(serde_json::json!({
+        "description": lines.join("\n"),
+        "since_hash": old.fingerprint,
+        "current_hash": current.fingerprint,
+        "added": diff.added.len(),
+        "modified": diff.modified.len(),
+        "deleted": diff.deleted.len(),
+    }))
+}
+
+fn exec_tree(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let raw_path = args["path"].as_str().unwrap_or("");
+    let max_depth = args["depth"].as_u64().unwrap_or(3) as usize;
+
+    let lock = state
+        .current
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+
+    // Build a tree from the snapshot entries, filtered by prefix.
+    let prefix = if raw_path.is_empty() {
+        String::new()
+    } else {
+        let mut p = raw_path.to_string();
+        if !p.ends_with('/') {
+            p.push('/');
+        }
+        p
+    };
+
+    // Collect unique directories and files under prefix, capped by depth.
+    let mut tree_nodes: BTreeMap<String, bool> = BTreeMap::new(); // path -> is_file
+
+    for entry in &lock.entries {
+        let path = if prefix.is_empty() {
+            &entry.path
+        } else if let Some(rest) = entry.path.strip_prefix(&prefix) {
+            rest
+        } else {
+            continue;
+        };
+
+        let parts: Vec<&str> = path.split('/').collect();
+        // Add each directory prefix up to max_depth, plus the file itself if within depth.
+        for i in 0..parts.len().min(max_depth + 1) {
+            let segment_path = if prefix.is_empty() {
+                parts[..=i].join("/")
+            } else {
+                format!("{}{}", prefix, parts[..=i].join("/"))
+            };
+            let is_file = i == parts.len() - 1;
+            tree_nodes.insert(segment_path, is_file);
+        }
+    }
+
+    // Render as indented text.
+    let mut lines: Vec<String> = Vec::new();
+    for (path, is_file) in &tree_nodes {
+        let display_path = if prefix.is_empty() {
+            path.as_str()
+        } else {
+            path.strip_prefix(&prefix).unwrap_or(path)
+        };
+        let depth = display_path.matches('/').count();
+        let indent = "  ".repeat(depth);
+        let name = display_path.rsplit('/').next().unwrap_or(display_path);
+        let suffix = if *is_file { "" } else { "/" };
+        lines.push(format!("{indent}{name}{suffix}"));
+    }
+
+    Ok(serde_json::json!({
+        "path": raw_path,
+        "depth": max_depth,
+        "tree": lines.join("\n"),
+        "node_count": tree_nodes.len(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// New tool implementations: Observability operations
+// ---------------------------------------------------------------------------
+
+fn exec_status(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
+    use std::sync::atomic::Ordering;
+
+    let m = &state.metrics;
+    let polls = m.polls.load(Ordering::Relaxed);
+    let duration_sum_us = m.poll_duration_sum_us.load(Ordering::Relaxed);
+    let avg_poll_ms = if polls > 0 {
+        (duration_sum_us as f64 / polls as f64) / 1_000.0
+    } else {
+        0.0
+    };
+    let entries = m.entries.load(Ordering::Relaxed);
+    let ws_connections = m.ws_connections.load(Ordering::Relaxed);
+    let events_emitted = m.events_emitted.load(Ordering::Relaxed);
+    let cache_hits = m.cache_hits.load(Ordering::Relaxed);
+    let cache_misses = m.cache_misses.load(Ordering::Relaxed);
+    let total = cache_hits + cache_misses;
+    let cache_ratio = if total > 0 {
+        cache_hits as f64 / total as f64
+    } else {
+        0.0
+    };
+
+    let current_hash = {
+        let lock = state
+            .current
+            .lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        lock.fingerprint.clone()
+    };
+
+    let history_count = {
+        let lock = state
+            .history
+            .lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        lock.len()
+    };
+
+    let sequence = {
+        let lock = state
+            .sequence
+            .lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        *lock
+    };
+
+    Ok(serde_json::json!({
+        "status": "running",
+        "version": env!("CARGO_PKG_VERSION"),
+        "current_fingerprint": current_hash,
+        "source_entries": entries,
+        "ws_connections": ws_connections,
+        "events_emitted": events_emitted,
+        "sequence": sequence,
+        "history_snapshots": history_count,
+        "polls": polls,
+        "avg_poll_ms": format!("{avg_poll_ms:.2}"),
+        "cache_hit_ratio": format!("{cache_ratio:.3}"),
+        "includes": state.includes,
+    }))
+}
+
+fn exec_events(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+
+    // History order gives us the chronological sequence of snapshot hashes.
+    let order = state
+        .history_order
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+
+    let history = state
+        .history
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+
+    // Take the last `limit + 1` entries so we can diff consecutive pairs.
+    let total = order.len();
+    let start = total.saturating_sub(limit + 1);
+    let hashes: Vec<String> = order.iter().skip(start).cloned().collect();
+
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    for i in 1..hashes.len() {
+        let prev = history.get(&hashes[i - 1]);
+        let curr = history.get(&hashes[i]);
+        if let (Some(prev), Some(curr)) = (prev, curr) {
+            let diff = diff_snapshots(prev, curr);
+            events.push(serde_json::json!({
+                "sequence": start + i,
+                "from_hash": diff.previous_fingerprint,
+                "to_hash": diff.current_fingerprint,
+                "added": diff.added.len(),
+                "modified": diff.modified.len(),
+                "deleted": diff.deleted.len(),
+                "added_paths": diff.added.iter().map(|e| &e.path).collect::<Vec<_>>(),
+                "modified_paths": diff.modified.iter().map(|e| &e.path).collect::<Vec<_>>(),
+                "deleted_paths": diff.deleted.iter().map(|e| &e.path).collect::<Vec<_>>(),
+            }));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "total_snapshots": total,
+        "showing": events.len(),
+        "events": events,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Search implementation (existing)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, serde::Serialize)]
@@ -707,12 +1895,7 @@ fn compute_stats(snapshot: &crate::Snapshot) -> serde_json::Value {
         ext_entry.1 += entry.bytes;
 
         // Top-level directory (first path segment).
-        let dir = entry
-            .path
-            .split('/')
-            .take(2)
-            .collect::<Vec<_>>()
-            .join("/");
+        let dir = entry.path.split('/').take(2).collect::<Vec<_>>().join("/");
         let dir_entry = by_directory.entry(dir).or_insert((0, 0));
         dir_entry.0 += 1;
         dir_entry.1 += entry.bytes;
@@ -768,11 +1951,13 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "test_tool");
         assert_eq!(tools[1]["inputSchema"]["required"][0], "name");
-        assert!(tools[1]["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|v| v != "count"));
+        assert!(
+            tools[1]["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|v| v != "count")
+        );
     }
 
     #[test]
@@ -825,5 +2010,31 @@ mod tests {
         assert_eq!(stats["total_files"], 3);
         assert_eq!(stats["total_bytes"], 3500);
         assert_eq!(stats["average_bytes"], 1166); // 3500 / 3
+    }
+
+    #[test]
+    fn tool_count_matches_expected() {
+        // Ensure we don't accidentally drop tools. 13 existing + 14 new = 27.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let tools = rt.block_on(async { handle_mcp_tools().await });
+        assert_eq!(tools.0.len(), 27, "expected 27 MCP tools");
+    }
+
+    #[test]
+    fn validate_path_rejects_traversal() {
+        let root = PathBuf::from("/tmp/test");
+        assert!(validate_path(&root, "../etc/passwd").is_err());
+        assert!(validate_path(&root, "/absolute/path").is_err());
+        assert!(validate_path(&root, "src/Server/ok.luau").is_ok());
+    }
+
+    #[test]
+    fn sha256_hex_deterministic() {
+        let a = sha256_hex(b"hello world");
+        let b = sha256_hex(b"hello world");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64); // 256 bits = 64 hex chars
     }
 }

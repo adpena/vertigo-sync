@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::fs;
 use tempfile::TempDir;
 
@@ -74,7 +74,11 @@ fn touch_file(dir: &TempDir, index: usize) {
         "Shared/Net",
     ];
     let subdir = subdirs[index % subdirs.len()];
-    let path = dir.path().join("src").join(subdir).join(format!("Module{index}.luau"));
+    let path = dir
+        .path()
+        .join("src")
+        .join(subdir)
+        .join(format!("Module{index}.luau"));
     let mut content = fs::read_to_string(&path).unwrap();
     content.push_str(&format!("\n-- modified {index}\n"));
     fs::write(&path, &content).unwrap();

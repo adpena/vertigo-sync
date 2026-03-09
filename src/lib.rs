@@ -482,9 +482,7 @@ pub fn build_snapshot_cached(
             let absolute = root.join(relative);
             let meta = fs::metadata(&absolute)
                 .with_context(|| format!("failed to stat {}", absolute.display()))?;
-            let mtime = meta
-                .modified()
-                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             let size = meta.len();
             let cached_hash = cache.get(&normalized, mtime, size).map(String::from);
             Ok(FileWork {
@@ -994,8 +992,7 @@ pub fn run_watch_native(
 
     let (tx, rx) = mpsc::channel();
 
-    let config = Config::default()
-        .with_poll_interval(Duration::from_millis(100));
+    let config = Config::default().with_poll_interval(Duration::from_millis(100));
 
     let mut watcher: RecommendedWatcher =
         Watcher::new(tx, config).context("failed to create native file watcher")?;
@@ -1006,9 +1003,7 @@ pub fn run_watch_native(
         if watch_path.exists() {
             watcher
                 .watch(&watch_path, RecursiveMode::Recursive)
-                .with_context(|| {
-                    format!("failed to watch path {}", watch_path.display())
-                })?;
+                .with_context(|| format!("failed to watch path {}", watch_path.display()))?;
         }
     }
 
@@ -1444,8 +1439,7 @@ fn hash_file_mmap(file: &File, file_len: u64, path: &Path) -> Result<(String, u6
     // SAFETY: The file is open for reading and we do not modify it.
     // The mmap is read-only and lives only for the duration of this function.
     let mmap = unsafe {
-        memmap2::Mmap::map(file)
-            .with_context(|| format!("failed to mmap {}", path.display()))?
+        memmap2::Mmap::map(file).with_context(|| format!("failed to mmap {}", path.display()))?
     };
     let mut hasher = Sha256::new();
     hasher.update(&mmap[..]);
@@ -1479,7 +1473,9 @@ fn should_skip_file(path: &Path) -> bool {
     if SKIP_FILE_NAMES.contains(&name) {
         return true;
     }
-    SKIP_FILE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+    SKIP_FILE_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
 }
 
 // ---------------------------------------------------------------------------
@@ -1525,10 +1521,16 @@ mod tests {
 
         fs::write(root.path().join("src/live/game.luau"), "print('ok')").expect("write game");
         fs::write(root.path().join("src/live/dev.log"), "noise").expect("write log");
-        fs::write(root.path().join("src/node_modules/pkg/index.js"), "module.exports = 1;")
-            .expect("write node module");
-        fs::write(root.path().join("src/dist/assets/app.js"), "console.log(1);")
-            .expect("write dist");
+        fs::write(
+            root.path().join("src/node_modules/pkg/index.js"),
+            "module.exports = 1;",
+        )
+        .expect("write node module");
+        fs::write(
+            root.path().join("src/dist/assets/app.js"),
+            "console.log(1);",
+        )
+        .expect("write dist");
         fs::write(root.path().join("src/.cache/meta.json"), "{}").expect("write cache");
 
         let includes = vec!["src".to_string()];
@@ -1626,11 +1628,7 @@ mod tests {
     fn health_doctor_valid_source() {
         let root = tempdir().expect("tempdir");
         fs::create_dir_all(root.path().join("src")).expect("create src");
-        fs::write(
-            root.path().join("src/init.luau"),
-            "--!strict\nreturn {}\n",
-        )
-        .expect("write");
+        fs::write(root.path().join("src/init.luau"), "--!strict\nreturn {}\n").expect("write");
         fs::write(
             root.path().join("default.project.json"),
             r#"{"name":"test","tree":{"$path":"src/"}}"#,

@@ -13,13 +13,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Json;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
-use axum::Router;
 use base64::Engine;
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -182,17 +182,19 @@ async fn handle_diff(
 async fn handle_events(
     State(state): State<Arc<ServerState>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let stream = BroadcastStream::new(state.tx.subscribe()).filter_map(|result| {
-        match result {
-            Ok(event) => {
-                let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-                Some(Ok(Event::default().event("sync_diff").data(data)))
-            }
-            Err(_) => None,
+    let stream = BroadcastStream::new(state.tx.subscribe()).filter_map(|result| match result {
+        Ok(event) => {
+            let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+            Some(Ok(Event::default().event("sync_diff").data(data)))
         }
+        Err(_) => None,
     });
 
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping"))
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -633,9 +635,7 @@ async fn handle_validate(
     Ok(Json(report))
 }
 
-async fn handle_metrics(
-    State(state): State<Arc<ServerState>>,
-) -> (HeaderMap, String) {
+async fn handle_metrics(State(state): State<Arc<ServerState>>) -> (HeaderMap, String) {
     let body = state.metrics.render();
     let mut headers = HeaderMap::new();
     headers.insert(

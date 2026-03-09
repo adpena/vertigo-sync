@@ -143,7 +143,13 @@ fn walk_tree_node(
             continue;
         }
         let child_instance_path = format!("{instance_path}.{key}");
-        walk_tree_node(key, child_value, &child_instance_path, ignore_unknown, mappings);
+        walk_tree_node(
+            key,
+            child_value,
+            &child_instance_path,
+            ignore_unknown,
+            mappings,
+        );
     }
 }
 
@@ -154,10 +160,7 @@ fn walk_tree_node(
 /// Given a filesystem path, determine the Roblox instance class.
 pub fn resolve_instance_class(file_path: &str) -> &str {
     let normalized = file_path.replace('\\', "/");
-    let file_name = normalized
-        .rsplit('/')
-        .next()
-        .unwrap_or(&normalized);
+    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
 
     match file_name {
         "init.server.luau" | "init.server.lua" => "Script",
@@ -167,9 +170,7 @@ pub fn resolve_instance_class(file_path: &str) -> &str {
                 "Script"
             } else if file_name.ends_with(".client.luau") || file_name.ends_with(".client.lua") {
                 "LocalScript"
-            } else if file_name.ends_with(".luau")
-                || file_name.ends_with(".lua")
-            {
+            } else if file_name.ends_with(".luau") || file_name.ends_with(".lua") {
                 "ModuleScript"
             } else if !file_name.contains('.') {
                 // Directory (no extension).
@@ -274,9 +275,18 @@ mod tests {
 
     #[test]
     fn resolve_instance_class_init_scripts() {
-        assert_eq!(resolve_instance_class("src/Server/init.server.luau"), "Script");
-        assert_eq!(resolve_instance_class("src/Client/init.client.luau"), "LocalScript");
-        assert_eq!(resolve_instance_class("src/Shared/Util/Types.luau"), "ModuleScript");
+        assert_eq!(
+            resolve_instance_class("src/Server/init.server.luau"),
+            "Script"
+        );
+        assert_eq!(
+            resolve_instance_class("src/Client/init.client.luau"),
+            "LocalScript"
+        );
+        assert_eq!(
+            resolve_instance_class("src/Shared/Util/Types.luau"),
+            "ModuleScript"
+        );
         assert_eq!(resolve_instance_class("src/Server/Services"), "Folder");
     }
 
@@ -293,7 +303,11 @@ mod tests {
             parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
         // Root has $ignoreUnknownInstances = true, so children inherit it.
         for mapping in &tree.mappings {
-            assert!(mapping.ignore_unknown, "mapping {} should inherit ignore_unknown", mapping.fs_path);
+            assert!(
+                mapping.ignore_unknown,
+                "mapping {} should inherit ignore_unknown",
+                mapping.fs_path
+            );
         }
     }
 }
