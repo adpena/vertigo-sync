@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::project::parse_project;
+use crate::rbxl::RbxlLoader;
 use crate::validate;
 use crate::{ServerState, build_snapshot, diff_snapshots, run_doctor, run_health_doctor};
 
@@ -354,6 +355,41 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
                 ),
             ],
         ),
+        // ── RBXL file loading and querying ────────────────────────────
+        tool_def(
+            "vsync_rbxl_load",
+            "Load and parse a .rbxl/.rbxlx file into the in-memory DOM cache",
+            vec![param(
+                "path",
+                "string",
+                "Absolute or relative path to the .rbxl/.rbxlx file",
+                true,
+            )],
+        ),
+        tool_def(
+            "vsync_rbxl_tree",
+            "Return the full instance tree of the loaded .rbxl file as a SceneGraph",
+            vec![],
+        ),
+        tool_def(
+            "vsync_rbxl_query",
+            "Query instances in the loaded .rbxl file by class, tag, or name",
+            vec![
+                param("class", "string", "Filter by ClassName (exact match)", false),
+                param("tag", "string", "Filter by CollectionService tag", false),
+                param("name", "string", "Filter by Name (substring match)", false),
+            ],
+        ),
+        tool_def(
+            "vsync_rbxl_scripts",
+            "Extract all Script/LocalScript/ModuleScript instances with their Source from the loaded .rbxl",
+            vec![],
+        ),
+        tool_def(
+            "vsync_rbxl_meshes",
+            "Extract all MeshPart instances with their MeshId from the loaded .rbxl",
+            vec![],
+        ),
     ])
 }
 
@@ -412,6 +448,12 @@ pub async fn handle_mcp_execute(
         // New: Observability operations
         "vsync_status" => exec_status(&state),
         "vsync_events" => exec_events(&state, &req.arguments),
+        // RBXL file operations
+        "vsync_rbxl_load" => exec_rbxl_load(&state, &req.arguments),
+        "vsync_rbxl_tree" => exec_rbxl_tree(&state),
+        "vsync_rbxl_query" => exec_rbxl_query(&state, &req.arguments),
+        "vsync_rbxl_scripts" => exec_rbxl_scripts(&state),
+        "vsync_rbxl_meshes" => exec_rbxl_meshes(&state),
         _ => Err((StatusCode::NOT_FOUND, format!("unknown tool: {}", req.tool))),
     }?;
 
@@ -2686,4 +2728,132 @@ mod tests {
         let result = interpolate_args(&args, &ns);
         assert_eq!(result["path"], "src/Server/NewFile.luau");
     }
+}
+
+// ---------------------------------------------------------------------------
+// RBXL MCP tool executors
+// ---------------------------------------------------------------------------
+
+fn exec_rbxl_load(
+    state: &Arc<ServerState>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let raw_path = args["path"]
+        .as_str()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing 'path' argument".to_string()))?;
+
+    let path = PathBuf::from(raw_path);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        state.root.join(&path)
+    };
+
+    if !resolved.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("file not found: {}", resolved.display()),
+        ));
+    }
+
+    let dom = RbxlLoader::load_file(&resolved).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("parse error: {e}"),
+        )
+    })?;
+
+    let ref_map = crate::rbxl::build_ref_map(&dom);
+    let instance_count = ref_map.len();
+
+    let mut lock = state
+        .rbxl
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".to_string()))?;
+    lock.dom = Some(dom);
+    lock.ref_map = ref_map;
+    lock.loaded_path = Some(resolved.clone());
+
+    Ok(serde_json::json!({
+        "status": "loaded",
+        "path": resolved.display().to_string(),
+        "instance_count": instance_count,
+    }))
+}
+
+fn exec_rbxl_tree(
+    state: &Arc<ServerState>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let lock = state
+        .rbxl
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".to_string()))?;
+    let dom = lock.dom.as_ref().ok_or_else(|| {
+        (
+            StatusCode::PRECONDITION_REQUIRED,
+            "no .rbxl file loaded — call vsync_rbxl_load first".to_string(),
+        )
+    })?;
+
+    let sg = RbxlLoader::to_scene_graph(dom);
+    serde_json::to_value(&sg).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn exec_rbxl_query(
+    state: &Arc<ServerState>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let lock = state
+        .rbxl
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".to_string()))?;
+    let dom = lock.dom.as_ref().ok_or_else(|| {
+        (
+            StatusCode::PRECONDITION_REQUIRED,
+            "no .rbxl file loaded".to_string(),
+        )
+    })?;
+
+    let class = args["class"].as_str();
+    let tag = args["tag"].as_str();
+    let name = args["name"].as_str();
+
+    let results = RbxlLoader::query(dom, class, tag, name);
+    serde_json::to_value(&results).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn exec_rbxl_scripts(
+    state: &Arc<ServerState>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let lock = state
+        .rbxl
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".to_string()))?;
+    let dom = lock.dom.as_ref().ok_or_else(|| {
+        (
+            StatusCode::PRECONDITION_REQUIRED,
+            "no .rbxl file loaded".to_string(),
+        )
+    })?;
+
+    let scripts = RbxlLoader::extract_scripts(dom);
+    serde_json::to_value(&scripts).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn exec_rbxl_meshes(
+    state: &Arc<ServerState>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let lock = state
+        .rbxl
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".to_string()))?;
+    let dom = lock.dom.as_ref().ok_or_else(|| {
+        (
+            StatusCode::PRECONDITION_REQUIRED,
+            "no .rbxl file loaded".to_string(),
+        )
+    })?;
+
+    let meshes = RbxlLoader::extract_meshes(dom);
+    serde_json::to_value(&meshes).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }

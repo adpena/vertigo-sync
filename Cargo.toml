@@ -24,6 +24,11 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 notify = { version = "8", features = ["macos_fsevent"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+rbx_binary = "2.0.1"
+rbx_xml = "2.0.1"
+rbx_dom_weak = "4.1.0"
+rbx_types = "3.1.0"
+rbx_reflection_database = "2.0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

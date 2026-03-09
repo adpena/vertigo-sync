@@ -14,6 +14,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub mod mcp;
 pub mod project;
+pub mod rbxl;
+pub mod serve_rbxl;
 pub mod server;
 pub mod validate;
 
@@ -1084,6 +1086,23 @@ pub fn run_watch_native(
 /// Maximum number of history entries to retain before eviction.
 const MAX_HISTORY_ENTRIES: usize = 64;
 
+/// Cached .rbxl DOM state, shared between MCP tools and HTTP endpoints.
+pub struct RbxlDomCache {
+    pub dom: Option<rbx_dom_weak::WeakDom>,
+    pub ref_map: HashMap<String, rbx_dom_weak::types::Ref>,
+    pub loaded_path: Option<PathBuf>,
+}
+
+impl RbxlDomCache {
+    pub fn new() -> Self {
+        Self {
+            dom: None,
+            ref_map: HashMap::new(),
+            loaded_path: None,
+        }
+    }
+}
+
 /// Thread-safe state for the serve command.
 pub struct ServerState {
     pub root: PathBuf,
@@ -1095,6 +1114,8 @@ pub struct ServerState {
     pub sequence: Mutex<u64>,
     pub cache: Mutex<SnapshotCache>,
     pub metrics: Arc<Metrics>,
+    /// Cached .rbxl DOM for MCP tool access.
+    pub rbxl: Mutex<RbxlDomCache>,
 }
 
 impl ServerState {
@@ -1126,6 +1147,7 @@ impl ServerState {
             sequence: Mutex::new(0),
             cache: Mutex::new(SnapshotCache::new()),
             metrics,
+            rbxl: Mutex::new(RbxlDomCache::new()),
         })
     }
 

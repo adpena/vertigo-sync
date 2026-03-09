@@ -28,6 +28,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use sha2::{Digest, Sha256};
 
 use crate::mcp::{handle_mcp_execute, handle_mcp_tools};
+use crate::serve_rbxl::{new_shared_rbxl_state, rbxl_router};
 use crate::{EventCoalescer, ServerState, Snapshot, SnapshotDiff, build_snapshot, diff_snapshots};
 use std::sync::atomic::Ordering;
 
@@ -58,6 +59,8 @@ pub struct SyncPatchAck {
 
 /// Build the Axum router with all endpoints.
 pub fn build_router(state: Arc<ServerState>) -> Router {
+    let rbxl_state = new_shared_rbxl_state();
+
     Router::new()
         .route("/health", get(handle_health))
         .route("/snapshot", get(handle_snapshot))
@@ -72,6 +75,7 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/mcp/tools", get(handle_mcp_tools))
         .route("/mcp/execute", post(handle_mcp_execute))
         .with_state(state)
+        .merge(rbxl_router(rbxl_state))
 }
 
 /// Start the HTTP server. This blocks until the server exits.
