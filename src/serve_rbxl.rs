@@ -22,12 +22,13 @@ use axum::response::Json;
 use axum::routing::get;
 use axum::Router;
 use rbx_dom_weak::WeakDom;
+use rbx_dom_weak::types::Ref;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use crate::rbxl::{
-    InstanceNode, MeshEntry, PropertyValue, RbxlLoader, SceneGraph, ScriptEntry,
-    build_ref_map, convert_variant,
+    InstanceNode, MeshEntry, RbxlLoader, SceneGraph, ScriptEntry,
+    build_ref_map,
 };
 
 // ---------------------------------------------------------------------------
@@ -160,48 +161,13 @@ async fn handle_instance(
         )
     })?;
 
-    let inst = dom.get_by_ref(*inst_ref).ok_or_else(|| {
+    RbxlLoader::get_instance_full(dom, *inst_ref).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             format!("ref dangling: {id}"),
         )
-    })?;
-
-    // Build full InstanceNode (including large blobs).
-    let children: Vec<String> = inst
-        .children()
-        .iter()
-        .map(|r| format!("{:?}", r))
-        .collect();
-
-    let mut properties = HashMap::new();
-    for (key, variant) in &inst.properties {
-        properties.insert(key.clone(), convert_variant(variant));
-    }
-
-    let parent_id = if inst.parent() != rbx_dom_weak::types::Ref::none() {
-        Some(format!("{:?}", inst.parent()))
-    } else {
-        None
-    };
-
-    let tags = if let Some(rbx_types::Variant::Tags(tags)) = inst.properties.get("Tags") {
-        tags.iter().map(|t| t.to_string()).collect()
-    } else {
-        Vec::new()
-    };
-
-    let node = InstanceNode {
-        id,
-        name: inst.name.clone(),
-        class_name: inst.class_name.clone(),
-        parent_id,
-        properties,
-        tags,
-        children,
-    };
-
-    Ok(Json(node))
+    })
+    .map(Json)
 }
 
 #[derive(Deserialize)]

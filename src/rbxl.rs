@@ -198,7 +198,7 @@ impl RbxlLoader {
             if is_large_blob(variant) {
                 continue;
             }
-            properties.insert(key.clone(), convert_variant(variant));
+            properties.insert(key.to_string(), convert_variant(variant));
         }
 
         let tags = extract_tags(inst);
@@ -206,7 +206,7 @@ impl RbxlLoader {
         out.push(InstanceNode {
             id: id.clone(),
             name: inst.name.clone(),
-            class_name: inst.class_name.clone(),
+            class_name: inst.class.to_string(),
             parent_id,
             properties,
             tags,
@@ -308,17 +308,20 @@ impl RbxlLoader {
             .collect()
     }
 
-    /// Get a single instance by ref string. Returns full properties including
-    /// large blobs (unlike the tree endpoint which strips them).
-    pub fn get_instance_full(dom: &WeakDom, id_str: &str) -> Option<InstanceNode> {
-        let inst_ref = string_to_ref(id_str)?;
+    /// Get a single instance by ref string using a prebuilt ref_map.
+    /// Returns full properties including large blobs.
+    pub fn get_instance_full(
+        dom: &WeakDom,
+        inst_ref: Ref,
+    ) -> Option<InstanceNode> {
         let inst = dom.get_by_ref(inst_ref)?;
 
+        let id = ref_to_string(inst_ref);
         let children: Vec<String> = inst.children().iter().map(|r| ref_to_string(*r)).collect();
 
         let mut properties = HashMap::new();
         for (key, variant) in &inst.properties {
-            properties.insert(key.clone(), convert_variant(variant));
+            properties.insert(key.to_string(), convert_variant(variant));
         }
 
         let parent_id = if inst.parent() != Ref::none() {
@@ -328,9 +331,9 @@ impl RbxlLoader {
         };
 
         Some(InstanceNode {
-            id: id_str.to_string(),
+            id,
             name: inst.name.clone(),
-            class_name: inst.class_name.clone(),
+            class_name: inst.class.to_string(),
             parent_id,
             properties,
             tags: extract_tags(inst),
@@ -373,8 +376,9 @@ pub fn convert_variant(variant: &rbx_types::Variant) -> PropertyValue {
         Variant::String(s) => PropertyValue::String(s.clone()),
         Variant::BinaryString(b) => {
             use base64::Engine;
+            let bytes: &[u8] = b.as_ref();
             PropertyValue::BinaryString(
-                base64::engine::general_purpose::STANDARD.encode(b.as_ref()),
+                base64::engine::general_purpose::STANDARD.encode(bytes),
             )
         }
         Variant::Bool(b) => PropertyValue::Bool(*b),
@@ -415,8 +419,7 @@ pub fn convert_variant(variant: &rbx_types::Variant) -> PropertyValue {
             }
         }
         Variant::Content(c) => {
-            let s: &str = c.as_ref();
-            PropertyValue::Content(s.to_string())
+            PropertyValue::Content(content_to_string(c))
         }
         Variant::UDim(u) => PropertyValue::UDim(u.scale as f64, u.offset),
         Variant::UDim2(u) => PropertyValue::UDim2(
@@ -453,11 +456,11 @@ pub fn convert_variant(variant: &rbx_types::Variant) -> PropertyValue {
         ),
         Variant::PhysicalProperties(pp) => match pp {
             rbx_types::PhysicalProperties::Custom(custom) => PropertyValue::PhysicalProperties {
-                density: custom.density as f64,
-                friction: custom.friction as f64,
-                elasticity: custom.elasticity as f64,
-                friction_weight: custom.friction_weight as f64,
-                elasticity_weight: custom.elasticity_weight as f64,
+                density: custom.density() as f64,
+                friction: custom.friction() as f64,
+                elasticity: custom.elasticity() as f64,
+                friction_weight: custom.friction_weight() as f64,
+                elasticity_weight: custom.elasticity_weight() as f64,
             },
             rbx_types::PhysicalProperties::Default => {
                 PropertyValue::String("Default".to_string())
@@ -480,11 +483,21 @@ pub fn convert_variant(variant: &rbx_types::Variant) -> PropertyValue {
     }
 }
 
+/// Extract the string representation from an rbx_types::Content value.
+fn content_to_string(content: &rbx_types::Content) -> String {
+    // Content in rbx_types 3.x is an opaque type. We use Debug as a
+    // fallback but try to extract the URI string if possible.
+    format!("{:?}", content)
+}
+
 /// Returns `true` for binary property values over 4 KB that should be stripped
 /// from the tree response and served separately.
 fn is_large_blob(variant: &rbx_types::Variant) -> bool {
     match variant {
-        rbx_types::Variant::BinaryString(b) => b.as_ref().len() > 4096,
+        rbx_types::Variant::BinaryString(b) => {
+            let bytes: &[u8] = b.as_ref();
+            bytes.len() > 4096
+        }
         rbx_types::Variant::SharedString(s) => s.data().len() > 4096,
         _ => false,
     }
@@ -492,11 +505,15 @@ fn is_large_blob(variant: &rbx_types::Variant) -> bool {
 
 /// Extract CollectionService tags from an instance.
 fn extract_tags(inst: &rbx_dom_weak::Instance) -> Vec<String> {
-    if let Some(rbx_types::Variant::Tags(tags)) = inst.properties.get("Tags") {
-        tags.iter().map(|t| t.to_string()).collect()
-    } else {
-        Vec::new()
+    // Properties in rbx_dom_weak use Ustr keys; find Tags by iterating.
+    for (key, value) in &inst.properties {
+        if key.as_str() == "Tags" {
+            if let rbx_types::Variant::Tags(tags) = value {
+                return tags.iter().map(|t| t.to_string()).collect();
+            }
+        }
     }
+    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -507,18 +524,6 @@ fn extract_tags(inst: &rbx_dom_weak::Instance) -> Vec<String> {
 fn ref_to_string(r: Ref) -> String {
     // Ref is an opaque index — we format it as hex for readability.
     format!("{:?}", r)
-}
-
-/// Attempt to parse a ref string back to a `Ref`. This is inherently fragile
-/// since Ref is opaque, so we try to find the instance by iterating. For the
-/// HTTP API we store our own string IDs and look up via a map.
-fn string_to_ref(s: &str) -> Option<Ref> {
-    // We can't reconstruct a Ref from its Debug output directly. Instead,
-    // callers should use the ref_map built during tree construction.
-    // This function exists as a placeholder — the serve layer uses a HashMap
-    // lookup instead.
-    let _ = s;
-    None
 }
 
 /// Build a lookup map from our string IDs to DOM Refs for instance retrieval.

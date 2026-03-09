@@ -2600,12 +2600,12 @@ mod tests {
 
     #[test]
     fn tool_count_matches_expected() {
-        // Ensure we don't accidentally drop tools. 13 existing + 14 new + 1 pipeline = 28.
+        // Ensure we don't accidentally drop tools. 13 existing + 14 new + 1 pipeline + 5 rbxl = 33.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         let tools = rt.block_on(async { handle_mcp_tools().await });
-        assert_eq!(tools.0.len(), 28, "expected 28 MCP tools");
+        assert_eq!(tools.0.len(), 33, "expected 33 MCP tools");
     }
 
     #[test]
