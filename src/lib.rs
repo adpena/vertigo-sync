@@ -1032,6 +1032,7 @@ impl RbxlDomCache {
 /// Thread-safe state for the serve command.
 pub struct ServerState {
     pub root: PathBuf,
+    pub canonical_root: PathBuf,
     pub includes: Vec<String>,
     pub current: Mutex<Arc<Snapshot>>,
     pub history: Mutex<BTreeMap<String, Arc<Snapshot>>>,
@@ -1062,9 +1063,11 @@ impl ServerState {
         let mut history_order = VecDeque::new();
         history.insert(arc.fingerprint.clone(), Arc::clone(&arc));
         history_order.push_back(arc.fingerprint.clone());
+        let canonical_root = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
 
         Arc::new(Self {
             root,
+            canonical_root,
             includes,
             current: Mutex::new(arc),
             history: Mutex::new(history),

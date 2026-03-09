@@ -9,7 +9,7 @@
 //!   POST /sync/patch         — apply file patches, return ack
 //!   GET  /validate            — run source validation, return report
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -391,60 +391,39 @@ async fn handle_ws_connection(mut socket: WebSocket, state: Arc<ServerState>) {
 
 /// Read a source file and return a JSON value for the WebSocket response.
 fn serve_source_for_ws(state: &Arc<ServerState>, raw_path: &str) -> serde_json::Value {
-    let candidate = Path::new(raw_path);
-    if candidate.is_absolute() {
-        return serde_json::json!({
-            "type": "source",
-            "path": raw_path,
-            "error": "absolute paths not allowed",
-        });
-    }
-
-    for component in candidate.components() {
-        if matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
+    let source_root = state.canonical_root.clone();
+    let normalized = match normalize_snapshot_lookup_path(raw_path) {
+        Some(path) => path,
+        None => {
             return serde_json::json!({
                 "type": "source",
                 "path": raw_path,
                 "error": "path traversal not allowed",
-            });
-        }
-    }
-
-    let source_root = match state.root.canonicalize() {
-        Ok(r) => r,
-        Err(e) => {
-            return serde_json::json!({
-                "type": "source",
-                "path": raw_path,
-                "error": e.to_string(),
-            });
+            })
         }
     };
-
-    let target = source_root.join(candidate);
-    let resolved = match target.canonicalize() {
-        Ok(r) if r.starts_with(&source_root) && r.is_file() => r,
-        _ => {
+    let resolved = match resolve_source_file(&source_root, &normalized) {
+        Ok(path) => path,
+        Err((_, error)) => {
             return serde_json::json!({
                 "type": "source",
                 "path": raw_path,
-                "error": "file not found",
-            });
+                "error": error,
+            })
         }
     };
 
     match std::fs::read_to_string(&resolved) {
         Ok(content) => {
-            let mut hasher = Sha256::new();
-            hasher.update(content.as_bytes());
-            let hash = format!("{:x}", hasher.finalize());
+            let content_bytes = content.len() as u64;
+            let hash = match snapshot_metadata_for_path(state, &normalized) {
+                Ok(Some((sha, expected_bytes))) if expected_bytes == content_bytes => sha,
+                _ => sha256_hex(content.as_bytes()),
+            };
 
             serde_json::json!({
                 "type": "source",
-                "path": raw_path,
+                "path": normalized,
                 "content": content,
                 "sha256": hash,
             })
@@ -482,10 +461,7 @@ async fn handle_patch(
         }));
     }
 
-    let source_root = state
-        .root
-        .canonicalize()
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let source_root = state.canonical_root.clone();
 
     let mut applied = 0usize;
     let mut errors: Vec<String> = Vec::new();
@@ -631,10 +607,7 @@ async fn handle_sources_content(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<SourcesContentQuery>,
 ) -> Result<Json<SourcesContentResponse>, (StatusCode, String)> {
-    let source_root = state
-        .root
-        .canonicalize()
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let source_root = state.canonical_root.clone();
 
     let mut dedupe = HashSet::new();
     let mut requested = Vec::new();
@@ -643,8 +616,10 @@ async fn handle_sources_content(
         if path.is_empty() {
             continue;
         }
-        if dedupe.insert(path.to_string()) {
-            requested.push(path.to_string());
+        let normalized = normalize_snapshot_lookup_path(path)
+            .ok_or((StatusCode::BAD_REQUEST, "invalid relative path".to_string()))?;
+        if dedupe.insert(normalized.clone()) {
+            requested.push(normalized);
         }
     }
 
@@ -668,6 +643,7 @@ async fn handle_sources_content(
     let mut entries: Vec<SourceContentEntry> = Vec::with_capacity(requested.len());
     let mut missing: Vec<String> = Vec::new();
     let mut total_bytes: usize = 0;
+    let snapshot_meta = snapshot_metadata_for_paths(&state, &requested)?;
 
     for raw_path in requested {
         let resolved = match resolve_source_file(&source_root, &raw_path) {
@@ -692,14 +668,16 @@ async fn handle_sources_content(
             ));
         }
 
-        let mut hasher = Sha256::new();
-        hasher.update(content.as_bytes());
-        let sha256 = format!("{:x}", hasher.finalize());
+        let content_bytes = content.len() as u64;
+        let sha256 = match snapshot_meta.get(&raw_path) {
+            Some((sha, expected_bytes)) if *expected_bytes == content_bytes => sha.clone(),
+            _ => sha256_hex(content.as_bytes()),
+        };
 
         entries.push(SourceContentEntry {
             path: raw_path,
             sha256,
-            bytes: content.len() as u64,
+            bytes: content_bytes,
             content,
         });
     }
@@ -707,24 +685,69 @@ async fn handle_sources_content(
     Ok(Json(SourcesContentResponse { entries, missing }))
 }
 
+fn normalize_snapshot_lookup_path(raw_path: &str) -> Option<String> {
+    let normalized = raw_path.replace('\\', "/");
+    let candidate = Path::new(&normalized);
+    let mut out = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(seg) => out.push(seg),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return None;
+    }
+    Some(out.to_string_lossy().replace('\\', "/"))
+}
+
+fn snapshot_metadata_for_paths(
+    state: &Arc<ServerState>,
+    requested: &[String],
+) -> Result<HashMap<String, (String, u64)>, (StatusCode, String)> {
+    let requested_set: HashSet<&str> = requested.iter().map(|path| path.as_str()).collect();
+    let current = state
+        .current
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".into()))?;
+    let mut metadata = HashMap::with_capacity(requested.len());
+    for entry in &current.entries {
+        if requested_set.contains(entry.path.as_str()) {
+            metadata.insert(entry.path.clone(), (entry.sha256.clone(), entry.bytes));
+        }
+    }
+    Ok(metadata)
+}
+
+fn snapshot_metadata_for_path(
+    state: &Arc<ServerState>,
+    path: &str,
+) -> Result<Option<(String, u64)>, (StatusCode, String)> {
+    let current = state
+        .current
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".into()))?;
+    Ok(current
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .map(|entry| (entry.sha256.clone(), entry.bytes)))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 fn resolve_source_file(
     source_root: &Path,
     raw_path: &str,
 ) -> Result<PathBuf, (StatusCode, String)> {
-    let candidate = Path::new(raw_path);
-    if candidate.is_absolute() {
-        return Err((StatusCode::BAD_REQUEST, "absolute paths not allowed".into()));
-    }
-    for component in candidate.components() {
-        match component {
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err((StatusCode::BAD_REQUEST, "path traversal not allowed".into()));
-            }
-            _ => {}
-        }
-    }
-
-    let target = source_root.join(candidate);
+    let normalized = normalize_snapshot_lookup_path(raw_path)
+        .ok_or((StatusCode::BAD_REQUEST, "path traversal not allowed".into()))?;
+    let target = source_root.join(&normalized);
     let resolved = target
         .canonicalize()
         .map_err(|_| (StatusCode::NOT_FOUND, format!("file not found: {raw_path}")))?;
@@ -741,19 +764,19 @@ async fn handle_source(
     State(state): State<Arc<ServerState>>,
     AxumPath(raw_path): AxumPath<String>,
 ) -> Result<(HeaderMap, String), (StatusCode, String)> {
-    let source_root = state
-        .root
-        .canonicalize()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let source_root = state.canonical_root.clone();
     let resolved = resolve_source_file(&source_root, &raw_path)?;
 
     let content = std::fs::read_to_string(&resolved)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Compute SHA-256 hash.
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    let hash = format!("{:x}", hasher.finalize());
+    let normalized = normalize_snapshot_lookup_path(&raw_path)
+        .ok_or((StatusCode::BAD_REQUEST, "path traversal not allowed".to_string()))?;
+    let content_bytes = content.len() as u64;
+    let hash = match snapshot_metadata_for_path(&state, &normalized)? {
+        Some((sha, expected_bytes)) if expected_bytes == content_bytes => sha,
+        _ => sha256_hex(content.as_bytes()),
+    };
 
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "text/plain; charset=utf-8".parse().unwrap());
@@ -781,7 +804,8 @@ async fn handle_metrics(State(state): State<Arc<ServerState>>) -> (HeaderMap, St
 }
 
 fn resolve_patch_target(source_root: &Path, raw_path: &str) -> anyhow::Result<PathBuf> {
-    let candidate = Path::new(raw_path);
+    let normalized = raw_path.replace('\\', "/");
+    let candidate = Path::new(&normalized);
 
     if candidate.is_absolute() {
         anyhow::bail!("absolute paths are not allowed")
@@ -797,4 +821,39 @@ fn resolve_patch_target(source_root: &Path, raw_path: &str) -> anyhow::Result<Pa
     }
 
     Ok(source_root.join(candidate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn normalize_snapshot_lookup_path_canonicalizes_separators() {
+        let path = normalize_snapshot_lookup_path(r".\src\Server\init.server.luau")
+            .expect("normalize path");
+        assert_eq!(path, "src/Server/init.server.luau");
+    }
+
+    #[test]
+    fn normalize_snapshot_lookup_path_rejects_parent_dir() {
+        assert!(normalize_snapshot_lookup_path("../secrets.txt").is_none());
+        assert!(normalize_snapshot_lookup_path(r"..\secrets.txt").is_none());
+    }
+
+    #[test]
+    fn resolve_source_file_accepts_backslash_relative_paths() {
+        let root_dir = tempdir().expect("tempdir");
+        let src_dir = root_dir.path().join("src").join("Server");
+        fs::create_dir_all(&src_dir).expect("create src/Server");
+        let file_path = src_dir.join("init.server.luau");
+        fs::write(&file_path, "return {}\n").expect("write source");
+
+        let canonical_root = root_dir.path().canonicalize().expect("canonical root");
+        let resolved =
+            resolve_source_file(&canonical_root, r"src\Server\init.server.luau").expect("resolve");
+
+        assert_eq!(resolved, file_path.canonicalize().expect("canonical file"));
+    }
 }
