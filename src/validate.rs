@@ -122,13 +122,23 @@ pub fn run_selene(root: &Path, includes: &[String]) -> Option<Vec<String>> {
     let selene_path = which_selene()?;
 
     let resolved = crate::resolve_includes(includes);
+    let mut skipped_studio_plugin = false;
     let paths: Vec<String> = resolved
         .iter()
-        .map(|inc| root.join(inc).to_string_lossy().into_owned())
+        .filter_map(|inc| {
+            if should_skip_selene_include(inc) {
+                skipped_studio_plugin = true;
+                return None;
+            }
+            Some(root.join(inc).to_string_lossy().into_owned())
+        })
         .filter(|p| Path::new(p).exists())
         .collect();
 
     if paths.is_empty() {
+        if skipped_studio_plugin {
+            return Some(vec![selene_skip_note()]);
+        }
         return Some(Vec::new());
     }
 
@@ -147,6 +157,10 @@ pub fn run_selene(root: &Path, includes: &[String]) -> Option<Vec<String>> {
         if !trimmed.is_empty() {
             lines.push(trimmed.to_string());
         }
+    }
+
+    if skipped_studio_plugin {
+        lines.push(selene_skip_note());
     }
 
     Some(lines)
@@ -235,7 +249,11 @@ fn check_large_file(path: &str, lines: &[&str], issues: &mut Vec<ValidationIssue
             path: path.to_string(),
             line: 0,
             severity: "warning".to_string(),
-            message: format!("file has {} lines (threshold: {})", lines.len(), LARGE_FILE_LINES),
+            message: format!(
+                "file has {} lines (threshold: {})",
+                lines.len(),
+                LARGE_FILE_LINES
+            ),
             rule: RULE_LARGE_FILE.to_string(),
         });
     }
@@ -302,7 +320,11 @@ fn check_instance_new_hot_path(path: &str, lines: &[&str], issues: &mut Vec<Vali
         }
 
         // Track end keywords (simplified — counts end/do/if/for/while blocks).
-        if trimmed == "end" || trimmed == "end)" || trimmed.starts_with("end,") || trimmed.starts_with("end)") {
+        if trimmed == "end"
+            || trimmed == "end)"
+            || trimmed.starts_with("end,")
+            || trimmed.starts_with("end)")
+        {
             current_depth -= 1;
             if in_hot_fn && current_depth <= hot_fn_depth {
                 in_hot_fn = false;
@@ -395,9 +417,7 @@ fn check_ncg_untyped_param(path: &str, lines: &[&str], issues: &mut Vec<Validati
                 path: path.to_string(),
                 line: idx + 1,
                 severity: "warning".to_string(),
-                message: format!(
-                    "add type annotations for NCG optimization: ({params_str})"
-                ),
+                message: format!("add type annotations for NCG optimization: ({params_str})"),
                 rule: RULE_NCG_UNTYPED_PARAM.to_string(),
             });
         }
@@ -590,7 +610,10 @@ fn check_perf_unfrozen_constant(path: &str, lines: &[&str], issues: &mut Vec<Val
                     && name
                         .chars()
                         .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
-                    && name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+                    && name
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_ascii_uppercase())
                     && value.starts_with('{')
                 {
                     constant_tables.push((name.to_string(), idx));
@@ -850,19 +873,16 @@ fn contains_bare_wait(line: &str) -> bool {
 
 /// Check if a function definition line contains a hot-path name.
 fn is_hot_path_function(line: &str) -> bool {
-    HOT_PATH_FN_NAMES
-        .iter()
-        .any(|name| line.contains(name))
+    HOT_PATH_FN_NAMES.iter().any(|name| line.contains(name))
 }
 
 /// Find selene on PATH.
 fn which_selene() -> Option<String> {
     // Check common locations first.
-    for path in &[
-        std::env::var("HOME")
-            .map(|h| format!("{h}/.aftman/bin/selene"))
-            .unwrap_or_default(),
-    ] {
+    for path in &[std::env::var("HOME")
+        .map(|h| format!("{h}/.aftman/bin/selene"))
+        .unwrap_or_default()]
+    {
         if !path.is_empty() && Path::new(path).is_file() {
             return Some(path.clone());
         }
@@ -876,15 +896,21 @@ fn which_selene() -> Option<String> {
         .and_then(|o| {
             if o.status.success() {
                 let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if !path.is_empty() {
-                    Some(path)
-                } else {
-                    None
-                }
+                if !path.is_empty() { Some(path) } else { None }
             } else {
                 None
             }
         })
+}
+
+fn should_skip_selene_include(include: &str) -> bool {
+    let normalized = include.replace('\\', "/");
+    let normalized = normalized.trim_start_matches("./");
+    normalized == "studio-plugin" || normalized.starts_with("studio-plugin/")
+}
+
+fn selene_skip_note() -> String {
+    "[vertigo-sync] selene skipped studio-plugin (Luau @native parsing is unstable in current selene). Built-in validator still enforces strict/perf rules.".to_string()
 }
 
 fn walk_and_validate(
@@ -1107,7 +1133,8 @@ mod tests {
 
     #[test]
     fn instance_new_in_hot_path() {
-        let content = "--!strict\nfunction MyModule:Heartbeat(dt)\n\tlocal p = Instance.new(\"Part\")\nend\n";
+        let content =
+            "--!strict\nfunction MyModule:Heartbeat(dt)\n\tlocal p = Instance.new(\"Part\")\nend\n";
         let issues = validate_file_content("src/Client/Controllers/Bad.luau", content);
         assert!(
             issues.iter().any(|i| i.rule == RULE_INSTANCE_NEW_HOT_PATH),
@@ -1235,7 +1262,9 @@ mod tests {
         let content = "--!strict\n--!native\nfor seg in path:gmatch(\"[^/]+\") do\nend\n";
         let issues = validate_file_content("src/Server/Foo.luau", content);
         assert!(
-            issues.iter().any(|i| i.rule == RULE_NCG_PATTERN_IN_HOT_PATH),
+            issues
+                .iter()
+                .any(|i| i.rule == RULE_NCG_PATTERN_IN_HOT_PATH),
             "should flag gmatch in native file"
         );
     }
@@ -1245,14 +1274,17 @@ mod tests {
         let content = "--!strict\nfor seg in path:gmatch(\"[^/]+\") do\nend\n";
         let issues = validate_file_content("src/Server/Foo.luau", content);
         assert!(
-            !issues.iter().any(|i| i.rule == RULE_NCG_PATTERN_IN_HOT_PATH),
+            !issues
+                .iter()
+                .any(|i| i.rule == RULE_NCG_PATTERN_IN_HOT_PATH),
             "should not flag gmatch in non-native file"
         );
     }
 
     #[test]
     fn perf_dynamic_array_flagged() {
-        let content = "--!strict\nlocal results = {}\nfor i = 1, 100 do\n\ttable.insert(results, i)\nend\n";
+        let content =
+            "--!strict\nlocal results = {}\nfor i = 1, 100 do\n\ttable.insert(results, i)\nend\n";
         let issues = validate_file_content("src/Server/Foo.luau", content);
         assert!(
             issues.iter().any(|i| i.rule == RULE_PERF_DYNAMIC_ARRAY),
@@ -1282,8 +1314,7 @@ mod tests {
 
     #[test]
     fn perf_unfrozen_constant_frozen_ok() {
-        let content =
-            "--!strict\nlocal MAX_VALUES = { 10, 20, 30 }\ntable.freeze(MAX_VALUES)\nreturn MAX_VALUES\n";
+        let content = "--!strict\nlocal MAX_VALUES = { 10, 20, 30 }\ntable.freeze(MAX_VALUES)\nreturn MAX_VALUES\n";
         let issues = validate_file_content("src/Server/Foo.luau", content);
         assert!(
             !issues.iter().any(|i| i.rule == RULE_PERF_UNFROZEN_CONSTANT),
