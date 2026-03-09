@@ -355,6 +355,49 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
                 ),
             ],
         ),
+        // ── Bridge compatibility layer ────────────────────────────
+        tool_def(
+            "vsync_bridge_manifest",
+            "Describe the agent-first bridge.v1 method catalog and transport endpoints",
+            vec![],
+        ),
+        tool_def(
+            "vsync_bridge_execute",
+            "Execute a single bridge.v1 method via {method, params, id?} and return normalized envelope",
+            vec![
+                param(
+                    "method",
+                    "string",
+                    "Bridge method name (e.g. bridge.hello, source.read, sync.validate)",
+                    true,
+                ),
+                param("params", "object", "Method parameters object", false),
+                param(
+                    "id",
+                    "string",
+                    "Optional request id echoed in the response envelope",
+                    false,
+                ),
+            ],
+        ),
+        tool_def(
+            "vsync_bridge_batch",
+            "Execute multiple bridge.v1 method calls in one request for lower round-trip overhead",
+            vec![
+                param(
+                    "calls",
+                    "array",
+                    "Array of {method, params?, id?} bridge method calls",
+                    true,
+                ),
+                param(
+                    "stop_on_error",
+                    "boolean",
+                    "Stop execution after first failure (default true)",
+                    false,
+                ),
+            ],
+        ),
         // ── RBXL file loading and querying ────────────────────────────
         tool_def(
             "vsync_rbxl_load",
@@ -453,6 +496,10 @@ pub async fn handle_mcp_execute(
         // New: Observability operations
         "vsync_status" => exec_status(&state),
         "vsync_events" => exec_events(&state, &req.arguments),
+        // Bridge compatibility layer
+        "vsync_bridge_manifest" => exec_bridge_manifest(&state),
+        "vsync_bridge_execute" => exec_bridge_execute(&state, &req.arguments),
+        "vsync_bridge_batch" => exec_bridge_batch(&state, &req.arguments),
         // RBXL file operations
         "vsync_rbxl_load" => exec_rbxl_load(&state, &req.arguments),
         "vsync_rbxl_tree" => exec_rbxl_tree(&state),
@@ -463,6 +510,331 @@ pub async fn handle_mcp_execute(
     }?;
 
     Ok(Json(result))
+}
+
+const BRIDGE_PROTOCOL_VERSION: &str = "bridge.v1";
+
+fn bridge_method_catalog() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "bridge.hello",
+            "Return protocol/version/server metadata and current workspace fingerprint",
+        ),
+        (
+            "bridge.capabilities",
+            "List supported bridge methods and concise descriptions",
+        ),
+        ("sync.health", "Health/status probe for vertigo-sync"),
+        ("sync.snapshot", "Return current source snapshot"),
+        ("sync.diff", "Diff current snapshot against since_hash"),
+        ("sync.status", "Sync observability status report"),
+        ("sync.events", "Recent sync events with sequence metadata"),
+        ("sync.validate", "Run Luau + NCG validation pass"),
+        ("sync.doctor", "Run determinism and sync doctor checks"),
+        (
+            "source.index",
+            "List all source entries with path/hash/bytes",
+        ),
+        ("source.read", "Read one source file by relative path"),
+        (
+            "source.read_batch",
+            "Read multiple source files in one request",
+        ),
+        ("source.search", "Regex search across source content"),
+        (
+            "source.grep",
+            "Regex search with context and bounded results",
+        ),
+        ("source.info", "Read source metadata for a single path"),
+        ("source.tree", "Render source tree as indented text"),
+        ("source.write", "Write a UTF-8 source file"),
+        (
+            "source.safe_write",
+            "Validate then write source file atomically",
+        ),
+        ("source.patch", "Apply write/delete patch batch"),
+        (
+            "source.conflict_check",
+            "Check if a path collides with existing source paths",
+        ),
+        ("project.mappings", "Return parsed project tree mappings"),
+        (
+            "metrics.get",
+            "Return sync metrics and performance counters",
+        ),
+    ]
+}
+
+fn bridge_capabilities_json() -> Vec<serde_json::Value> {
+    bridge_method_catalog()
+        .iter()
+        .map(|(name, description)| {
+            serde_json::json!({
+                "name": name,
+                "description": description,
+            })
+        })
+        .collect()
+}
+
+fn bridge_error_code(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "BAD_PARAMS",
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::CONFLICT => "EDIT_CONFLICT",
+        StatusCode::PAYLOAD_TOO_LARGE => "PAYLOAD_TOO_LARGE",
+        StatusCode::TOO_MANY_REQUESTS => "RATE_LIMITED",
+        StatusCode::SERVICE_UNAVAILABLE => "TRANSPORT_UNAVAILABLE",
+        StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => "TIMEOUT",
+        _ => "INTERNAL_ERROR",
+    }
+}
+
+fn bridge_error_retryable(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn bridge_ok_response(id: Option<&str>, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "v": BRIDGE_PROTOCOL_VERSION,
+        "kind": "response",
+        "id": id,
+        "ok": true,
+        "result": result,
+    })
+}
+
+fn bridge_error_response(
+    id: Option<&str>,
+    status: StatusCode,
+    message: impl Into<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "v": BRIDGE_PROTOCOL_VERSION,
+        "kind": "response",
+        "id": id,
+        "ok": false,
+        "error": {
+            "code": bridge_error_code(status),
+            "message": message.into(),
+            "retryable": bridge_error_retryable(status),
+        }
+    })
+}
+
+fn exec_bridge_manifest(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
+    let (source_hash, entry_count) = {
+        let lock = state
+            .current
+            .lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        (lock.fingerprint.clone(), lock.entries.len())
+    };
+
+    Ok(serde_json::json!({
+        "protocol": BRIDGE_PROTOCOL_VERSION,
+        "server": "vertigo-sync",
+        "version": env!("CARGO_PKG_VERSION"),
+        "workspace": {
+            "source_hash": source_hash,
+            "entry_count": entry_count,
+        },
+        "transport": {
+            "mcp_tool": "vsync_bridge_execute",
+            "batch_tool": "vsync_bridge_batch",
+            "http": {
+                "tools_path": "/mcp/tools",
+                "execute_path": "/mcp/execute",
+            },
+            "ws": {
+                "path": "/ws",
+                "note": "legacy sync events plus bridge-compatible request envelopes via MCP bridge tools",
+            }
+        },
+        "methods": bridge_capabilities_json(),
+    }))
+}
+
+fn exec_bridge_method(
+    state: &ServerState,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    match method {
+        "bridge.hello" => {
+            let (source_hash, entry_count) = {
+                let lock = state
+                    .current
+                    .lock()
+                    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+                (lock.fingerprint.clone(), lock.entries.len())
+            };
+            Ok(serde_json::json!({
+                "protocol": BRIDGE_PROTOCOL_VERSION,
+                "server": "vertigo-sync",
+                "version": env!("CARGO_PKG_VERSION"),
+                "source_hash": source_hash,
+                "entry_count": entry_count,
+            }))
+        }
+        "bridge.capabilities" => Ok(serde_json::json!({
+            "methods": bridge_capabilities_json(),
+        })),
+        "sync.health" => exec_health(),
+        "sync.snapshot" => exec_snapshot(state),
+        "sync.diff" => exec_diff(state, params),
+        "sync.status" => exec_status(state),
+        "sync.events" => exec_events(state, params),
+        "sync.validate" => exec_validate(state),
+        "sync.doctor" => exec_doctor(state),
+        "source.index" => exec_sources(state),
+        "source.read" => exec_source(state, params),
+        "source.read_batch" => exec_read_batch(state, params),
+        "source.search" => exec_search(state, params),
+        "source.grep" => exec_grep(state, params),
+        "source.info" => exec_file_info(state, params),
+        "source.tree" => exec_tree(state, params),
+        "source.write" => exec_write(state, params),
+        "source.safe_write" => exec_safe_write(state, params),
+        "source.patch" => exec_patch(state, params),
+        "source.conflict_check" => exec_check_conflict(state, params),
+        "project.mappings" => exec_project(state),
+        "metrics.get" => exec_metrics(state),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            format!("unknown bridge method: {method}"),
+        )),
+    }
+}
+
+fn exec_bridge_execute(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let id = args["id"].as_str();
+    let method = match args["method"].as_str() {
+        Some(value) if !value.trim().is_empty() => value.trim(),
+        _ => {
+            return Ok(bridge_error_response(
+                id,
+                StatusCode::BAD_REQUEST,
+                "missing required param: method",
+            ));
+        }
+    };
+
+    let params = match args.get("params") {
+        None | Some(serde_json::Value::Null) => serde_json::json!({}),
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => {
+            return Ok(bridge_error_response(
+                id,
+                StatusCode::BAD_REQUEST,
+                "params must be an object when provided",
+            ));
+        }
+    };
+
+    match exec_bridge_method(state, method, &params) {
+        Ok(result) => Ok(bridge_ok_response(id, result)),
+        Err((status, message)) => Ok(bridge_error_response(id, status, message)),
+    }
+}
+
+fn exec_bridge_batch(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let calls = args["calls"].as_array().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: calls (array)".to_string(),
+        )
+    })?;
+    if calls.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "calls must include at least one item".to_string(),
+        ));
+    }
+
+    let stop_on_error = args["stop_on_error"].as_bool().unwrap_or(true);
+    let mut responses = Vec::with_capacity(calls.len());
+    let mut success_count = 0usize;
+    let mut failure_count = 0usize;
+
+    for (index, call) in calls.iter().enumerate() {
+        let id = call["id"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("batch-{}", index + 1));
+        let method = call["method"].as_str().map(str::trim).unwrap_or_default();
+        let params = match call.get("params") {
+            None | Some(serde_json::Value::Null) => serde_json::json!({}),
+            Some(value) if value.is_object() => value.clone(),
+            Some(_) => {
+                failure_count += 1;
+                responses.push(bridge_error_response(
+                    Some(&id),
+                    StatusCode::BAD_REQUEST,
+                    "params must be an object when provided",
+                ));
+                if stop_on_error {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        if method.is_empty() {
+            failure_count += 1;
+            responses.push(bridge_error_response(
+                Some(&id),
+                StatusCode::BAD_REQUEST,
+                "missing required field calls[].method",
+            ));
+            if stop_on_error {
+                break;
+            }
+            continue;
+        }
+
+        match exec_bridge_method(state, method, &params) {
+            Ok(result) => {
+                success_count += 1;
+                responses.push(bridge_ok_response(Some(&id), result));
+            }
+            Err((status, message)) => {
+                failure_count += 1;
+                responses.push(bridge_error_response(Some(&id), status, message));
+                if stop_on_error {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "v": BRIDGE_PROTOCOL_VERSION,
+        "kind": "batch_response",
+        "ok": failure_count == 0,
+        "summary": {
+            "total": calls.len(),
+            "completed": responses.len(),
+            "succeeded": success_count,
+            "failed": failure_count,
+            "stop_on_error": stop_on_error,
+        },
+        "responses": responses,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2098,6 +2470,9 @@ fn execute_step(
         "vsync_tree" => exec_tree(state, &args).map_err(|(_, e)| e),
         "vsync_status" => exec_status(state).map_err(|(_, e)| e),
         "vsync_events" => exec_events(state, &args).map_err(|(_, e)| e),
+        "vsync_bridge_manifest" => exec_bridge_manifest(state).map_err(|(_, e)| e),
+        "vsync_bridge_execute" => exec_bridge_execute(state, &args).map_err(|(_, e)| e),
+        "vsync_bridge_batch" => exec_bridge_batch(state, &args).map_err(|(_, e)| e),
         other => Err(format!("unknown tool in pipeline: {other}")),
     }
 }
@@ -2605,12 +2980,84 @@ mod tests {
 
     #[test]
     fn tool_count_matches_expected() {
-        // Ensure we don't accidentally drop tools. 13 existing + 14 new + 1 pipeline + 5 rbxl = 33.
+        // Ensure we don't accidentally drop tools. 13 existing + 14 new + 1 pipeline + 3 bridge + 5 rbxl = 36.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         let tools = rt.block_on(async { handle_mcp_tools().await });
-        assert_eq!(tools.0.len(), 33, "expected 33 MCP tools");
+        assert_eq!(tools.0.len(), 36, "expected 36 MCP tools");
+    }
+
+    #[test]
+    fn bridge_manifest_exposes_protocol_and_methods() {
+        let methods = bridge_capabilities_json();
+        assert!(
+            methods
+                .iter()
+                .any(|method| method["name"] == "bridge.hello")
+        );
+        assert!(
+            methods
+                .iter()
+                .any(|method| method["name"] == "source.safe_write")
+        );
+    }
+
+    #[test]
+    fn bridge_error_code_mapping_is_stable() {
+        assert_eq!(bridge_error_code(StatusCode::BAD_REQUEST), "BAD_PARAMS");
+        assert_eq!(bridge_error_code(StatusCode::NOT_FOUND), "NOT_FOUND");
+        assert_eq!(
+            bridge_error_code(StatusCode::SERVICE_UNAVAILABLE),
+            "TRANSPORT_UNAVAILABLE"
+        );
+    }
+
+    #[test]
+    fn bridge_execute_rejects_non_object_params() {
+        let snapshot = crate::Snapshot {
+            version: 1,
+            include: vec![],
+            fingerprint: "abc123".into(),
+            entries: vec![],
+        };
+        let state = crate::ServerState::new(std::env::temp_dir(), vec![], snapshot, 32);
+        let result = exec_bridge_execute(
+            &state,
+            &serde_json::json!({
+                "id": "req-1",
+                "method": "bridge.hello",
+                "params": ["invalid"]
+            }),
+        )
+        .expect("bridge execute should return structured envelope");
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"]["code"], "BAD_PARAMS");
+    }
+
+    #[test]
+    fn bridge_batch_stops_after_first_error() {
+        let snapshot = crate::Snapshot {
+            version: 1,
+            include: vec![],
+            fingerprint: "abc123".into(),
+            entries: vec![],
+        };
+        let state = crate::ServerState::new(std::env::temp_dir(), vec![], snapshot, 32);
+        let result = exec_bridge_batch(
+            &state,
+            &serde_json::json!({
+                "stop_on_error": true,
+                "calls": [
+                    {"id": "a", "method": "bridge.hello"},
+                    {"id": "b", "method": "does.not.exist"},
+                    {"id": "c", "method": "bridge.capabilities"}
+                ]
+            }),
+        )
+        .expect("bridge batch should return summary envelope");
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["summary"]["completed"], 2);
     }
 
     #[test]

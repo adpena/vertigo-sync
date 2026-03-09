@@ -578,7 +578,11 @@ async fn handle_patch(
     };
     let validation_issues = collect_patch_validation_issues(&planned);
 
-    Ok(Json(accepted_patch_ack(new_hash, applied, validation_issues)))
+    Ok(Json(accepted_patch_ack(
+        new_hash,
+        applied,
+        validation_issues,
+    )))
 }
 
 fn accepted_patch_ack(
