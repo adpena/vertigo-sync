@@ -455,6 +455,28 @@ pub fn build_snapshot_cached(
     includes: &[String],
     cache: &mut SnapshotCache,
 ) -> Result<Snapshot> {
+    build_snapshot_cached_inner(root, includes, cache, None)
+}
+
+/// Like `build_snapshot_cached` but also records cache hit/miss counts
+/// into the provided `Metrics`.
+pub fn build_snapshot_cached_with_metrics(
+    root: &Path,
+    includes: &[String],
+    cache: &mut SnapshotCache,
+    metrics: &Metrics,
+) -> Result<Snapshot> {
+    build_snapshot_cached_inner(root, includes, cache, Some(metrics))
+}
+
+/// Shared implementation for cached snapshot builds. When `metrics` is
+/// `Some`, cache hit/miss counts are recorded atomically.
+fn build_snapshot_cached_inner(
+    root: &Path,
+    includes: &[String],
+    cache: &mut SnapshotCache,
+    metrics: Option<&Metrics>,
+) -> Result<Snapshot> {
     let resolved_includes = resolve_includes(includes);
     let mut files = Vec::new();
 
@@ -468,7 +490,6 @@ pub fn build_snapshot_cached(
 
     files.sort_by(|a, b| normalize_path(a).cmp(&normalize_path(b)));
 
-    // First pass: check cache hits vs misses.
     struct FileWork {
         normalized: String,
         absolute: PathBuf,
@@ -498,7 +519,22 @@ pub fn build_snapshot_cached(
         .collect();
     let work = work?;
 
-    // Second pass: parallel hash only the cache misses.
+    // Record cache hit/miss metrics if a Metrics handle was provided.
+    if let Some(m) = metrics {
+        let mut hits = 0u64;
+        let mut misses = 0u64;
+        for fw in &work {
+            if fw.cached_hash.is_some() {
+                hits += 1;
+            } else {
+                misses += 1;
+            }
+        }
+        m.cache_hits.fetch_add(hits, Ordering::Relaxed);
+        m.cache_misses.fetch_add(misses, Ordering::Relaxed);
+    }
+
+    // Parallel hash only the cache misses.
     let entries: Result<Vec<SnapshotEntry>> = work
         .par_iter()
         .map(|fw| {
@@ -534,116 +570,6 @@ pub fn build_snapshot_cached(
     }
 
     // Prune deleted files from cache.
-    let live_paths: HashSet<String> = entries.iter().map(|e| e.path.clone()).collect();
-    cache.retain_paths(&live_paths);
-
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    let fingerprint = fingerprint_entries(&entries);
-
-    Ok(Snapshot {
-        version: 1,
-        include: resolved_includes,
-        fingerprint,
-        entries,
-    })
-}
-
-/// Like `build_snapshot_cached` but also records cache hit/miss counts
-/// into the provided `Metrics`.
-pub fn build_snapshot_cached_with_metrics(
-    root: &Path,
-    includes: &[String],
-    cache: &mut SnapshotCache,
-    metrics: &Metrics,
-) -> Result<Snapshot> {
-    let resolved_includes = resolve_includes(includes);
-    let mut files = Vec::new();
-
-    for include in &resolved_includes {
-        let include_path = root.join(include);
-        if !include_path.exists() {
-            continue;
-        }
-        collect_files(root, &include_path, &mut files)?;
-    }
-
-    files.sort_by(|a, b| normalize_path(a).cmp(&normalize_path(b)));
-
-    struct FileWork {
-        normalized: String,
-        absolute: PathBuf,
-        mtime: SystemTime,
-        size: u64,
-        cached_hash: Option<String>,
-    }
-
-    let mut hits = 0u64;
-    let mut misses = 0u64;
-
-    let work: Result<Vec<FileWork>> = files
-        .iter()
-        .map(|relative| {
-            let normalized = normalize_path(relative);
-            let absolute = root.join(relative);
-            let meta = fs::metadata(&absolute)
-                .with_context(|| format!("failed to stat {}", absolute.display()))?;
-            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            let size = meta.len();
-            let cached_hash = cache.get(&normalized, mtime, size).map(String::from);
-            Ok(FileWork {
-                normalized,
-                absolute,
-                mtime,
-                size,
-                cached_hash,
-            })
-        })
-        .collect();
-    let work = work?;
-
-    for fw in &work {
-        if fw.cached_hash.is_some() {
-            hits += 1;
-        } else {
-            misses += 1;
-        }
-    }
-    metrics.cache_hits.fetch_add(hits, Ordering::Relaxed);
-    metrics.cache_misses.fetch_add(misses, Ordering::Relaxed);
-
-    let entries: Result<Vec<SnapshotEntry>> = work
-        .par_iter()
-        .map(|fw| {
-            if let Some(ref sha256) = fw.cached_hash {
-                Ok(SnapshotEntry {
-                    path: fw.normalized.clone(),
-                    sha256: sha256.clone(),
-                    bytes: fw.size,
-                })
-            } else {
-                let (sha256, bytes) = hash_file(&fw.absolute)
-                    .with_context(|| format!("failed to hash file {}", fw.absolute.display()))?;
-                Ok(SnapshotEntry {
-                    path: fw.normalized.clone(),
-                    sha256,
-                    bytes,
-                })
-            }
-        })
-        .collect();
-    let mut entries = entries?;
-
-    for (fw, entry) in work.iter().zip(entries.iter()) {
-        if fw.cached_hash.is_none() {
-            cache.insert(
-                entry.path.clone(),
-                entry.sha256.clone(),
-                entry.bytes,
-                fw.mtime,
-            );
-        }
-    }
-
     let live_paths: HashSet<String> = entries.iter().map(|e| e.path.clone()).collect();
     cache.retain_paths(&live_paths);
 
