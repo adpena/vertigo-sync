@@ -5,9 +5,11 @@
 //!   GET  /snapshot           — current snapshot JSON
 //!   GET  /diff?since=<hash>  — diff from historical hash to current
 //!   GET  /events             — SSE stream of SyncDiffEvent
+//!   GET  /sources/content    — batched source fetch for high-rate hotload
 //!   POST /sync/patch         — apply file patches, return ack
 //!   GET  /validate            — run source validation, return report
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -61,6 +63,10 @@ pub struct SyncPatchAck {
 /// Maximum request body size (10 MiB). Prevents memory exhaustion from
 /// oversized `/sync/patch` payloads while accommodating large Luau source files.
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum number of paths accepted by one batched source request.
+const MAX_BATCH_SOURCE_PATHS: usize = 256;
+/// Maximum aggregate UTF-8 payload served in one batched source request.
+const MAX_BATCH_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Build the Axum router with all endpoints.
 pub fn build_router(state: Arc<ServerState>) -> Router {
@@ -88,6 +94,7 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/events", get(handle_events))
         .route("/ws", get(handle_ws))
         .route("/sources", get(handle_sources))
+        .route("/sources/content", get(handle_sources_content))
         .route("/source/{*path}", get(handle_source))
         .route("/sync/patch", post(handle_patch))
         .route("/validate", get(handle_validate))
@@ -601,12 +608,110 @@ async fn handle_sources(
     Ok(Json(entries))
 }
 
-async fn handle_source(
+#[derive(Debug, Deserialize)]
+struct SourcesContentQuery {
+    paths: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SourceContentEntry {
+    path: String,
+    sha256: String,
+    bytes: u64,
+    content: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SourcesContentResponse {
+    entries: Vec<SourceContentEntry>,
+    missing: Vec<String>,
+}
+
+async fn handle_sources_content(
     State(state): State<Arc<ServerState>>,
-    AxumPath(raw_path): AxumPath<String>,
-) -> Result<(HeaderMap, String), (StatusCode, String)> {
-    // Validate: no traversal, must be within include roots.
-    let candidate = Path::new(&raw_path);
+    Query(query): Query<SourcesContentQuery>,
+) -> Result<Json<SourcesContentResponse>, (StatusCode, String)> {
+    let source_root = state
+        .root
+        .canonicalize()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    let mut dedupe = HashSet::new();
+    let mut requested = Vec::new();
+    for raw in query.paths.split(',') {
+        let path = raw.trim();
+        if path.is_empty() {
+            continue;
+        }
+        if dedupe.insert(path.to_string()) {
+            requested.push(path.to_string());
+        }
+    }
+
+    if requested.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "paths query must include at least one relative path".to_string(),
+        ));
+    }
+
+    if requested.len() > MAX_BATCH_SOURCE_PATHS {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "paths query exceeds max entries ({}/{MAX_BATCH_SOURCE_PATHS})",
+                requested.len()
+            ),
+        ));
+    }
+
+    let mut entries: Vec<SourceContentEntry> = Vec::with_capacity(requested.len());
+    let mut missing: Vec<String> = Vec::new();
+    let mut total_bytes: usize = 0;
+
+    for raw_path in requested {
+        let resolved = match resolve_source_file(&source_root, &raw_path) {
+            Ok(path) => path,
+            Err((StatusCode::NOT_FOUND, _)) => {
+                missing.push(raw_path);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        let content = std::fs::read_to_string(&resolved)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        total_bytes += content.len();
+        if total_bytes > MAX_BATCH_SOURCE_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "batch source payload exceeded {} bytes; reduce request size",
+                    MAX_BATCH_SOURCE_BYTES
+                ),
+            ));
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        let sha256 = format!("{:x}", hasher.finalize());
+
+        entries.push(SourceContentEntry {
+            path: raw_path,
+            sha256,
+            bytes: content.len() as u64,
+            content,
+        });
+    }
+
+    Ok(Json(SourcesContentResponse { entries, missing }))
+}
+
+fn resolve_source_file(
+    source_root: &Path,
+    raw_path: &str,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let candidate = Path::new(raw_path);
     if candidate.is_absolute() {
         return Err((StatusCode::BAD_REQUEST, "absolute paths not allowed".into()));
     }
@@ -619,24 +724,28 @@ async fn handle_source(
         }
     }
 
+    let target = source_root.join(candidate);
+    let resolved = target
+        .canonicalize()
+        .map_err(|_| (StatusCode::NOT_FOUND, format!("file not found: {raw_path}")))?;
+    if !resolved.starts_with(source_root) {
+        return Err((StatusCode::BAD_REQUEST, "path escapes source root".into()));
+    }
+    if !resolved.is_file() {
+        return Err((StatusCode::NOT_FOUND, format!("not a file: {raw_path}")));
+    }
+    Ok(resolved)
+}
+
+async fn handle_source(
+    State(state): State<Arc<ServerState>>,
+    AxumPath(raw_path): AxumPath<String>,
+) -> Result<(HeaderMap, String), (StatusCode, String)> {
     let source_root = state
         .root
         .canonicalize()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let target = source_root.join(candidate);
-
-    // Verify the resolved path is still under the source root.
-    let resolved = target
-        .canonicalize()
-        .map_err(|_| (StatusCode::NOT_FOUND, format!("file not found: {raw_path}")))?;
-    if !resolved.starts_with(&source_root) {
-        return Err((StatusCode::BAD_REQUEST, "path escapes source root".into()));
-    }
-
-    if !resolved.is_file() {
-        return Err((StatusCode::NOT_FOUND, format!("not a file: {raw_path}")));
-    }
+    let resolved = resolve_source_file(&source_root, &raw_path)?;
 
     let content = std::fs::read_to_string(&resolved)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
