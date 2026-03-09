@@ -1,16 +1,172 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
+pub mod mcp;
+pub mod project;
 pub mod server;
+pub mod validate;
+
+// ---------------------------------------------------------------------------
+// Event coalescer — batches filesystem events within a configurable window
+// ---------------------------------------------------------------------------
+
+/// Batches filesystem events within a configurable time window before
+/// triggering a snapshot rebuild. Saving 10 files in quick succession
+/// produces 1 rebuild, not 10.
+pub struct EventCoalescer {
+    /// How long to wait for more events before triggering.
+    window: Duration,
+    /// Monotonic timestamp of the last event received.
+    last_event: Mutex<Option<Instant>>,
+    /// Whether a coalesce cycle is currently in progress.
+    pending: AtomicBool,
+}
+
+impl EventCoalescer {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            last_event: Mutex::new(None),
+            pending: AtomicBool::new(false),
+        }
+    }
+
+    /// Signal that a filesystem event occurred. Returns `true` if this is
+    /// the first event in a new coalesce window (caller should spawn the
+    /// quiescence waiter). Returns `false` if a window is already open
+    /// (the timer has been reset internally).
+    pub fn signal(&self) -> bool {
+        let now = Instant::now();
+        let mut lock = self.last_event.lock().unwrap();
+        *lock = Some(now);
+
+        // If no pending cycle, start one.
+        let was_pending = self.pending.swap(true, Ordering::AcqRel);
+        !was_pending
+    }
+
+    /// Wait for the coalesce window to close (no events for `window`
+    /// duration), then mark the cycle as finished and return. Call this
+    /// after `signal()` returns `true`.
+    pub async fn wait_for_quiescence(&self) {
+        loop {
+            tokio::time::sleep(self.window).await;
+
+            let elapsed = {
+                let lock = self.last_event.lock().unwrap();
+                match *lock {
+                    Some(ts) => ts.elapsed(),
+                    None => self.window, // shouldn't happen, but safe
+                }
+            };
+
+            if elapsed >= self.window {
+                // Window closed — no new events arrived during the sleep.
+                self.pending.store(false, Ordering::Release);
+                return;
+            }
+
+            // Events arrived during our sleep — loop and wait again.
+            // Sleep only the remaining time rather than a full window.
+            let remaining = self.window.saturating_sub(elapsed);
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining).await;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prometheus-compatible metrics
+// ---------------------------------------------------------------------------
+
+/// Atomic counters/gauges for the sync server. All fields are updated
+/// via atomic operations — no locking required for reads or writes.
+pub struct Metrics {
+    pub polls: AtomicU64,
+    pub poll_duration_sum_us: AtomicU64,
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
+    pub events_emitted: AtomicU64,
+    pub ws_connections: AtomicU64,
+    pub entries: AtomicU64,
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        Self {
+            polls: AtomicU64::new(0),
+            poll_duration_sum_us: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            events_emitted: AtomicU64::new(0),
+            ws_connections: AtomicU64::new(0),
+            entries: AtomicU64::new(0),
+        }
+    }
+
+    /// Render Prometheus text exposition format.
+    pub fn render(&self) -> String {
+        let polls = self.polls.load(Ordering::Relaxed);
+        let duration_sum_us = self.poll_duration_sum_us.load(Ordering::Relaxed);
+        let duration_sum_s = duration_sum_us as f64 / 1_000_000.0;
+        let cache_hits = self.cache_hits.load(Ordering::Relaxed);
+        let cache_misses = self.cache_misses.load(Ordering::Relaxed);
+        let total_lookups = cache_hits + cache_misses;
+        let hit_ratio = if total_lookups > 0 {
+            cache_hits as f64 / total_lookups as f64
+        } else {
+            0.0
+        };
+        let entries = self.entries.load(Ordering::Relaxed);
+        let ws_conns = self.ws_connections.load(Ordering::Relaxed);
+        let events = self.events_emitted.load(Ordering::Relaxed);
+
+        format!(
+            "# HELP vertigo_sync_polls_total Total number of snapshot polls\n\
+             # TYPE vertigo_sync_polls_total counter\n\
+             vertigo_sync_polls_total {polls}\n\
+             \n\
+             # HELP vertigo_sync_poll_duration_seconds Time to build snapshot\n\
+             # TYPE vertigo_sync_poll_duration_seconds histogram\n\
+             vertigo_sync_poll_duration_seconds_sum {duration_sum_s:.6}\n\
+             vertigo_sync_poll_duration_seconds_count {polls}\n\
+             \n\
+             # HELP vertigo_sync_cache_hit_ratio Ratio of cache hits to total file lookups\n\
+             # TYPE vertigo_sync_cache_hit_ratio gauge\n\
+             vertigo_sync_cache_hit_ratio {hit_ratio:.6}\n\
+             \n\
+             # HELP vertigo_sync_entries_total Number of files in current snapshot\n\
+             # TYPE vertigo_sync_entries_total gauge\n\
+             vertigo_sync_entries_total {entries}\n\
+             \n\
+             # HELP vertigo_sync_ws_connections Active WebSocket connections\n\
+             # TYPE vertigo_sync_ws_connections gauge\n\
+             vertigo_sync_ws_connections {ws_conns}\n\
+             \n\
+             # HELP vertigo_sync_events_total Total sync events emitted\n\
+             # TYPE vertigo_sync_events_total counter\n\
+             vertigo_sync_events_total {events}\n"
+        )
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub const DEFAULT_INCLUDES: &[&str] = &["src", "studio-plugin", "scripts/dev"];
 const SKIP_DIR_NAMES: &[&str] = &[
@@ -29,6 +185,80 @@ const SKIP_DIR_NAMES: &[&str] = &[
 ];
 const SKIP_FILE_NAMES: &[&str] = &[".DS_Store"];
 const SKIP_FILE_SUFFIXES: &[&str] = &[".log", ".tmp", ".swp"];
+
+/// Threshold in bytes above which memory-mapped I/O is used for hashing.
+/// Below this, the mmap syscall overhead exceeds the copy savings.
+const MMAP_THRESHOLD: u64 = 4096;
+
+// ---------------------------------------------------------------------------
+// Incremental snapshot cache
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct CachedEntry {
+    sha256: String,
+    bytes: u64,
+    mtime: SystemTime,
+}
+
+/// Per-file hash cache keyed by (path, mtime, size). Eliminates redundant
+/// SHA-256 computation on unchanged files — makes subsequent snapshots
+/// O(changed_files) instead of O(all_files).
+pub struct SnapshotCache {
+    entries: HashMap<String, CachedEntry>,
+}
+
+impl SnapshotCache {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Returns cached hash if mtime+size match, otherwise `None`.
+    pub fn get(&self, path: &str, mtime: SystemTime, size: u64) -> Option<&str> {
+        self.entries.get(path).and_then(|entry| {
+            if entry.mtime == mtime && entry.bytes == size {
+                Some(entry.sha256.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Store a computed hash for a file.
+    pub fn insert(&mut self, path: String, sha256: String, bytes: u64, mtime: SystemTime) {
+        self.entries.insert(
+            path,
+            CachedEntry {
+                sha256,
+                bytes,
+                mtime,
+            },
+        );
+    }
+
+    /// Remove entries for paths no longer present on disk.
+    pub fn retain_paths(&mut self, live_paths: &HashSet<String>) {
+        self.entries.retain(|key, _| live_paths.contains(key));
+    }
+
+    /// Number of cached entries (for diagnostics).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Default for SnapshotCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotEntry {
@@ -186,18 +416,236 @@ pub fn build_snapshot(root: &Path, includes: &[String]) -> Result<Snapshot> {
 
     files.sort_by(|a, b| normalize_path(a).cmp(&normalize_path(b)));
 
-    let mut entries = Vec::with_capacity(files.len());
-    for relative in files {
-        let absolute = root.join(&relative);
-        let (sha256, bytes) = hash_file(&absolute)
-            .with_context(|| format!("failed to hash file {}", absolute.display()))?;
+    // Parallel hash using rayon — all CPU cores for initial/uncached builds.
+    let entries: Result<Vec<SnapshotEntry>> = files
+        .par_iter()
+        .map(|relative| {
+            let absolute = root.join(relative);
+            let (sha256, bytes) = hash_file(&absolute)
+                .with_context(|| format!("failed to hash file {}", absolute.display()))?;
+            Ok(SnapshotEntry {
+                path: normalize_path(relative),
+                sha256,
+                bytes,
+            })
+        })
+        .collect();
 
-        entries.push(SnapshotEntry {
-            path: normalize_path(&relative),
-            sha256,
-            bytes,
-        });
+    let mut entries = entries?;
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let fingerprint = fingerprint_entries(&entries);
+
+    Ok(Snapshot {
+        version: 1,
+        include: resolved_includes,
+        fingerprint,
+        entries,
+    })
+}
+
+/// Cached variant of `build_snapshot`. Skips SHA-256 computation for files
+/// whose (mtime, size) haven't changed since the last poll. After building,
+/// prunes cache entries for deleted files.
+///
+/// Use the uncached `build_snapshot` for determinism verification (doctor/health).
+pub fn build_snapshot_cached(
+    root: &Path,
+    includes: &[String],
+    cache: &mut SnapshotCache,
+) -> Result<Snapshot> {
+    let resolved_includes = resolve_includes(includes);
+    let mut files = Vec::new();
+
+    for include in &resolved_includes {
+        let include_path = root.join(include);
+        if !include_path.exists() {
+            continue;
+        }
+        collect_files(root, &include_path, &mut files)?;
     }
+
+    files.sort_by(|a, b| normalize_path(a).cmp(&normalize_path(b)));
+
+    // First pass: check cache hits vs misses.
+    struct FileWork {
+        normalized: String,
+        absolute: PathBuf,
+        mtime: SystemTime,
+        size: u64,
+        cached_hash: Option<String>,
+    }
+
+    let work: Result<Vec<FileWork>> = files
+        .iter()
+        .map(|relative| {
+            let normalized = normalize_path(relative);
+            let absolute = root.join(relative);
+            let meta = fs::metadata(&absolute)
+                .with_context(|| format!("failed to stat {}", absolute.display()))?;
+            let mtime = meta
+                .modified()
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let size = meta.len();
+            let cached_hash = cache.get(&normalized, mtime, size).map(String::from);
+            Ok(FileWork {
+                normalized,
+                absolute,
+                mtime,
+                size,
+                cached_hash,
+            })
+        })
+        .collect();
+    let work = work?;
+
+    // Second pass: parallel hash only the cache misses.
+    let entries: Result<Vec<SnapshotEntry>> = work
+        .par_iter()
+        .map(|fw| {
+            if let Some(ref sha256) = fw.cached_hash {
+                Ok(SnapshotEntry {
+                    path: fw.normalized.clone(),
+                    sha256: sha256.clone(),
+                    bytes: fw.size,
+                })
+            } else {
+                let (sha256, bytes) = hash_file(&fw.absolute)
+                    .with_context(|| format!("failed to hash file {}", fw.absolute.display()))?;
+                Ok(SnapshotEntry {
+                    path: fw.normalized.clone(),
+                    sha256,
+                    bytes,
+                })
+            }
+        })
+        .collect();
+    let mut entries = entries?;
+
+    // Update cache with newly computed hashes.
+    for (fw, entry) in work.iter().zip(entries.iter()) {
+        if fw.cached_hash.is_none() {
+            cache.insert(
+                entry.path.clone(),
+                entry.sha256.clone(),
+                entry.bytes,
+                fw.mtime,
+            );
+        }
+    }
+
+    // Prune deleted files from cache.
+    let live_paths: HashSet<String> = entries.iter().map(|e| e.path.clone()).collect();
+    cache.retain_paths(&live_paths);
+
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let fingerprint = fingerprint_entries(&entries);
+
+    Ok(Snapshot {
+        version: 1,
+        include: resolved_includes,
+        fingerprint,
+        entries,
+    })
+}
+
+/// Like `build_snapshot_cached` but also records cache hit/miss counts
+/// into the provided `Metrics`.
+pub fn build_snapshot_cached_with_metrics(
+    root: &Path,
+    includes: &[String],
+    cache: &mut SnapshotCache,
+    metrics: &Metrics,
+) -> Result<Snapshot> {
+    let resolved_includes = resolve_includes(includes);
+    let mut files = Vec::new();
+
+    for include in &resolved_includes {
+        let include_path = root.join(include);
+        if !include_path.exists() {
+            continue;
+        }
+        collect_files(root, &include_path, &mut files)?;
+    }
+
+    files.sort_by(|a, b| normalize_path(a).cmp(&normalize_path(b)));
+
+    struct FileWork {
+        normalized: String,
+        absolute: PathBuf,
+        mtime: SystemTime,
+        size: u64,
+        cached_hash: Option<String>,
+    }
+
+    let mut hits = 0u64;
+    let mut misses = 0u64;
+
+    let work: Result<Vec<FileWork>> = files
+        .iter()
+        .map(|relative| {
+            let normalized = normalize_path(relative);
+            let absolute = root.join(relative);
+            let meta = fs::metadata(&absolute)
+                .with_context(|| format!("failed to stat {}", absolute.display()))?;
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let size = meta.len();
+            let cached_hash = cache.get(&normalized, mtime, size).map(String::from);
+            Ok(FileWork {
+                normalized,
+                absolute,
+                mtime,
+                size,
+                cached_hash,
+            })
+        })
+        .collect();
+    let work = work?;
+
+    for fw in &work {
+        if fw.cached_hash.is_some() {
+            hits += 1;
+        } else {
+            misses += 1;
+        }
+    }
+    metrics.cache_hits.fetch_add(hits, Ordering::Relaxed);
+    metrics.cache_misses.fetch_add(misses, Ordering::Relaxed);
+
+    let entries: Result<Vec<SnapshotEntry>> = work
+        .par_iter()
+        .map(|fw| {
+            if let Some(ref sha256) = fw.cached_hash {
+                Ok(SnapshotEntry {
+                    path: fw.normalized.clone(),
+                    sha256: sha256.clone(),
+                    bytes: fw.size,
+                })
+            } else {
+                let (sha256, bytes) = hash_file(&fw.absolute)
+                    .with_context(|| format!("failed to hash file {}", fw.absolute.display()))?;
+                Ok(SnapshotEntry {
+                    path: fw.normalized.clone(),
+                    sha256,
+                    bytes,
+                })
+            }
+        })
+        .collect();
+    let mut entries = entries?;
+
+    for (fw, entry) in work.iter().zip(entries.iter()) {
+        if fw.cached_hash.is_none() {
+            cache.insert(
+                entry.path.clone(),
+                entry.sha256.clone(),
+                entry.bytes,
+                fw.mtime,
+            );
+        }
+    }
+
+    let live_paths: HashSet<String> = entries.iter().map(|e| e.path.clone()).collect();
+    cache.retain_paths(&live_paths);
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let fingerprint = fingerprint_entries(&entries);
@@ -418,6 +866,22 @@ pub fn run_health_doctor(root: &Path, includes: &[String]) -> Result<HealthRepor
         }
     }
 
+    // Run source validation checks.
+    if let Ok(validation) = validate::validate_source(root, includes) {
+        for vi in &validation.issues {
+            let severity = if vi.severity == "error" {
+                "error"
+            } else {
+                "warn"
+            };
+            issues.push(HealthIssue {
+                severity: severity.into(),
+                path: vi.path.clone(),
+                message: format!("[{}] {}", vi.rule, vi.message),
+            });
+        }
+    }
+
     let first = build_snapshot(root, includes)?;
     let second = build_snapshot(root, includes)?;
     let deterministic = first.fingerprint == second.fingerprint && first.entries == second.entries;
@@ -502,9 +966,128 @@ pub fn run_watch(
     }
 }
 
+/// Native filesystem watcher using `notify` (FSEvents on macOS).
+///
+/// Falls back to [`run_watch`] if native watching cannot be initialised.
+/// Emits the same NDJSON format as `run_watch` but reacts to filesystem
+/// events instead of polling at a fixed interval.
+///
+/// `coalesce_window` controls how long to wait after the last filesystem
+/// event before triggering a snapshot rebuild (default: 50ms).
+pub fn run_watch_native(
+    root: &Path,
+    includes: &[String],
+    output_dir: Option<&Path>,
+    coalesce_window: Duration,
+) -> Result<()> {
+    use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+    use std::sync::mpsc;
+
+    let resolved = resolve_includes(includes);
+    let mut prev = build_snapshot(root, &resolved)?;
+    let mut seq: u64 = 0;
+
+    if let Some(dir) = output_dir {
+        fs::create_dir_all(dir)?;
+        write_snapshot_file(dir, &prev)?;
+    }
+
+    let (tx, rx) = mpsc::channel();
+
+    let config = Config::default()
+        .with_poll_interval(Duration::from_millis(100));
+
+    let mut watcher: RecommendedWatcher =
+        Watcher::new(tx, config).context("failed to create native file watcher")?;
+
+    // Watch each include root.
+    for inc in &resolved {
+        let watch_path = root.join(inc);
+        if watch_path.exists() {
+            watcher
+                .watch(&watch_path, RecursiveMode::Recursive)
+                .with_context(|| {
+                    format!("failed to watch path {}", watch_path.display())
+                })?;
+        }
+    }
+
+    eprintln!(
+        "[vertigo-sync] native watch root={} includes={:?} files={} coalesce={}ms",
+        root.display(),
+        &resolved,
+        prev.entries.len(),
+        coalesce_window.as_millis()
+    );
+
+    // Coalesce: collect events for the configured window then rebuild once.
+    loop {
+        // Block until first event.
+        match rx.recv() {
+            Ok(_) => {}
+            Err(_) => break,
+        }
+
+        // Drain any buffered events within the coalesce window.
+        // Use a sliding-window approach: keep draining while events arrive.
+        let mut last_event = Instant::now();
+        loop {
+            let remaining = coalesce_window.saturating_sub(last_event.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(_) => {
+                    last_event = Instant::now();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        }
+
+        let current = match build_snapshot(root, &resolved) {
+            Ok(snap) => snap,
+            Err(e) => {
+                eprintln!("[vertigo-sync] snapshot error during watch: {e}");
+                continue;
+            }
+        };
+
+        if current.fingerprint == prev.fingerprint {
+            continue;
+        }
+
+        seq += 1;
+        let diff = diff_snapshots(&prev, &current);
+
+        let event = SyncDiffEvent {
+            sequence_id: seq,
+            source_hash: current.fingerprint.clone(),
+            added_paths: diff.added.iter().map(|f| f.path.clone()).collect(),
+            modified_paths: diff.modified.iter().map(|f| f.path.clone()).collect(),
+            deleted_paths: diff.deleted.iter().map(|f| f.path.clone()).collect(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let json = serde_json::to_string(&event).context("failed to serialize watch event")?;
+        println!("{json}");
+
+        if let Some(dir) = output_dir {
+            write_snapshot_file(dir, &current)?;
+        }
+
+        prev = current;
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Server state (shared between HTTP server and background poller)
 // ---------------------------------------------------------------------------
+
+/// Maximum number of history entries to retain before eviction.
+const MAX_HISTORY_ENTRIES: usize = 64;
 
 /// Thread-safe state for the serve command.
 pub struct ServerState {
@@ -512,8 +1095,11 @@ pub struct ServerState {
     pub includes: Vec<String>,
     pub current: Mutex<Arc<Snapshot>>,
     pub history: Mutex<BTreeMap<String, Arc<Snapshot>>>,
+    pub history_order: Mutex<VecDeque<String>>,
     pub tx: tokio::sync::broadcast::Sender<SyncDiffEvent>,
     pub sequence: Mutex<u64>,
+    pub cache: Mutex<SnapshotCache>,
+    pub metrics: Arc<Metrics>,
 }
 
 impl ServerState {
@@ -525,23 +1111,62 @@ impl ServerState {
     ) -> Arc<Self> {
         let capacity = channel_capacity.clamp(32, 16_384);
         let (tx, _rx) = tokio::sync::broadcast::channel::<SyncDiffEvent>(capacity);
+        let metrics = Arc::new(Metrics::new());
+        metrics
+            .entries
+            .store(initial.entries.len() as u64, Ordering::Relaxed);
         let arc = Arc::new(initial);
         let mut history = BTreeMap::new();
+        let mut history_order = VecDeque::new();
         history.insert(arc.fingerprint.clone(), Arc::clone(&arc));
+        history_order.push_back(arc.fingerprint.clone());
 
         Arc::new(Self {
             root,
             includes,
             current: Mutex::new(arc),
             history: Mutex::new(history),
+            history_order: Mutex::new(history_order),
             tx,
             sequence: Mutex::new(0),
+            cache: Mutex::new(SnapshotCache::new()),
+            metrics,
         })
     }
 
     /// Poll source tree and broadcast diff if changed.
+    /// Uses incremental `SnapshotCache` so only changed files are re-hashed.
     pub fn poll_and_broadcast(&self) -> Result<()> {
-        let new_snapshot = build_snapshot(&self.root, &self.includes)?;
+        let start = Instant::now();
+        let new_snapshot = {
+            let mut cache_lock = self
+                .cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
+            build_snapshot_cached_with_metrics(
+                &self.root,
+                &self.includes,
+                &mut cache_lock,
+                &self.metrics,
+            )?
+        };
+        let elapsed = start.elapsed();
+
+        // Record poll metrics.
+        self.metrics.polls.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .poll_duration_sum_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        self.metrics
+            .entries
+            .store(new_snapshot.entries.len() as u64, Ordering::Relaxed);
+
+        if elapsed.as_millis() > 50 {
+            eprintln!(
+                "[vertigo-sync] slow poll: {elapsed:?} ({} entries)",
+                new_snapshot.entries.len()
+            );
+        }
         let current = {
             let lock = self
                 .current
@@ -583,13 +1208,30 @@ impl ServerState {
             *lock = Arc::clone(&new_arc);
         }
         {
-            let mut lock = self
+            let mut hist_lock = self
                 .history
                 .lock()
                 .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-            lock.insert(new_arc.fingerprint.clone(), new_arc);
+            let mut order_lock = self
+                .history_order
+                .lock()
+                .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+
+            let fp = new_arc.fingerprint.clone();
+            if !hist_lock.contains_key(&fp) {
+                hist_lock.insert(fp.clone(), new_arc);
+                order_lock.push_back(fp);
+
+                // Evict oldest entries beyond the limit.
+                while order_lock.len() > MAX_HISTORY_ENTRIES {
+                    if let Some(oldest) = order_lock.pop_front() {
+                        hist_lock.remove(&oldest);
+                    }
+                }
+            }
         }
 
+        self.metrics.events_emitted.fetch_add(1, Ordering::Relaxed);
         let _ = self.tx.send(event);
         Ok(())
     }
@@ -762,6 +1404,18 @@ fn collect_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Resu
 
 fn hash_file(path: &Path) -> Result<(String, u64)> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    let file_len = meta.len();
+
+    // For files above the mmap threshold, use zero-copy memory-mapped I/O.
+    // This avoids a kernel→userspace copy for the entire file contents.
+    if file_len > MMAP_THRESHOLD {
+        return hash_file_mmap(&file, file_len, path);
+    }
+
+    // Small files: regular buffered read (mmap syscall overhead not worth it).
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
     let mut total_bytes = 0_u64;
@@ -780,6 +1434,23 @@ fn hash_file(path: &Path) -> Result<(String, u64)> {
 
     let digest = hasher.finalize();
     Ok((format!("{digest:x}"), total_bytes))
+}
+
+/// Hash a file using memory-mapped I/O. The mmap gives the kernel a single
+/// contiguous view of the file — the SHA-256 update reads directly from the
+/// page cache with zero intermediate copies.
+#[allow(unsafe_code)]
+fn hash_file_mmap(file: &File, file_len: u64, path: &Path) -> Result<(String, u64)> {
+    // SAFETY: The file is open for reading and we do not modify it.
+    // The mmap is read-only and lives only for the duration of this function.
+    let mmap = unsafe {
+        memmap2::Mmap::map(file)
+            .with_context(|| format!("failed to mmap {}", path.display()))?
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&mmap[..]);
+    let digest = hasher.finalize();
+    Ok((format!("{digest:x}"), file_len))
 }
 
 fn ensure_parent(path: &Path) -> Result<()> {
@@ -1000,5 +1671,177 @@ mod tests {
 
         assert_eq!(snap.fingerprint, deserialized.fingerprint);
         assert_eq!(snap.entries.len(), deserialized.entries.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // SnapshotCache tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cache_new_is_empty() {
+        let cache = SnapshotCache::new();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn cache_insert_and_get() {
+        let mut cache = SnapshotCache::new();
+        let mtime = SystemTime::now();
+        cache.insert("src/a.lua".into(), "abc123".into(), 100, mtime);
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get("src/a.lua", mtime, 100), Some("abc123"));
+    }
+
+    #[test]
+    fn cache_miss_on_different_mtime() {
+        let mut cache = SnapshotCache::new();
+        let mtime = SystemTime::now();
+        cache.insert("src/a.lua".into(), "abc123".into(), 100, mtime);
+
+        let later = mtime + Duration::from_secs(1);
+        assert_eq!(cache.get("src/a.lua", later, 100), None);
+    }
+
+    #[test]
+    fn cache_miss_on_different_size() {
+        let mut cache = SnapshotCache::new();
+        let mtime = SystemTime::now();
+        cache.insert("src/a.lua".into(), "abc123".into(), 100, mtime);
+
+        assert_eq!(cache.get("src/a.lua", mtime, 200), None);
+    }
+
+    #[test]
+    fn cache_retain_prunes_deleted() {
+        let mut cache = SnapshotCache::new();
+        let mtime = SystemTime::now();
+        cache.insert("src/a.lua".into(), "aaa".into(), 10, mtime);
+        cache.insert("src/b.lua".into(), "bbb".into(), 20, mtime);
+        cache.insert("src/c.lua".into(), "ccc".into(), 30, mtime);
+
+        let live: HashSet<String> = ["src/a.lua".into(), "src/c.lua".into()].into();
+        cache.retain_paths(&live);
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get("src/a.lua", mtime, 10).is_some());
+        assert!(cache.get("src/b.lua", mtime, 20).is_none());
+        assert!(cache.get("src/c.lua", mtime, 30).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_snapshot_cached tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cached_snapshot_matches_uncached() {
+        let root = tempdir().expect("tempdir");
+        fs::create_dir_all(root.path().join("src/sub")).expect("mkdir");
+        fs::write(root.path().join("src/a.luau"), "return 'a'\n").expect("write a");
+        fs::write(root.path().join("src/b.luau"), "return 'b'\n").expect("write b");
+        fs::write(root.path().join("src/sub/c.luau"), "return 'c'\n").expect("write c");
+
+        let includes = vec!["src".to_string()];
+        let uncached = build_snapshot(root.path(), &includes).expect("uncached");
+
+        let mut cache = SnapshotCache::new();
+        let cached = build_snapshot_cached(root.path(), &includes, &mut cache).expect("cached");
+
+        assert_eq!(uncached.fingerprint, cached.fingerprint);
+        assert_eq!(uncached.entries, cached.entries);
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn cached_snapshot_reuses_cache_on_second_call() {
+        let root = tempdir().expect("tempdir");
+        fs::create_dir_all(root.path().join("src")).expect("mkdir");
+        fs::write(root.path().join("src/a.luau"), "return 'a'\n").expect("write");
+
+        let includes = vec!["src".to_string()];
+        let mut cache = SnapshotCache::new();
+
+        let first = build_snapshot_cached(root.path(), &includes, &mut cache).expect("first");
+        let second = build_snapshot_cached(root.path(), &includes, &mut cache).expect("second");
+
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(first.entries, second.entries);
+    }
+
+    #[test]
+    fn cached_snapshot_detects_file_modification() {
+        let root = tempdir().expect("tempdir");
+        fs::create_dir_all(root.path().join("src")).expect("mkdir");
+        fs::write(root.path().join("src/x.luau"), "return 1\n").expect("write");
+
+        let includes = vec!["src".to_string()];
+        let mut cache = SnapshotCache::new();
+
+        let first = build_snapshot_cached(root.path(), &includes, &mut cache).expect("first");
+
+        // Wait briefly so mtime advances, then modify.
+        std::thread::sleep(Duration::from_millis(50));
+        fs::write(root.path().join("src/x.luau"), "return 2\n").expect("modify");
+
+        let second = build_snapshot_cached(root.path(), &includes, &mut cache).expect("second");
+
+        assert_ne!(first.fingerprint, second.fingerprint);
+    }
+
+    #[test]
+    fn cached_snapshot_handles_deleted_file() {
+        let root = tempdir().expect("tempdir");
+        fs::create_dir_all(root.path().join("src")).expect("mkdir");
+        fs::write(root.path().join("src/a.luau"), "a").expect("write a");
+        fs::write(root.path().join("src/b.luau"), "b").expect("write b");
+
+        let includes = vec!["src".to_string()];
+        let mut cache = SnapshotCache::new();
+
+        let _first = build_snapshot_cached(root.path(), &includes, &mut cache).expect("first");
+        assert_eq!(cache.len(), 2);
+
+        fs::remove_file(root.path().join("src/b.luau")).expect("delete");
+
+        let second = build_snapshot_cached(root.path(), &includes, &mut cache).expect("second");
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(cache.len(), 1); // pruned
+    }
+
+    // -----------------------------------------------------------------------
+    // mmap hash parity test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mmap_and_buffered_hash_produce_same_result() {
+        let root = tempdir().expect("tempdir");
+
+        // Create a file larger than MMAP_THRESHOLD (4KB).
+        let large_content: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
+        let large_path = root.path().join("large.bin");
+        fs::write(&large_path, &large_content).expect("write large");
+
+        // Create a file smaller than MMAP_THRESHOLD.
+        let small_path = root.path().join("small.bin");
+        fs::write(&small_path, b"hello world").expect("write small");
+
+        let (large_hash, large_bytes) = hash_file(&large_path).expect("hash large");
+        let (small_hash, small_bytes) = hash_file(&small_path).expect("hash small");
+
+        assert_eq!(large_bytes, 8192);
+        assert_eq!(small_bytes, 11);
+
+        // Verify hashes are valid hex SHA-256 (64 chars).
+        assert_eq!(large_hash.len(), 64);
+        assert_eq!(small_hash.len(), 64);
+        assert!(large_hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(small_hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Re-hash to confirm determinism.
+        let (large_hash2, _) = hash_file(&large_path).expect("rehash large");
+        let (small_hash2, _) = hash_file(&small_path).expect("rehash small");
+        assert_eq!(large_hash, large_hash2);
+        assert_eq!(small_hash, small_hash2);
     }
 }

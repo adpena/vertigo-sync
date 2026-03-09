@@ -4,10 +4,13 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use vertigo_sync::project::parse_project;
 use vertigo_sync::server::run_serve;
+use vertigo_sync::validate;
 use vertigo_sync::{
     DiffEvent, EventDiffCounts, EventPaths, append_event, build_snapshot, diff_snapshots,
-    next_event_seq, read_snapshot, run_doctor, run_health_doctor, run_watch, write_json_file,
+    next_event_seq, read_snapshot, run_doctor, run_health_doctor, run_watch, run_watch_native,
+    write_json_file,
 };
 
 #[derive(Debug, Parser)]
@@ -78,6 +81,20 @@ struct Cli {
     )]
     channel_capacity: usize,
 
+    #[arg(
+        long,
+        default_value_t = 50,
+        help = "Event coalescing window in milliseconds"
+    )]
+    coalesce_ms: u64,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Turbo mode: 10ms coalesce, 100ms poll, native fsevents"
+    )]
+    turbo: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -96,8 +113,21 @@ enum Command {
     Health,
     /// Blocking watch loop that emits NDJSON diff events to stdout.
     Watch,
+    /// Native filesystem watch using FSEvents/inotify (replaces polling).
+    WatchNative,
     /// Serve snapshot/diff/events over HTTP + SSE.
     Serve,
+    /// Validate Luau source files for common issues.
+    Validate,
+    /// Build a .rbxl place file from source (replaces `rojo build`).
+    Build {
+        /// Output .rbxl file path.
+        #[arg(long, short)]
+        output: PathBuf,
+        /// Project file path (default: default.project.json).
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -113,14 +143,29 @@ async fn main() -> Result<()> {
         Command::Doctor => command_doctor(&root, &state_dir, &cli),
         Command::Health => command_health(&root, &state_dir, &cli),
         Command::Watch => command_watch(&root, &state_dir, &cli),
+        Command::WatchNative => command_watch_native(&root, &state_dir, &cli),
+        Command::Validate => command_validate(&root, &cli),
+        Command::Build { output, project } => command_build(&root, output, project),
         Command::Serve => {
             let includes = cli.include.clone();
+            let (interval, coalesce_ms) = if cli.turbo {
+                eprintln!(
+                    "[vertigo-sync] turbo mode: 10ms coalesce, native fsevents"
+                );
+                (Duration::from_millis(100), 10u64)
+            } else {
+                (
+                    Duration::from_secs(cli.interval_seconds.max(1)),
+                    cli.coalesce_ms,
+                )
+            };
             run_serve(
                 root,
                 includes,
                 cli.port,
-                Duration::from_secs(cli.interval_seconds.max(1)),
+                interval,
                 cli.channel_capacity,
+                coalesce_ms,
             )
             .await
         }
@@ -300,6 +345,58 @@ fn command_health(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
+    let report = validate::validate_source(root, &cli.include)?;
+
+    // Print issues in a cargo-style format.
+    for issue in &report.issues {
+        let severity_tag = match issue.severity.as_str() {
+            "error" => "error",
+            "warning" => "warning",
+            _ => "info",
+        };
+        let location = if issue.line > 0 {
+            format!("{}:{}", issue.path, issue.line)
+        } else {
+            issue.path.clone()
+        };
+        println!("{severity_tag}[{}]: {location}: {}", issue.rule, issue.message);
+    }
+
+    // Optionally run selene if available.
+    if let Some(selene_output) = validate::run_selene(root, &cli.include) {
+        if !selene_output.is_empty() {
+            println!();
+            println!("--- selene output ---");
+            for line in &selene_output {
+                println!("{line}");
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "validate: files={} errors={} warnings={} clean={}",
+        report.files_checked, report.errors, report.warnings, report.clean
+    );
+
+    if let Some(output_path) = cli.output.as_ref() {
+        let path = resolve_relative_to_root(root, output_path);
+        write_json_file(&path, &report)?;
+        println!("report path={}", path.display());
+    }
+
+    if report.errors > 0 {
+        bail!(
+            "validation failed: {} error(s), {} warning(s)",
+            report.errors,
+            report.warnings
+        )
+    }
+
+    Ok(())
+}
+
 fn command_watch(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
     let output_dir = cli
         .output
@@ -313,6 +410,66 @@ fn command_watch(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
         Duration::from_secs(cli.interval_seconds.max(1)),
         Some(&output_dir),
     )
+}
+
+fn command_watch_native(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
+    let output_dir = cli
+        .output
+        .as_ref()
+        .map(|value| resolve_relative_to_root(root, value))
+        .unwrap_or_else(|| state_dir.to_path_buf());
+
+    let coalesce_ms = if cli.turbo {
+        eprintln!(
+            "[vertigo-sync] turbo mode: 10ms coalesce, native fsevents"
+        );
+        10
+    } else {
+        cli.coalesce_ms
+    };
+    run_watch_native(
+        root,
+        &cli.include,
+        Some(&output_dir),
+        Duration::from_millis(coalesce_ms),
+    )
+}
+
+fn command_build(root: &Path, output: &Path, project: &Path) -> Result<()> {
+    let project_path = if project.is_absolute() {
+        project.to_path_buf()
+    } else {
+        root.join(project)
+    };
+
+    let tree = parse_project(&project_path)?;
+
+    println!("[vertigo-sync] build (dry-run)");
+    println!("  project: {}", project_path.display());
+    println!("  output:  {}", output.display());
+    println!("  name:    {}", tree.name);
+    println!("  mappings:");
+
+    for mapping in &tree.mappings {
+        println!(
+            "    {} -> {} (class={}, ignore_unknown={})",
+            mapping.fs_path, mapping.instance_path, mapping.class_name, mapping.ignore_unknown
+        );
+    }
+
+    // Build a snapshot to show what files would be included.
+    let fs_paths: Vec<String> = tree
+        .mappings
+        .iter()
+        .map(|m| m.fs_path.clone())
+        .collect();
+    let snapshot = build_snapshot(root, &fs_paths)?;
+    println!("  source files: {}", snapshot.entries.len());
+    println!("  fingerprint:  {}", snapshot.fingerprint);
+    println!();
+    println!("[vertigo-sync] rbx-dom integration is WIP — dry-run only");
+
+    Ok(())
 }
 
 fn resolve_root(path: &Path) -> Result<PathBuf> {

@@ -10,15 +10,26 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.26"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
+rayon = "1"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
+notify = { version = "8", features = ["macos_fsevent"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+serde_json = "1"
 tempfile = "3"
+
+[[bench]]
+name = "sync_benchmark"
+harness = false
