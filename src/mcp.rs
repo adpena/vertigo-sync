@@ -15,16 +15,16 @@
 //! Read ops are side-effect-free. Write ops rebuild the snapshot atomically.
 //! Validation ops work on content in memory without touching disk.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::project::parse_project;
@@ -334,6 +334,31 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
                 false,
             )],
         ),
+        // ── Pipeline orchestration ─────────────────────────────────
+        tool_def(
+            "vsync_pipeline",
+            "Execute a composable pipeline of operations with dependency-aware scheduling",
+            vec![
+                param(
+                    "steps",
+                    "array",
+                    "Array of pipeline steps: {tool, args, id, depends_on?, collect?}",
+                    true,
+                ),
+                param(
+                    "mode",
+                    "string",
+                    "Execution mode: 'sequential', 'parallel', 'auto' (default: 'auto')",
+                    false,
+                ),
+                param(
+                    "stop_on_error",
+                    "boolean",
+                    "Stop pipeline on first error (default: true)",
+                    false,
+                ),
+            ],
+        ),
     ])
 }
 
@@ -352,6 +377,12 @@ pub async fn handle_mcp_execute(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<McpExecuteRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Pipeline is async — handle it before the synchronous match.
+    if req.tool == "vsync_pipeline" {
+        let result = exec_pipeline(&state, &req.arguments).await?;
+        return Ok(Json(result));
+    }
+
     let result = match req.tool.as_str() {
         // Existing tools
         "vsync_health" => exec_health(),
@@ -1930,6 +1961,500 @@ fn compute_stats(snapshot: &crate::Snapshot) -> serde_json::Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline orchestration — vsync_pipeline
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+struct PipelineStep {
+    tool: String,
+    #[serde(default)]
+    args: serde_json::Value,
+    id: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    collect: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PipelineError {
+    step_id: String,
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PipelineResult {
+    completed: usize,
+    failed: usize,
+    results: serde_json::Map<String, serde_json::Value>,
+    errors: Vec<PipelineError>,
+    execution_order: Vec<String>,
+    total_ms: u64,
+}
+
+/// Execute a single pipeline step by dispatching to the appropriate tool.
+fn execute_step(
+    state: &ServerState,
+    step: &PipelineStep,
+    namespace: &HashMap<String, serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    // Interpolate variable references in args: "${step_id.field}" syntax.
+    let args = interpolate_args(&step.args, namespace);
+
+    match step.tool.as_str() {
+        "vsync_health" => exec_health().map_err(|(_, e)| e),
+        "vsync_snapshot" => exec_snapshot(state).map_err(|(_, e)| e),
+        "vsync_diff" => exec_diff(state, &args).map_err(|(_, e)| e),
+        "vsync_sources" => exec_sources(state).map_err(|(_, e)| e),
+        "vsync_source" => exec_source(state, &args).map_err(|(_, e)| e),
+        "vsync_validate" => exec_validate(state).map_err(|(_, e)| e),
+        "vsync_metrics" => exec_metrics(state).map_err(|(_, e)| e),
+        "vsync_patch" => exec_patch(state, &args).map_err(|(_, e)| e),
+        "vsync_doctor" => exec_doctor(state).map_err(|(_, e)| e),
+        "vsync_project" => exec_project(state).map_err(|(_, e)| e),
+        "vsync_search" => exec_search(state, &args).map_err(|(_, e)| e),
+        "vsync_stats" => exec_stats(state).map_err(|(_, e)| e),
+        "vsync_ls" => exec_ls(state, &args).map_err(|(_, e)| e),
+        "vsync_read_batch" => exec_read_batch(state, &args).map_err(|(_, e)| e),
+        "vsync_file_info" => exec_file_info(state, &args).map_err(|(_, e)| e),
+        "vsync_grep" => exec_grep(state, &args).map_err(|(_, e)| e),
+        "vsync_write" => exec_write(state, &args).map_err(|(_, e)| e),
+        "vsync_delete" => exec_delete(state, &args).map_err(|(_, e)| e),
+        "vsync_move" => exec_move(state, &args).map_err(|(_, e)| e),
+        "vsync_mkdir" => exec_mkdir(state, &args).map_err(|(_, e)| e),
+        "vsync_validate_content" => exec_validate_content(&args).map_err(|(_, e)| e),
+        "vsync_check_conflict" => exec_check_conflict(state, &args).map_err(|(_, e)| e),
+        "vsync_safe_write" => exec_safe_write(state, &args).map_err(|(_, e)| e),
+        "vsync_describe_changes" => exec_describe_changes(state, &args).map_err(|(_, e)| e),
+        "vsync_tree" => exec_tree(state, &args).map_err(|(_, e)| e),
+        "vsync_status" => exec_status(state).map_err(|(_, e)| e),
+        "vsync_events" => exec_events(state, &args).map_err(|(_, e)| e),
+        other => Err(format!("unknown tool in pipeline: {other}")),
+    }
+}
+
+/// Interpolate `${step_id.field}` references in JSON args using the namespace.
+fn interpolate_args(
+    args: &serde_json::Value,
+    namespace: &HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    match args {
+        serde_json::Value::String(s) => {
+            // Full-value substitution: if the entire string is "${x.y}", replace
+            // with the actual JSON value (preserving type).
+            if s.starts_with("${") && s.ends_with('}') && s.matches("${").count() == 1 {
+                let ref_path = &s[2..s.len() - 1];
+                if let Some(val) = resolve_ref(ref_path, namespace) {
+                    return val;
+                }
+            }
+            // Partial interpolation: replace ${...} within the string.
+            let mut result = s.clone();
+            while let Some(start) = result.find("${") {
+                let rest = &result[start + 2..];
+                if let Some(end) = rest.find('}') {
+                    let ref_path = &rest[..end];
+                    let replacement = resolve_ref(ref_path, namespace)
+                        .and_then(|v| match &v {
+                            serde_json::Value::String(s) => Some(s.clone()),
+                            other => Some(other.to_string()),
+                        })
+                        .unwrap_or_default();
+                    result = format!(
+                        "{}{}{}",
+                        &result[..start],
+                        replacement,
+                        &result[start + 2 + end + 1..]
+                    );
+                } else {
+                    break;
+                }
+            }
+            serde_json::Value::String(result)
+        }
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                out.insert(k.clone(), interpolate_args(v, namespace));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(|v| interpolate_args(v, namespace)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Resolve a dotted reference like "step1.content" from the namespace.
+fn resolve_ref(
+    ref_path: &str,
+    namespace: &HashMap<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let mut parts = ref_path.splitn(2, '.');
+    let step_id = parts.next()?;
+    let field = parts.next();
+
+    let value = namespace.get(step_id)?;
+    match field {
+        Some(f) => value.get(f).cloned(),
+        None => Some(value.clone()),
+    }
+}
+
+/// Topological sort of pipeline steps. Returns levels where each level
+/// contains step indices that can execute in parallel.
+fn topological_levels(steps: &[PipelineStep]) -> Result<Vec<Vec<usize>>, String> {
+    let n = steps.len();
+    let id_to_idx: HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), i))
+        .collect();
+
+    // Validate all dependencies exist.
+    for step in steps {
+        for dep in &step.depends_on {
+            if !id_to_idx.contains_key(dep.as_str()) {
+                return Err(format!(
+                    "step '{}' depends on unknown step '{}'",
+                    step.id, dep
+                ));
+            }
+        }
+    }
+
+    // Build in-degree map and adjacency list.
+    let mut in_degree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (i, step) in steps.iter().enumerate() {
+        for dep in &step.depends_on {
+            if let Some(&dep_idx) = id_to_idx.get(dep.as_str()) {
+                in_degree[i] += 1;
+                dependents[dep_idx].push(i);
+            }
+        }
+    }
+
+    // Kahn's algorithm with level tracking.
+    let mut levels: Vec<Vec<usize>> = Vec::new();
+    let mut queue: VecDeque<usize> = VecDeque::new();
+
+    for i in 0..n {
+        if in_degree[i] == 0 {
+            queue.push_back(i);
+        }
+    }
+
+    let mut visited = 0usize;
+
+    while !queue.is_empty() {
+        let level: Vec<usize> = queue.drain(..).collect();
+        let mut next_queue = VecDeque::new();
+
+        for &idx in &level {
+            visited += 1;
+            for &dep_idx in &dependents[idx] {
+                in_degree[dep_idx] -= 1;
+                if in_degree[dep_idx] == 0 {
+                    next_queue.push_back(dep_idx);
+                }
+            }
+        }
+
+        levels.push(level);
+        queue = next_queue;
+    }
+
+    if visited != n {
+        return Err("pipeline contains a dependency cycle".to_string());
+    }
+
+    Ok(levels)
+}
+
+/// Execute the pipeline in sequential mode: steps run one at a time in order.
+async fn execute_sequential(
+    steps: Vec<PipelineStep>,
+    stop_on_error: bool,
+    state: &Arc<ServerState>,
+) -> Result<PipelineResult, (StatusCode, String)> {
+    let start = Instant::now();
+    let mut namespace: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut results = serde_json::Map::new();
+    let mut errors: Vec<PipelineError> = Vec::new();
+    let mut execution_order: Vec<String> = Vec::new();
+    let mut completed = 0usize;
+
+    for step in &steps {
+        execution_order.push(step.id.clone());
+
+        match execute_step(state, step, &namespace) {
+            Ok(value) => {
+                completed += 1;
+                // Store in namespace under step id (always) and collect name (if set).
+                namespace.insert(step.id.clone(), value.clone());
+                if let Some(ref collect) = step.collect {
+                    namespace.insert(collect.clone(), value.clone());
+                }
+                results.insert(step.id.clone(), value);
+            }
+            Err(error) => {
+                errors.push(PipelineError {
+                    step_id: step.id.clone(),
+                    error,
+                });
+                if stop_on_error {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(PipelineResult {
+        completed,
+        failed: errors.len(),
+        results,
+        errors,
+        execution_order,
+        total_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
+/// Execute the pipeline in parallel mode: all steps run concurrently (imap_unordered).
+async fn execute_parallel(
+    steps: Vec<PipelineStep>,
+    stop_on_error: bool,
+    state: &Arc<ServerState>,
+) -> Result<PipelineResult, (StatusCode, String)> {
+    let start = Instant::now();
+    let state = Arc::clone(state);
+
+    // Spawn all steps as concurrent tasks on the blocking pool (since the
+    // underlying tool implementations are synchronous).
+    let mut handles = Vec::with_capacity(steps.len());
+    for step in steps.clone() {
+        let state_clone = Arc::clone(&state);
+        let handle = tokio::task::spawn_blocking(move || {
+            let namespace = HashMap::new();
+            let result = execute_step(&state_clone, &step, &namespace);
+            (step.id.clone(), step.collect.clone(), result)
+        });
+        handles.push(handle);
+    }
+
+    let mut results = serde_json::Map::new();
+    let mut errors: Vec<PipelineError> = Vec::new();
+    let mut execution_order: Vec<String> = Vec::new();
+    let mut completed = 0usize;
+
+    for handle in handles {
+        match handle.await {
+            Ok((id, collect, Ok(value))) => {
+                completed += 1;
+                execution_order.push(id.clone());
+                if let Some(ref collect_name) = collect {
+                    results.insert(collect_name.clone(), value.clone());
+                }
+                results.insert(id, value);
+            }
+            Ok((id, _, Err(error))) => {
+                execution_order.push(id.clone());
+                errors.push(PipelineError {
+                    step_id: id,
+                    error,
+                });
+                if stop_on_error {
+                    break;
+                }
+            }
+            Err(join_error) => {
+                errors.push(PipelineError {
+                    step_id: "unknown".to_string(),
+                    error: format!("task join error: {join_error}"),
+                });
+                if stop_on_error {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(PipelineResult {
+        completed,
+        failed: errors.len(),
+        results,
+        errors,
+        execution_order,
+        total_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
+/// Execute the pipeline in auto mode: topological sort by dependencies,
+/// execute independent steps within each level concurrently.
+async fn execute_auto(
+    steps: Vec<PipelineStep>,
+    stop_on_error: bool,
+    state: &Arc<ServerState>,
+) -> Result<PipelineResult, (StatusCode, String)> {
+    let start = Instant::now();
+
+    let levels = topological_levels(&steps)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    let namespace = Arc::new(std::sync::Mutex::new(HashMap::<String, serde_json::Value>::new()));
+    let mut results = serde_json::Map::new();
+    let mut errors: Vec<PipelineError> = Vec::new();
+    let mut execution_order: Vec<String> = Vec::new();
+    let mut completed = 0usize;
+    let mut should_stop = false;
+
+    for level in &levels {
+        if should_stop {
+            break;
+        }
+
+        if level.len() == 1 {
+            // Single step — run inline, no spawn overhead.
+            let step = &steps[level[0]];
+            execution_order.push(step.id.clone());
+            let ns = namespace.lock().unwrap().clone();
+
+            match execute_step(state, step, &ns) {
+                Ok(value) => {
+                    completed += 1;
+                    let mut ns = namespace.lock().unwrap();
+                    ns.insert(step.id.clone(), value.clone());
+                    if let Some(ref collect) = step.collect {
+                        ns.insert(collect.clone(), value.clone());
+                    }
+                    results.insert(step.id.clone(), value);
+                }
+                Err(error) => {
+                    errors.push(PipelineError {
+                        step_id: step.id.clone(),
+                        error,
+                    });
+                    if stop_on_error {
+                        should_stop = true;
+                    }
+                }
+            }
+        } else {
+            // Multiple steps — run concurrently on the blocking pool.
+            let mut handles = Vec::with_capacity(level.len());
+            for &idx in level {
+                let step = steps[idx].clone();
+                let state_clone = Arc::clone(state);
+                let ns_clone = namespace.lock().unwrap().clone();
+                let handle = tokio::task::spawn_blocking(move || {
+                    let result = execute_step(&state_clone, &step, &ns_clone);
+                    (step.id.clone(), step.collect.clone(), result)
+                });
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                match handle.await {
+                    Ok((id, collect, Ok(value))) => {
+                        completed += 1;
+                        execution_order.push(id.clone());
+                        let mut ns = namespace.lock().unwrap();
+                        ns.insert(id.clone(), value.clone());
+                        if let Some(ref collect_name) = collect {
+                            ns.insert(collect_name.clone(), value.clone());
+                        }
+                        results.insert(id, value);
+                    }
+                    Ok((id, _, Err(error))) => {
+                        execution_order.push(id.clone());
+                        errors.push(PipelineError {
+                            step_id: id,
+                            error,
+                        });
+                        if stop_on_error {
+                            should_stop = true;
+                        }
+                    }
+                    Err(join_error) => {
+                        errors.push(PipelineError {
+                            step_id: "unknown".to_string(),
+                            error: format!("task join error: {join_error}"),
+                        });
+                        if stop_on_error {
+                            should_stop = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(PipelineResult {
+        completed,
+        failed: errors.len(),
+        results,
+        errors,
+        execution_order,
+        total_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
+/// Top-level pipeline executor: parse args, dispatch to the appropriate mode.
+async fn exec_pipeline(
+    state: &Arc<ServerState>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let steps: Vec<PipelineStep> = serde_json::from_value(
+        args.get("steps")
+            .cloned()
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing required param: steps".into()))?,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid steps: {e}")))?;
+
+    if steps.is_empty() {
+        return Ok(serde_json::json!({
+            "completed": 0,
+            "failed": 0,
+            "results": {},
+            "errors": [],
+            "execution_order": [],
+            "total_ms": 0,
+        }));
+    }
+
+    // Validate step IDs are unique.
+    let mut seen_ids = HashSet::new();
+    for step in &steps {
+        if !seen_ids.insert(&step.id) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("duplicate step id: {}", step.id),
+            ));
+        }
+    }
+
+    let mode = args
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto");
+    let stop_on_error = args
+        .get("stop_on_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let result = match mode {
+        "sequential" => execute_sequential(steps, stop_on_error, state).await?,
+        "parallel" => execute_parallel(steps, stop_on_error, state).await?,
+        "auto" | _ => execute_auto(steps, stop_on_error, state).await?,
+    };
+
+    serde_json::to_value(&result)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("serialize error: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2014,12 +2539,12 @@ mod tests {
 
     #[test]
     fn tool_count_matches_expected() {
-        // Ensure we don't accidentally drop tools. 13 existing + 14 new = 27.
+        // Ensure we don't accidentally drop tools. 13 existing + 14 new + 1 pipeline = 28.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         let tools = rt.block_on(async { handle_mcp_tools().await });
-        assert_eq!(tools.0.len(), 27, "expected 27 MCP tools");
+        assert_eq!(tools.0.len(), 28, "expected 28 MCP tools");
     }
 
     #[test]
@@ -2036,5 +2561,113 @@ mod tests {
         let b = sha256_hex(b"hello world");
         assert_eq!(a, b);
         assert_eq!(a.len(), 64); // 256 bits = 64 hex chars
+    }
+
+    #[test]
+    fn topological_sort_linear() {
+        let steps = vec![
+            PipelineStep {
+                tool: "vsync_health".into(),
+                args: serde_json::Value::Null,
+                id: "a".into(),
+                depends_on: vec![],
+                collect: None,
+            },
+            PipelineStep {
+                tool: "vsync_health".into(),
+                args: serde_json::Value::Null,
+                id: "b".into(),
+                depends_on: vec!["a".into()],
+                collect: None,
+            },
+            PipelineStep {
+                tool: "vsync_health".into(),
+                args: serde_json::Value::Null,
+                id: "c".into(),
+                depends_on: vec!["b".into()],
+                collect: None,
+            },
+        ];
+        let levels = topological_levels(&steps).unwrap();
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0], vec![0]);
+        assert_eq!(levels[1], vec![1]);
+        assert_eq!(levels[2], vec![2]);
+    }
+
+    #[test]
+    fn topological_sort_parallel() {
+        let steps = vec![
+            PipelineStep {
+                tool: "vsync_health".into(),
+                args: serde_json::Value::Null,
+                id: "a".into(),
+                depends_on: vec![],
+                collect: None,
+            },
+            PipelineStep {
+                tool: "vsync_health".into(),
+                args: serde_json::Value::Null,
+                id: "b".into(),
+                depends_on: vec![],
+                collect: None,
+            },
+            PipelineStep {
+                tool: "vsync_health".into(),
+                args: serde_json::Value::Null,
+                id: "c".into(),
+                depends_on: vec!["a".into(), "b".into()],
+                collect: None,
+            },
+        ];
+        let levels = topological_levels(&steps).unwrap();
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].len(), 2); // a and b in parallel
+        assert_eq!(levels[1], vec![2]); // c after both
+    }
+
+    #[test]
+    fn topological_sort_cycle_detected() {
+        let steps = vec![
+            PipelineStep {
+                tool: "vsync_health".into(),
+                args: serde_json::Value::Null,
+                id: "a".into(),
+                depends_on: vec!["b".into()],
+                collect: None,
+            },
+            PipelineStep {
+                tool: "vsync_health".into(),
+                args: serde_json::Value::Null,
+                id: "b".into(),
+                depends_on: vec!["a".into()],
+                collect: None,
+            },
+        ];
+        assert!(topological_levels(&steps).is_err());
+    }
+
+    #[test]
+    fn interpolate_full_ref() {
+        let mut ns = HashMap::new();
+        ns.insert(
+            "step1".to_string(),
+            serde_json::json!({"path": "src/test.luau", "content": "hello"}),
+        );
+        let args = serde_json::json!({"path": "${step1.path}"});
+        let result = interpolate_args(&args, &ns);
+        assert_eq!(result["path"], "src/test.luau");
+    }
+
+    #[test]
+    fn interpolate_partial_ref() {
+        let mut ns = HashMap::new();
+        ns.insert(
+            "s1".to_string(),
+            serde_json::json!({"dir": "src/Server"}),
+        );
+        let args = serde_json::json!({"path": "${s1.dir}/NewFile.luau"});
+        let result = interpolate_args(&args, &ns);
+        assert_eq!(result["path"], "src/Server/NewFile.luau");
     }
 }
