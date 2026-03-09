@@ -1,0 +1,24 @@
+[package]
+name = "vertigo-sync"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic source snapshot and diff CLI for Vertigo"
+
+[[bin]]
+name = "vertigo-sync"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+[dev-dependencies]
+tempfile = "3"
