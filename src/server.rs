@@ -104,6 +104,10 @@ impl PlannedPatch {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyncPatchAck {
+    pub status: String,
+    pub reason_code: String,
+    #[serde(default)]
+    pub reason_message: String,
     pub accepted: bool,
     pub new_source_hash: String,
     pub applied: usize,
@@ -503,63 +507,59 @@ async fn handle_patch(
     };
 
     if req.source_hash != current_hash {
-        return Ok(Json(SyncPatchAck {
-            accepted: false,
-            new_source_hash: current_hash.clone(),
-            applied: 0,
-            errors: vec![format!(
-                "hash mismatch: request targets {} but current is {}",
-                req.source_hash, current_hash
-            )],
-            validation: Vec::new(),
-        }));
+        let errors = vec![format!(
+            "hash mismatch: request targets {} but current is {}",
+            req.source_hash, current_hash
+        )];
+        return Ok(Json(rejected_patch_ack(
+            current_hash.clone(),
+            "hash_mismatch",
+            errors,
+            Vec::new(),
+        )));
     }
 
     if req.patches.is_empty() {
-        return Ok(Json(SyncPatchAck {
-            accepted: false,
-            new_source_hash: current_hash,
-            applied: 0,
-            errors: vec!["patch request must include at least one patch entry".to_string()],
-            validation: Vec::new(),
-        }));
+        return Ok(Json(rejected_patch_ack(
+            current_hash,
+            "empty_patch",
+            vec!["patch request must include at least one patch entry".to_string()],
+            Vec::new(),
+        )));
     }
 
     let source_root = state.canonical_root.clone();
     let planned = match plan_patch_ops(&source_root, &req.patches) {
         Ok(planned) => planned,
         Err(errors) => {
-            return Ok(Json(SyncPatchAck {
-                accepted: false,
-                new_source_hash: current_hash,
-                applied: 0,
+            return Ok(Json(rejected_patch_ack(
+                current_hash,
+                "invalid_patch",
                 errors,
-                validation: Vec::new(),
-            }));
+                Vec::new(),
+            )));
         }
     };
 
     let expectation_errors = verify_patch_expectations(&planned);
     if !expectation_errors.is_empty() {
-        return Ok(Json(SyncPatchAck {
-            accepted: false,
-            new_source_hash: current_hash,
-            applied: 0,
-            errors: expectation_errors,
-            validation: Vec::new(),
-        }));
+        return Ok(Json(rejected_patch_ack(
+            current_hash,
+            "expected_sha256_mismatch",
+            expectation_errors,
+            Vec::new(),
+        )));
     }
 
     let applied = match apply_planned_patches_atomically(&planned) {
         Ok(applied) => applied,
         Err(errors) => {
-            return Ok(Json(SyncPatchAck {
-                accepted: false,
-                new_source_hash: current_hash,
-                applied: 0,
+            return Ok(Json(rejected_patch_ack(
+                current_hash,
+                "apply_failed",
                 errors,
-                validation: Vec::new(),
-            }));
+                Vec::new(),
+            )));
         }
     };
 
@@ -578,13 +578,46 @@ async fn handle_patch(
     };
     let validation_issues = collect_patch_validation_issues(&planned);
 
-    Ok(Json(SyncPatchAck {
+    Ok(Json(accepted_patch_ack(new_hash, applied, validation_issues)))
+}
+
+fn accepted_patch_ack(
+    new_source_hash: String,
+    applied: usize,
+    validation: Vec<crate::validate::ValidationIssue>,
+) -> SyncPatchAck {
+    SyncPatchAck {
+        status: "accepted".to_string(),
+        reason_code: "ok".to_string(),
+        reason_message: String::new(),
         accepted: true,
-        new_source_hash: new_hash,
+        new_source_hash,
         applied,
         errors: Vec::new(),
-        validation: validation_issues,
-    }))
+        validation,
+    }
+}
+
+fn rejected_patch_ack(
+    new_source_hash: String,
+    reason_code: &str,
+    errors: Vec<String>,
+    validation: Vec<crate::validate::ValidationIssue>,
+) -> SyncPatchAck {
+    let reason_message = errors
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "patch rejected".to_string());
+    SyncPatchAck {
+        status: "rejected".to_string(),
+        reason_code: reason_code.to_string(),
+        reason_message,
+        accepted: false,
+        new_source_hash,
+        applied: 0,
+        errors,
+        validation,
+    }
 }
 
 fn plan_patch_ops(
@@ -1224,5 +1257,29 @@ mod tests {
 
         let stable_now = fs::read_to_string(&stable_path).expect("read stable after rollback");
         assert_eq!(stable_now, "return 'stable-old'\n");
+    }
+
+    #[test]
+    fn rejected_patch_ack_sets_reason_fields() {
+        let ack = rejected_patch_ack(
+            "sha256:new".to_string(),
+            "invalid_patch",
+            vec!["bad patch".to_string()],
+            Vec::new(),
+        );
+        assert!(!ack.accepted);
+        assert_eq!(ack.status, "rejected");
+        assert_eq!(ack.reason_code, "invalid_patch");
+        assert_eq!(ack.reason_message, "bad patch");
+    }
+
+    #[test]
+    fn accepted_patch_ack_sets_ok_reason() {
+        let ack = accepted_patch_ack("sha256:new".to_string(), 3, Vec::new());
+        assert!(ack.accepted);
+        assert_eq!(ack.status, "accepted");
+        assert_eq!(ack.reason_code, "ok");
+        assert_eq!(ack.reason_message, "");
+        assert_eq!(ack.applied, 3);
     }
 }
