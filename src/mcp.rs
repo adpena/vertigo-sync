@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -396,6 +396,24 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
                     "Stop execution after first failure (default true)",
                     false,
                 ),
+                param(
+                    "max_retries",
+                    "number",
+                    "Per-call retry attempts for retryable bridge errors (default 0)",
+                    false,
+                ),
+                param(
+                    "retry_backoff_ms",
+                    "number",
+                    "Base retry backoff in milliseconds (default 50, exponential)",
+                    false,
+                ),
+                param(
+                    "retry_on_codes",
+                    "array",
+                    "Optional bridge error codes eligible for retry (default retryable transport/internal codes)",
+                    false,
+                ),
             ],
         ),
         // ── RBXL file loading and querying ────────────────────────────
@@ -535,6 +553,7 @@ fn bridge_method_catalog() -> &'static [(&'static str, &'static str)] {
             "source.index",
             "List all source entries with path/hash/bytes",
         ),
+        ("source.list", "List source directory entries"),
         ("source.read", "Read one source file by relative path"),
         (
             "source.read_batch",
@@ -548,15 +567,31 @@ fn bridge_method_catalog() -> &'static [(&'static str, &'static str)] {
         ("source.info", "Read source metadata for a single path"),
         ("source.tree", "Render source tree as indented text"),
         ("source.write", "Write a UTF-8 source file"),
+        ("source.delete", "Delete a source file"),
+        ("source.move", "Move/rename a source file"),
+        ("source.mkdir", "Create a source directory"),
+        (
+            "source.validate_content",
+            "Validate source content without writing to disk",
+        ),
         (
             "source.safe_write",
             "Validate then write source file atomically",
         ),
         ("source.patch", "Apply write/delete patch batch"),
         (
+            "source.describe_changes",
+            "Summarize source diffs in natural language",
+        ),
+        (
             "source.conflict_check",
             "Check if a path collides with existing source paths",
         ),
+        (
+            "source.check_conflict",
+            "Alias of source.conflict_check for compatibility",
+        ),
+        ("sync.project", "Alias of project.mappings"),
         ("project.mappings", "Return parsed project tree mappings"),
         (
             "metrics.get",
@@ -600,6 +635,72 @@ fn bridge_error_retryable(status: StatusCode) -> bool {
             | StatusCode::SERVICE_UNAVAILABLE
             | StatusCode::GATEWAY_TIMEOUT
     )
+}
+
+const BRIDGE_DEFAULT_RETRY_CODES: &[&str] = &[
+    "TIMEOUT",
+    "RATE_LIMITED",
+    "TRANSPORT_UNAVAILABLE",
+    "INTERNAL_ERROR",
+];
+
+fn parse_bridge_retry_codes(args: &serde_json::Value) -> HashSet<String> {
+    if let Some(values) = args
+        .get("retry_on_codes")
+        .and_then(serde_json::Value::as_array)
+    {
+        let codes: HashSet<String> = values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_uppercase())
+            .collect();
+        if !codes.is_empty() {
+            return codes;
+        }
+    }
+    BRIDGE_DEFAULT_RETRY_CODES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect()
+}
+
+fn parse_bridge_max_retries(args: &serde_json::Value) -> usize {
+    args.get("max_retries")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value.min(5) as usize)
+        .unwrap_or(0)
+}
+
+fn parse_bridge_retry_backoff_ms(args: &serde_json::Value) -> u64 {
+    args.get("retry_backoff_ms")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value.min(5_000))
+        .unwrap_or(50)
+}
+
+fn should_retry_bridge_error(
+    status: StatusCode,
+    code: &str,
+    allowed_codes: &HashSet<String>,
+) -> bool {
+    if allowed_codes.contains(code) {
+        return true;
+    }
+    bridge_error_retryable(status) && allowed_codes.contains(bridge_error_code(status))
+}
+
+fn annotate_bridge_attempts(
+    mut response: serde_json::Value,
+    attempts: usize,
+    retries: usize,
+) -> serde_json::Value {
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert("attempts".to_string(), serde_json::json!(attempts));
+        obj.insert("retries".to_string(), serde_json::json!(retries));
+    }
+    response
 }
 
 fn bridge_ok_response(id: Option<&str>, result: serde_json::Value) -> serde_json::Value {
@@ -696,6 +797,7 @@ fn exec_bridge_method(
         "sync.validate" => exec_validate(state),
         "sync.doctor" => exec_doctor(state),
         "source.index" => exec_sources(state),
+        "source.list" => exec_ls(state, params),
         "source.read" => exec_source(state, params),
         "source.read_batch" => exec_read_batch(state, params),
         "source.search" => exec_search(state, params),
@@ -703,9 +805,16 @@ fn exec_bridge_method(
         "source.info" => exec_file_info(state, params),
         "source.tree" => exec_tree(state, params),
         "source.write" => exec_write(state, params),
+        "source.delete" => exec_delete(state, params),
+        "source.move" => exec_move(state, params),
+        "source.mkdir" => exec_mkdir(state, params),
+        "source.validate_content" => exec_validate_content(params),
         "source.safe_write" => exec_safe_write(state, params),
         "source.patch" => exec_patch(state, params),
+        "source.describe_changes" => exec_describe_changes(state, params),
         "source.conflict_check" => exec_check_conflict(state, params),
+        "source.check_conflict" => exec_check_conflict(state, params),
+        "sync.project" => exec_project(state),
         "project.mappings" => exec_project(state),
         "metrics.get" => exec_metrics(state),
         _ => Err((
@@ -767,9 +876,16 @@ fn exec_bridge_batch(
     }
 
     let stop_on_error = args["stop_on_error"].as_bool().unwrap_or(true);
+    let max_retries = parse_bridge_max_retries(args);
+    let retry_backoff_ms = parse_bridge_retry_backoff_ms(args);
+    let retry_codes = parse_bridge_retry_codes(args);
+    let mut retry_codes_sorted: Vec<String> = retry_codes.iter().cloned().collect();
+    retry_codes_sorted.sort();
     let mut responses = Vec::with_capacity(calls.len());
     let mut success_count = 0usize;
     let mut failure_count = 0usize;
+    let mut retry_count = 0usize;
+    let mut retried_calls = 0usize;
 
     for (index, call) in calls.iter().enumerate() {
         let id = call["id"]
@@ -782,10 +898,14 @@ fn exec_bridge_batch(
             Some(value) if value.is_object() => value.clone(),
             Some(_) => {
                 failure_count += 1;
-                responses.push(bridge_error_response(
-                    Some(&id),
-                    StatusCode::BAD_REQUEST,
-                    "params must be an object when provided",
+                responses.push(annotate_bridge_attempts(
+                    bridge_error_response(
+                        Some(&id),
+                        StatusCode::BAD_REQUEST,
+                        "params must be an object when provided",
+                    ),
+                    1,
+                    0,
                 ));
                 if stop_on_error {
                     break;
@@ -796,10 +916,14 @@ fn exec_bridge_batch(
 
         if method.is_empty() {
             failure_count += 1;
-            responses.push(bridge_error_response(
-                Some(&id),
-                StatusCode::BAD_REQUEST,
-                "missing required field calls[].method",
+            responses.push(annotate_bridge_attempts(
+                bridge_error_response(
+                    Some(&id),
+                    StatusCode::BAD_REQUEST,
+                    "missing required field calls[].method",
+                ),
+                1,
+                0,
             ));
             if stop_on_error {
                 break;
@@ -807,15 +931,59 @@ fn exec_bridge_batch(
             continue;
         }
 
-        match exec_bridge_method(state, method, &params) {
-            Ok(result) => {
-                success_count += 1;
-                responses.push(bridge_ok_response(Some(&id), result));
+        let mut attempt = 0usize;
+        let mut call_retries = 0usize;
+        loop {
+            attempt += 1;
+            match exec_bridge_method(state, method, &params) {
+                Ok(result) => {
+                    success_count += 1;
+                    if call_retries > 0 {
+                        retried_calls += 1;
+                        retry_count += call_retries;
+                    }
+                    responses.push(annotate_bridge_attempts(
+                        bridge_ok_response(Some(&id), result),
+                        attempt,
+                        call_retries,
+                    ));
+                    break;
+                }
+                Err((status, message)) => {
+                    let code = bridge_error_code(status).to_string();
+                    let can_retry = call_retries < max_retries
+                        && should_retry_bridge_error(status, &code, &retry_codes);
+                    if can_retry {
+                        call_retries += 1;
+                        let sleep_ms = retry_backoff_ms
+                            .saturating_mul(2u64.saturating_pow(call_retries as u32 - 1));
+                        if sleep_ms > 0 {
+                            std::thread::sleep(Duration::from_millis(sleep_ms));
+                        }
+                        continue;
+                    }
+
+                    failure_count += 1;
+                    if call_retries > 0 {
+                        retried_calls += 1;
+                        retry_count += call_retries;
+                    }
+                    responses.push(annotate_bridge_attempts(
+                        bridge_error_response(Some(&id), status, message),
+                        attempt,
+                        call_retries,
+                    ));
+                    if stop_on_error {
+                        break;
+                    }
+                    break;
+                }
             }
-            Err((status, message)) => {
-                failure_count += 1;
-                responses.push(bridge_error_response(Some(&id), status, message));
-                if stop_on_error {
+        }
+
+        if stop_on_error {
+            if let Some(last) = responses.last() {
+                if last["ok"].as_bool() == Some(false) {
                     break;
                 }
             }
@@ -832,6 +1000,11 @@ fn exec_bridge_batch(
             "succeeded": success_count,
             "failed": failure_count,
             "stop_on_error": stop_on_error,
+            "max_retries": max_retries,
+            "retry_backoff_ms": retry_backoff_ms,
+            "retry_on_codes": retry_codes_sorted,
+            "retried_calls": retried_calls,
+            "retry_attempts": retry_count,
         },
         "responses": responses,
     }))
@@ -3001,6 +3174,11 @@ mod tests {
                 .iter()
                 .any(|method| method["name"] == "source.safe_write")
         );
+        assert!(
+            methods
+                .iter()
+                .any(|method| method["name"] == "source.validate_content")
+        );
     }
 
     #[test]
@@ -3058,6 +3236,60 @@ mod tests {
         .expect("bridge batch should return summary envelope");
         assert_eq!(result["ok"], false);
         assert_eq!(result["summary"]["completed"], 2);
+    }
+
+    #[test]
+    fn bridge_batch_retries_when_code_allowlisted() {
+        let snapshot = crate::Snapshot {
+            version: 1,
+            include: vec![],
+            fingerprint: "abc123".into(),
+            entries: vec![],
+        };
+        let state = crate::ServerState::new(std::env::temp_dir(), vec![], snapshot, 32);
+        let result = exec_bridge_batch(
+            &state,
+            &serde_json::json!({
+                "stop_on_error": false,
+                "max_retries": 2,
+                "retry_backoff_ms": 0,
+                "retry_on_codes": ["NOT_FOUND"],
+                "calls": [
+                    {"id": "a", "method": "does.not.exist"}
+                ]
+            }),
+        )
+        .expect("bridge batch should return summary envelope");
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["summary"]["retry_attempts"], 2);
+        assert_eq!(result["summary"]["retried_calls"], 1);
+        assert_eq!(result["responses"][0]["attempts"], 3);
+        assert_eq!(result["responses"][0]["retries"], 2);
+    }
+
+    #[test]
+    fn bridge_execute_supports_source_alias_methods() {
+        let snapshot = crate::Snapshot {
+            version: 1,
+            include: vec![],
+            fingerprint: "abc123".into(),
+            entries: vec![],
+        };
+        let state = crate::ServerState::new(std::env::temp_dir(), vec![], snapshot, 32);
+        let result = exec_bridge_execute(
+            &state,
+            &serde_json::json!({
+                "id": "req-alias",
+                "method": "source.validate_content",
+                "params": {
+                    "path": "src/Server/Test.luau",
+                    "content": "--!strict\nreturn {}\n"
+                }
+            }),
+        )
+        .expect("bridge execute should return structured envelope");
+        assert_eq!(result["ok"], true);
+        assert!(result["result"]["issues"].is_array());
     }
 
     #[test]
