@@ -310,12 +310,7 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
                     "Root path to start from (default: project root)",
                     false,
                 ),
-                param(
-                    "depth",
-                    "number",
-                    "Maximum depth (default 3)",
-                    false,
-                ),
+                param("depth", "number", "Maximum depth (default 3)", false),
             ],
         ),
         // ── New: Observability operations ───────────────────────────
@@ -429,10 +424,7 @@ pub async fn handle_mcp_execute(
 
 /// Validate a relative path is safe (no traversal, no absolute). Returns
 /// the resolved absolute path under `source_root`.
-fn validate_path(
-    source_root: &Path,
-    raw_path: &str,
-) -> Result<PathBuf, (StatusCode, String)> {
+fn validate_path(source_root: &Path, raw_path: &str) -> Result<PathBuf, (StatusCode, String)> {
     let candidate = Path::new(raw_path);
     if candidate.is_absolute() {
         return Err((StatusCode::BAD_REQUEST, "absolute paths not allowed".into()));
@@ -805,9 +797,12 @@ fn exec_ls(
     }
 
     // Verify the resolved dir is inside the project root.
-    let resolved = target
-        .canonicalize()
-        .map_err(|_| (StatusCode::NOT_FOUND, format!("directory not found: {raw_path}")))?;
+    let resolved = target.canonicalize().map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("directory not found: {raw_path}"),
+        )
+    })?;
     if !resolved.starts_with(&source_root) {
         return Err((StatusCode::BAD_REQUEST, "path traversal not allowed".into()));
     }
@@ -970,8 +965,8 @@ fn exec_file_info(
     }
 
     // Read content just for hash (don't return it — that's the point of file_info).
-    let content = std::fs::read(&target)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let content =
+        std::fs::read(&target).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let hash = sha256_hex(&content);
 
     let modified = meta
@@ -1165,12 +1160,20 @@ fn exec_write(
 
     // Ensure parent directory exists.
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir error: {e}")))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("mkdir error: {e}"),
+            )
+        })?;
     }
 
-    std::fs::write(&target, content.as_bytes())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write error: {e}")))?;
+    std::fs::write(&target, content.as_bytes()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write error: {e}"),
+        )
+    })?;
 
     let hash = sha256_hex(content.as_bytes());
     let new_hash = rebuild_snapshot(state)?;
@@ -1200,8 +1203,12 @@ fn exec_delete(
 
     let existed = target.exists();
     if existed {
-        std::fs::remove_file(&target)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("delete error: {e}")))?;
+        std::fs::remove_file(&target).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("delete error: {e}"),
+            )
+        })?;
     }
 
     let new_hash = rebuild_snapshot(state)?;
@@ -1224,12 +1231,9 @@ fn exec_move(
             "missing required param: from".into(),
         )
     })?;
-    let to = args["to"].as_str().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "missing required param: to".into(),
-        )
-    })?;
+    let to = args["to"]
+        .as_str()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing required param: to".into()))?;
 
     let source_root = canon_root(state)?;
     let from_target = validate_path(&source_root, from)?;
@@ -1248,12 +1252,20 @@ fn exec_move(
 
     // Ensure destination parent exists.
     if let Some(parent) = to_target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir error: {e}")))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("mkdir error: {e}"),
+            )
+        })?;
     }
 
-    std::fs::rename(&from_target, &to_target)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("rename error: {e}")))?;
+    std::fs::rename(&from_target, &to_target).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("rename error: {e}"),
+        )
+    })?;
 
     let new_hash = rebuild_snapshot(state)?;
 
@@ -1280,8 +1292,12 @@ fn exec_mkdir(
     let target = validate_path(&source_root, raw_path)?;
 
     let already_existed = target.is_dir();
-    std::fs::create_dir_all(&target)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir error: {e}")))?;
+    std::fs::create_dir_all(&target).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("mkdir error: {e}"),
+        )
+    })?;
 
     Ok(serde_json::json!({
         "ok": true,
@@ -1457,12 +1473,20 @@ fn exec_safe_write(
 
     // Phase 3: Write to disk.
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir error: {e}")))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("mkdir error: {e}"),
+            )
+        })?;
     }
 
-    std::fs::write(&target, content.as_bytes())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write error: {e}")))?;
+    std::fs::write(&target, content.as_bytes()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write error: {e}"),
+        )
+    })?;
 
     // Phase 4: Rebuild snapshot.
     let hash = sha256_hex(content.as_bytes());
@@ -1549,10 +1573,7 @@ fn exec_describe_changes(
     for e in &diff.modified {
         let delta = e.current_bytes as i64 - e.previous_bytes as i64;
         let sign = if delta >= 0 { "+" } else { "" };
-        lines.push(format!(
-            "  ~ {} ({}{} bytes)",
-            e.path, sign, delta
-        ));
+        lines.push(format!("  ~ {} ({}{} bytes)", e.path, sign, delta));
     }
     for e in &diff.deleted {
         lines.push(format!("  - {} ({} bytes removed)", e.path, e.bytes));
@@ -2262,10 +2283,7 @@ async fn execute_parallel(
             }
             Ok((id, _, Err(error))) => {
                 execution_order.push(id.clone());
-                errors.push(PipelineError {
-                    step_id: id,
-                    error,
-                });
+                errors.push(PipelineError { step_id: id, error });
                 if stop_on_error {
                     break;
                 }
@@ -2301,10 +2319,11 @@ async fn execute_auto(
 ) -> Result<PipelineResult, (StatusCode, String)> {
     let start = Instant::now();
 
-    let levels = topological_levels(&steps)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let levels = topological_levels(&steps).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
-    let namespace = Arc::new(std::sync::Mutex::new(HashMap::<String, serde_json::Value>::new()));
+    let namespace = Arc::new(std::sync::Mutex::new(
+        HashMap::<String, serde_json::Value>::new(),
+    ));
     let mut results = serde_json::Map::new();
     let mut errors: Vec<PipelineError> = Vec::new();
     let mut execution_order: Vec<String> = Vec::new();
@@ -2370,10 +2389,7 @@ async fn execute_auto(
                     }
                     Ok((id, _, Err(error))) => {
                         execution_order.push(id.clone());
-                        errors.push(PipelineError {
-                            step_id: id,
-                            error,
-                        });
+                        errors.push(PipelineError { step_id: id, error });
                         if stop_on_error {
                             should_stop = true;
                         }
@@ -2407,12 +2423,14 @@ async fn exec_pipeline(
     state: &Arc<ServerState>,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let steps: Vec<PipelineStep> = serde_json::from_value(
-        args.get("steps")
-            .cloned()
-            .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing required param: steps".into()))?,
-    )
-    .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid steps: {e}")))?;
+    let steps: Vec<PipelineStep> =
+        serde_json::from_value(args.get("steps").cloned().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "missing required param: steps".into(),
+            )
+        })?)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid steps: {e}")))?;
 
     if steps.is_empty() {
         return Ok(serde_json::json!({
@@ -2436,10 +2454,7 @@ async fn exec_pipeline(
         }
     }
 
-    let mode = args
-        .get("mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("auto");
+    let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
     let stop_on_error = args
         .get("stop_on_error")
         .and_then(|v| v.as_bool())
@@ -2451,8 +2466,12 @@ async fn exec_pipeline(
         "auto" | _ => execute_auto(steps, stop_on_error, state).await?,
     };
 
-    serde_json::to_value(&result)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("serialize error: {e}")))
+    serde_json::to_value(&result).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize error: {e}"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -2662,10 +2681,7 @@ mod tests {
     #[test]
     fn interpolate_partial_ref() {
         let mut ns = HashMap::new();
-        ns.insert(
-            "s1".to_string(),
-            serde_json::json!({"dir": "src/Server"}),
-        );
+        ns.insert("s1".to_string(), serde_json::json!({"dir": "src/Server"}));
         let args = serde_json::json!({"path": "${s1.dir}/NewFile.luau"});
         let result = interpolate_args(&args, &ns);
         assert_eq!(result["path"], "src/Server/NewFile.luau");
