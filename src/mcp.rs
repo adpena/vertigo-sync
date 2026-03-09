@@ -375,7 +375,12 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
             "vsync_rbxl_query",
             "Query instances in the loaded .rbxl file by class, tag, or name",
             vec![
-                param("class", "string", "Filter by ClassName (exact match)", false),
+                param(
+                    "class",
+                    "string",
+                    "Filter by ClassName (exact match)",
+                    false,
+                ),
                 param("tag", "string", "Filter by CollectionService tag", false),
                 param("name", "string", "Filter by Name (substring match)", false),
             ],
@@ -2738,9 +2743,12 @@ fn exec_rbxl_load(
     state: &Arc<ServerState>,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let raw_path = args["path"]
-        .as_str()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing 'path' argument".to_string()))?;
+    let raw_path = args["path"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing 'path' argument".to_string(),
+        )
+    })?;
 
     let path = PathBuf::from(raw_path);
     let resolved = if path.is_absolute() {
@@ -2781,9 +2789,7 @@ fn exec_rbxl_load(
     }))
 }
 
-fn exec_rbxl_tree(
-    state: &Arc<ServerState>,
-) -> Result<serde_json::Value, (StatusCode, String)> {
+fn exec_rbxl_tree(state: &Arc<ServerState>) -> Result<serde_json::Value, (StatusCode, String)> {
     let lock = state
         .rbxl
         .lock()
@@ -2822,9 +2828,7 @@ fn exec_rbxl_query(
     serde_json::to_value(&results).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-fn exec_rbxl_scripts(
-    state: &Arc<ServerState>,
-) -> Result<serde_json::Value, (StatusCode, String)> {
+fn exec_rbxl_scripts(state: &Arc<ServerState>) -> Result<serde_json::Value, (StatusCode, String)> {
     let lock = state
         .rbxl
         .lock()
@@ -2840,9 +2844,7 @@ fn exec_rbxl_scripts(
     serde_json::to_value(&scripts).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-fn exec_rbxl_meshes(
-    state: &Arc<ServerState>,
-) -> Result<serde_json::Value, (StatusCode, String)> {
+fn exec_rbxl_meshes(state: &Arc<ServerState>) -> Result<serde_json::Value, (StatusCode, String)> {
     let lock = state
         .rbxl
         .lock()

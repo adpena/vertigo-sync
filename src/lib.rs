@@ -1038,6 +1038,7 @@ pub struct ServerState {
     pub history: Mutex<BTreeMap<String, Arc<Snapshot>>>,
     pub history_order: Mutex<VecDeque<String>>,
     pub tx: tokio::sync::broadcast::Sender<SyncDiffEvent>,
+    pub patch_lock: tokio::sync::Mutex<()>,
     pub sequence: Mutex<u64>,
     pub cache: Mutex<SnapshotCache>,
     pub metrics: Arc<Metrics>,
@@ -1073,6 +1074,7 @@ impl ServerState {
             history: Mutex::new(history),
             history_order: Mutex::new(history_order),
             tx,
+            patch_lock: tokio::sync::Mutex::new(()),
             sequence: Mutex::new(0),
             cache: Mutex::new(SnapshotCache::new()),
             metrics,
@@ -1103,9 +1105,6 @@ impl ServerState {
         self.metrics
             .poll_duration_sum_us
             .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
-        self.metrics
-            .entries
-            .store(new_snapshot.entries.len() as u64, Ordering::Relaxed);
 
         if elapsed.as_millis() > 50 {
             eprintln!(
@@ -1113,6 +1112,13 @@ impl ServerState {
                 new_snapshot.entries.len()
             );
         }
+        self.install_snapshot_and_broadcast(new_snapshot)?;
+        Ok(())
+    }
+
+    /// Install a freshly built snapshot into shared state and broadcast a diff
+    /// event when the fingerprint changes.
+    pub fn install_snapshot_and_broadcast(&self, new_snapshot: Snapshot) -> Result<()> {
         let current = {
             let lock = self
                 .current
@@ -1122,6 +1128,9 @@ impl ServerState {
         };
 
         if new_snapshot.fingerprint == current.fingerprint {
+            self.metrics
+                .entries
+                .store(new_snapshot.entries.len() as u64, Ordering::Relaxed);
             return Ok(());
         }
 
@@ -1165,7 +1174,7 @@ impl ServerState {
 
             let fp = new_arc.fingerprint.clone();
             if !hist_lock.contains_key(&fp) {
-                hist_lock.insert(fp.clone(), new_arc);
+                hist_lock.insert(fp.clone(), Arc::clone(&new_arc));
                 order_lock.push_back(fp);
 
                 // Evict oldest entries beyond the limit.
@@ -1177,6 +1186,9 @@ impl ServerState {
             }
         }
 
+        self.metrics
+            .entries
+            .store(new_arc.entries.len() as u64, Ordering::Relaxed);
         self.metrics.events_emitted.fetch_add(1, Ordering::Relaxed);
         let _ = self.tx.send(event);
         Ok(())

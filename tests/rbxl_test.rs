@@ -76,7 +76,10 @@ fn test_load_rbxlx_from_file() {
 fn test_load_xml_str() {
     let dom = RbxlLoader::load_xml_str(TEST_RBXLX).expect("should parse inline XML");
     let tree = RbxlLoader::to_instance_tree(&dom);
-    assert!(tree.len() >= 5, "should have root + workspace + part + scripts + folder children");
+    assert!(
+        tree.len() >= 5,
+        "should have root + workspace + part + scripts + folder children"
+    );
 }
 
 #[test]
@@ -155,7 +158,11 @@ fn test_query_by_class_name() {
     let dom = RbxlLoader::load_xml_str(TEST_RBXLX).unwrap();
 
     let parts = RbxlLoader::query(&dom, Some("Part"), None, None);
-    assert_eq!(parts.len(), 2, "should find 2 Parts (TestPart + EnemySpawn)");
+    assert_eq!(
+        parts.len(),
+        2,
+        "should find 2 Parts (TestPart + EnemySpawn)"
+    );
 
     let scripts = RbxlLoader::query(&dom, Some("Script"), None, None);
     assert_eq!(scripts.len(), 1, "should find 1 Script");
@@ -229,7 +236,10 @@ fn test_unsupported_extension() {
     let result = RbxlLoader::load_file(file.path());
     assert!(result.is_err(), "should reject .txt extension");
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("unsupported"), "error should mention unsupported");
+    assert!(
+        err.contains("unsupported"),
+        "error should mention unsupported"
+    );
 }
 
 #[test]
@@ -248,7 +258,9 @@ fn test_json_roundtrip_property_values() {
         PropertyValue::Int32(-100),
         PropertyValue::Float32(3.14),
         PropertyValue::Vector3(1.0, 2.0, 3.0),
-        PropertyValue::CFrame([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 10.0, 20.0, 30.0]),
+        PropertyValue::CFrame([
+            1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 10.0, 20.0, 30.0,
+        ]),
         PropertyValue::Color3(0.5, 0.5, 0.5),
         PropertyValue::BrickColor(194),
         PropertyValue::Enum(6),

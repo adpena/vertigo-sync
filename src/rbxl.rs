@@ -16,8 +16,8 @@ use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rbx_dom_weak::types::Ref;
 use rbx_dom_weak::WeakDom;
+use rbx_dom_weak::types::Ref;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -132,14 +132,10 @@ impl RbxlLoader {
         let reader = BufReader::new(file);
 
         match ext.as_str() {
-            "rbxl" | "rbxm" => {
-                rbx_binary::from_reader(reader)
-                    .with_context(|| format!("failed to parse binary file {}", path.display()))
-            }
-            "rbxlx" | "rbxmx" => {
-                rbx_xml::from_reader_default(reader)
-                    .with_context(|| format!("failed to parse XML file {}", path.display()))
-            }
+            "rbxl" | "rbxm" => rbx_binary::from_reader(reader)
+                .with_context(|| format!("failed to parse binary file {}", path.display())),
+            "rbxlx" | "rbxmx" => rbx_xml::from_reader_default(reader)
+                .with_context(|| format!("failed to parse XML file {}", path.display())),
             _ => bail!(
                 "unsupported file extension '{}' — expected .rbxl, .rbxlx, .rbxm, or .rbxmx",
                 ext
@@ -163,10 +159,7 @@ impl RbxlLoader {
     /// Convert the DOM into a Strata-compatible `SceneGraph` envelope.
     pub fn to_scene_graph(dom: &WeakDom) -> SceneGraph {
         let instances = Self::to_instance_tree(dom);
-        let root_id = instances
-            .first()
-            .map(|n| n.id.clone())
-            .unwrap_or_default();
+        let root_id = instances.first().map(|n| n.id.clone()).unwrap_or_default();
 
         SceneGraph {
             format_version: 1,
@@ -310,10 +303,7 @@ impl RbxlLoader {
 
     /// Get a single instance by ref string using a prebuilt ref_map.
     /// Returns full properties including large blobs.
-    pub fn get_instance_full(
-        dom: &WeakDom,
-        inst_ref: Ref,
-    ) -> Option<InstanceNode> {
+    pub fn get_instance_full(dom: &WeakDom, inst_ref: Ref) -> Option<InstanceNode> {
         let inst = dom.get_by_ref(inst_ref)?;
 
         let id = ref_to_string(inst_ref);
@@ -377,9 +367,7 @@ pub fn convert_variant(variant: &rbx_types::Variant) -> PropertyValue {
         Variant::BinaryString(b) => {
             use base64::Engine;
             let bytes: &[u8] = b.as_ref();
-            PropertyValue::BinaryString(
-                base64::engine::general_purpose::STANDARD.encode(bytes),
-            )
+            PropertyValue::BinaryString(base64::engine::general_purpose::STANDARD.encode(bytes))
         }
         Variant::Bool(b) => PropertyValue::Bool(*b),
         Variant::Int32(n) => PropertyValue::Int32(*n),
@@ -418,16 +406,11 @@ pub fn convert_variant(variant: &rbx_types::Variant) -> PropertyValue {
                 PropertyValue::Ref(ref_to_string(*r))
             }
         }
-        Variant::Content(c) => {
-            PropertyValue::Content(content_to_string(c))
-        }
+        Variant::Content(c) => PropertyValue::Content(content_to_string(c)),
         Variant::UDim(u) => PropertyValue::UDim(u.scale as f64, u.offset),
-        Variant::UDim2(u) => PropertyValue::UDim2(
-            u.x.scale as f64,
-            u.x.offset,
-            u.y.scale as f64,
-            u.y.offset,
-        ),
+        Variant::UDim2(u) => {
+            PropertyValue::UDim2(u.x.scale as f64, u.x.offset, u.y.scale as f64, u.y.offset)
+        }
         Variant::Rect(r) => PropertyValue::Rect(
             r.min.x as f64,
             r.min.y as f64,
@@ -462,15 +445,11 @@ pub fn convert_variant(variant: &rbx_types::Variant) -> PropertyValue {
                 friction_weight: custom.friction_weight() as f64,
                 elasticity_weight: custom.elasticity_weight() as f64,
             },
-            rbx_types::PhysicalProperties::Default => {
-                PropertyValue::String("Default".to_string())
-            }
+            rbx_types::PhysicalProperties::Default => PropertyValue::String("Default".to_string()),
         },
         Variant::SharedString(s) => {
             use base64::Engine;
-            PropertyValue::SharedString(
-                base64::engine::general_purpose::STANDARD.encode(s.data()),
-            )
+            PropertyValue::SharedString(base64::engine::general_purpose::STANDARD.encode(s.data()))
         }
         Variant::Tags(tags) => {
             // Tags are stored as a property but we also extract them to the
@@ -578,10 +557,7 @@ mod tests {
     fn test_load_xml_str() {
         let dom = RbxlLoader::load_xml_str(MINIMAL_RBXLX).expect("should parse");
         let root = dom.root();
-        assert!(
-            !root.children().is_empty(),
-            "root should have children"
-        );
+        assert!(!root.children().is_empty(), "root should have children");
     }
 
     #[test]

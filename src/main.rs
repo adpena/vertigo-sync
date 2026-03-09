@@ -479,16 +479,19 @@ fn command_build(root: &Path, output: &Path, project: &Path) -> Result<()> {
         // Ensure each ancestor exists in the DOM.
         let mut parent_ref = data_model_ref;
         for (i, segment) in segments.iter().enumerate() {
-            let existing = dom.get_by_ref(parent_ref).map(|inst| {
-                inst.children()
-                    .iter()
-                    .find(|&&child_ref| {
-                        dom.get_by_ref(child_ref)
-                            .map(|c| c.name == *segment)
-                            .unwrap_or(false)
-                    })
-                    .copied()
-            }).flatten();
+            let existing = dom
+                .get_by_ref(parent_ref)
+                .map(|inst| {
+                    inst.children()
+                        .iter()
+                        .find(|&&child_ref| {
+                            dom.get_by_ref(child_ref)
+                                .map(|c| c.name == *segment)
+                                .unwrap_or(false)
+                        })
+                        .copied()
+                })
+                .flatten();
 
             parent_ref = if let Some(existing_ref) = existing {
                 existing_ref
@@ -563,8 +566,7 @@ fn command_build(root: &Path, output: &Path, project: &Path) -> Result<()> {
                 .context("failed to write .rbxlx")?;
         }
         _ => {
-            rbx_binary::to_writer(file, &dom, &root_children)
-                .context("failed to write .rbxl")?;
+            rbx_binary::to_writer(file, &dom, &root_children).context("failed to write .rbxl")?;
         }
     }
 
@@ -609,8 +611,10 @@ fn populate_from_dir(
         if path.is_dir() {
             let class = resolve_container_class(&path);
 
-            let folder_ref =
-                dom.insert(parent_ref, rbx_dom_weak::InstanceBuilder::new(class).with_name(&*name_str));
+            let folder_ref = dom.insert(
+                parent_ref,
+                rbx_dom_weak::InstanceBuilder::new(class).with_name(&*name_str),
+            );
 
             // If there's an init script, load its source.
             for init_name in &[
@@ -652,11 +656,11 @@ fn populate_from_dir(
             let class = resolve_instance_class(&name_str);
             let instance_name = resolve_instance_name(&name_str);
 
-            let mut builder =
-                rbx_dom_weak::InstanceBuilder::new(class).with_name(instance_name);
+            let mut builder = rbx_dom_weak::InstanceBuilder::new(class).with_name(instance_name);
 
             if let Ok(source) = std::fs::read_to_string(&path) {
-                builder = builder.with_property("Source", rbx_dom_weak::types::Variant::String(source));
+                builder =
+                    builder.with_property("Source", rbx_dom_weak::types::Variant::String(source));
             }
 
             dom.insert(parent_ref, builder);
@@ -685,8 +689,7 @@ fn populate_file(
     let mut builder = rbx_dom_weak::InstanceBuilder::new(class).with_name(name);
 
     if let Ok(source) = std::fs::read_to_string(path) {
-        builder =
-            builder.with_property("Source", rbx_dom_weak::types::Variant::String(source));
+        builder = builder.with_property("Source", rbx_dom_weak::types::Variant::String(source));
     }
 
     dom.insert(parent_ref, builder);

@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -48,6 +48,58 @@ pub struct PatchEntry {
     pub action: String,
     #[serde(default)]
     pub content_base64: Option<String>,
+    #[serde(default)]
+    pub expected_sha256: Option<String>,
+}
+
+#[derive(Debug)]
+enum PlannedPatch {
+    Write {
+        requested_path: String,
+        normalized_path: String,
+        target: PathBuf,
+        bytes: Vec<u8>,
+        expected_sha256: Option<String>,
+    },
+    Delete {
+        requested_path: String,
+        target: PathBuf,
+        expected_sha256: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+struct ExistingFileBackup {
+    target: PathBuf,
+    existed: bool,
+    bytes: Vec<u8>,
+}
+
+impl PlannedPatch {
+    fn requested_path(&self) -> &str {
+        match self {
+            Self::Write { requested_path, .. } | Self::Delete { requested_path, .. } => {
+                requested_path
+            }
+        }
+    }
+
+    fn target(&self) -> &Path {
+        match self {
+            Self::Write { target, .. } | Self::Delete { target, .. } => target.as_path(),
+        }
+    }
+
+    fn expected_sha256(&self) -> Option<&str> {
+        match self {
+            Self::Write {
+                expected_sha256, ..
+            }
+            | Self::Delete {
+                expected_sha256, ..
+            } => expected_sha256.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -399,7 +451,7 @@ fn serve_source_for_ws(state: &Arc<ServerState>, raw_path: &str) -> serde_json::
                 "type": "source",
                 "path": raw_path,
                 "error": "path traversal not allowed",
-            })
+            });
         }
     };
     let resolved = match resolve_source_file(&source_root, &normalized) {
@@ -409,7 +461,7 @@ fn serve_source_for_ws(state: &Arc<ServerState>, raw_path: &str) -> serde_json::
                 "type": "source",
                 "path": raw_path,
                 "error": error,
-            })
+            });
         }
     };
 
@@ -440,6 +492,8 @@ async fn handle_patch(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<SyncPatchRequest>,
 ) -> Result<Json<SyncPatchAck>, (StatusCode, String)> {
+    let _patch_guard = state.patch_lock.lock().await;
+
     let current_hash = {
         let lock = state
             .current
@@ -461,100 +515,316 @@ async fn handle_patch(
         }));
     }
 
+    if req.patches.is_empty() {
+        return Ok(Json(SyncPatchAck {
+            accepted: false,
+            new_source_hash: current_hash,
+            applied: 0,
+            errors: vec!["patch request must include at least one patch entry".to_string()],
+            validation: Vec::new(),
+        }));
+    }
+
     let source_root = state.canonical_root.clone();
+    let planned = match plan_patch_ops(&source_root, &req.patches) {
+        Ok(planned) => planned,
+        Err(errors) => {
+            return Ok(Json(SyncPatchAck {
+                accepted: false,
+                new_source_hash: current_hash,
+                applied: 0,
+                errors,
+                validation: Vec::new(),
+            }));
+        }
+    };
 
-    let mut applied = 0usize;
-    let mut errors: Vec<String> = Vec::new();
+    let expectation_errors = verify_patch_expectations(&planned);
+    if !expectation_errors.is_empty() {
+        return Ok(Json(SyncPatchAck {
+            accepted: false,
+            new_source_hash: current_hash,
+            applied: 0,
+            errors: expectation_errors,
+            validation: Vec::new(),
+        }));
+    }
 
-    for patch in &req.patches {
-        let target = match resolve_patch_target(&source_root, &patch.path) {
-            Ok(target) => target,
+    let applied = match apply_planned_patches_atomically(&planned) {
+        Ok(applied) => applied,
+        Err(errors) => {
+            return Ok(Json(SyncPatchAck {
+                accepted: false,
+                new_source_hash: current_hash,
+                applied: 0,
+                errors,
+                validation: Vec::new(),
+            }));
+        }
+    };
+
+    // Rebuild snapshot after patches.
+    let new_snapshot = build_snapshot(&state.root, &state.includes)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    state
+        .install_snapshot_and_broadcast(new_snapshot)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let new_hash = {
+        let lock = state
+            .current
+            .lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".into()))?;
+        lock.fingerprint.clone()
+    };
+    let validation_issues = collect_patch_validation_issues(&planned);
+
+    Ok(Json(SyncPatchAck {
+        accepted: true,
+        new_source_hash: new_hash,
+        applied,
+        errors: Vec::new(),
+        validation: validation_issues,
+    }))
+}
+
+fn plan_patch_ops(
+    source_root: &Path,
+    patches: &[PatchEntry],
+) -> Result<Vec<PlannedPatch>, Vec<String>> {
+    let mut planned = Vec::with_capacity(patches.len());
+    let mut seen = HashSet::with_capacity(patches.len());
+    let mut errors = Vec::new();
+
+    for patch in patches {
+        let normalized = match normalize_snapshot_lookup_path(&patch.path) {
+            Some(path) => path,
+            None => {
+                errors.push(format!("{}: invalid patch path", patch.path));
+                continue;
+            }
+        };
+
+        if !seen.insert(normalized.clone()) {
+            errors.push(format!(
+                "{}: duplicate patch target after normalization ({normalized})",
+                patch.path
+            ));
+            continue;
+        }
+
+        let target = match resolve_patch_target(source_root, &patch.path) {
+            Ok(path) => path,
             Err(error) => {
                 errors.push(format!("{}: invalid patch path: {error}", patch.path));
                 continue;
             }
         };
 
+        let expected_sha256 = patch
+            .expected_sha256
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
         match patch.action.as_str() {
             "write" => {
-                if let Some(content) = patch.content_base64.as_ref() {
-                    match base64::engine::general_purpose::STANDARD.decode(content) {
-                        Ok(bytes) => {
-                            if let Some(parent) = target.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            match std::fs::write(&target, &bytes) {
-                                Ok(()) => applied += 1,
-                                Err(error) => {
-                                    errors.push(format!("{}: write error: {error}", patch.path));
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            errors.push(format!("{}: base64 decode error: {error}", patch.path));
-                        }
-                    }
-                } else {
+                let Some(content_b64) = patch.content_base64.as_ref() else {
                     errors.push(format!(
                         "{}: write action missing content_base64",
                         patch.path
                     ));
-                }
-            }
-            "delete" => match std::fs::remove_file(&target) {
-                Ok(()) => applied += 1,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => applied += 1,
-                Err(error) => errors.push(format!("{}: delete error: {error}", patch.path)),
-            },
-            other => errors.push(format!("{}: unknown action '{other}'", patch.path)),
-        }
-    }
+                    continue;
+                };
 
-    // Rebuild snapshot after patches.
-    let new_snapshot = build_snapshot(&state.root, &state.includes)
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-
-    let new_hash = new_snapshot.fingerprint.clone();
-    let new_arc = Arc::new(new_snapshot);
-
-    {
-        let mut lock = state
-            .current
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".into()))?;
-        *lock = Arc::clone(&new_arc);
-    }
-    {
-        let mut lock = state
-            .history
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".into()))?;
-        lock.insert(new_hash.clone(), new_arc);
-    }
-
-    // Validate changed files only.
-    let mut validation_issues = Vec::new();
-    for patch in &req.patches {
-        if patch.action == "write" {
-            if let Some(content_b64) = patch.content_base64.as_ref() {
-                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(content_b64) {
-                    if let Ok(content) = String::from_utf8(bytes) {
-                        let file_issues =
-                            crate::validate::validate_file_content(&patch.path, &content);
-                        validation_issues.extend(file_issues);
+                let bytes = match base64::engine::general_purpose::STANDARD.decode(content_b64) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        errors.push(format!("{}: base64 decode error: {error}", patch.path));
+                        continue;
                     }
-                }
+                };
+
+                planned.push(PlannedPatch::Write {
+                    requested_path: patch.path.clone(),
+                    normalized_path: normalized,
+                    target,
+                    bytes,
+                    expected_sha256,
+                });
+            }
+            "delete" => {
+                planned.push(PlannedPatch::Delete {
+                    requested_path: patch.path.clone(),
+                    target,
+                    expected_sha256,
+                });
+            }
+            other => {
+                errors.push(format!("{}: unknown action '{other}'", patch.path));
             }
         }
     }
 
-    Ok(Json(SyncPatchAck {
-        accepted: errors.is_empty(),
-        new_source_hash: new_hash,
-        applied,
-        errors,
-        validation: validation_issues,
-    }))
+    if errors.is_empty() {
+        Ok(planned)
+    } else {
+        Err(errors)
+    }
+}
+
+fn verify_patch_expectations(planned: &[PlannedPatch]) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for op in planned {
+        let Some(expected) = op.expected_sha256() else {
+            continue;
+        };
+
+        let actual = match std::fs::read(op.target()) {
+            Ok(bytes) => sha256_hex(&bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "<missing>".to_string(),
+            Err(error) => {
+                errors.push(format!(
+                    "{}: failed to read current file for expected_sha256 check: {error}",
+                    op.requested_path()
+                ));
+                continue;
+            }
+        };
+
+        if !actual.eq_ignore_ascii_case(expected) {
+            errors.push(format!(
+                "{}: expected_sha256 mismatch (expected={}, actual={})",
+                op.requested_path(),
+                expected,
+                actual
+            ));
+        }
+    }
+
+    errors
+}
+
+fn apply_planned_patches_atomically(planned: &[PlannedPatch]) -> Result<usize, Vec<String>> {
+    let mut backups = Vec::with_capacity(planned.len());
+    for op in planned {
+        let target = op.target().to_path_buf();
+        match std::fs::read(&target) {
+            Ok(bytes) => backups.push(ExistingFileBackup {
+                target,
+                existed: true,
+                bytes,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                backups.push(ExistingFileBackup {
+                    target,
+                    existed: false,
+                    bytes: Vec::new(),
+                });
+            }
+            Err(error) => {
+                return Err(vec![format!(
+                    "{}: failed to read existing file before apply: {error}",
+                    op.requested_path()
+                )]);
+            }
+        }
+    }
+
+    for op in planned {
+        let apply_result = match op {
+            PlannedPatch::Write { target, bytes, .. } => replace_file_contents(target, bytes),
+            PlannedPatch::Delete { target, .. } => match std::fs::remove_file(target) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+        };
+
+        if let Err(error) = apply_result {
+            let mut errors = vec![format!("{}: apply failed: {error}", op.requested_path())];
+            errors.extend(rollback_patch_backups(&backups));
+            return Err(errors);
+        }
+    }
+
+    Ok(planned.len())
+}
+
+fn rollback_patch_backups(backups: &[ExistingFileBackup]) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for backup in backups.iter().rev() {
+        if backup.existed {
+            if let Err(error) = replace_file_contents(&backup.target, &backup.bytes) {
+                errors.push(format!(
+                    "{}: rollback restore failed: {error}",
+                    backup.target.display()
+                ));
+            }
+        } else if backup.target.exists()
+            && let Err(error) = std::fs::remove_file(&backup.target)
+        {
+            errors.push(format!(
+                "{}: rollback cleanup failed: {error}",
+                backup.target.display()
+            ));
+        }
+    }
+
+    errors
+}
+
+fn replace_file_contents(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| std::io::Error::other("target file has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
+
+    let tmp_suffix = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = parent.join(format!(
+        ".vertigo-sync.tmp.{}.{}",
+        std::process::id(),
+        tmp_suffix
+    ));
+    std::fs::write(&tmp_path, bytes)?;
+
+    #[cfg(windows)]
+    if target.exists() {
+        std::fs::remove_file(target)?;
+    }
+
+    match std::fs::rename(&tmp_path, target) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(error)
+        }
+    }
+}
+
+fn collect_patch_validation_issues(
+    planned: &[PlannedPatch],
+) -> Vec<crate::validate::ValidationIssue> {
+    let mut issues = Vec::new();
+    for op in planned {
+        if let PlannedPatch::Write {
+            normalized_path,
+            bytes,
+            ..
+        } = op
+            && let Ok(content) = std::str::from_utf8(bytes)
+        {
+            issues.extend(crate::validate::validate_file_content(
+                normalized_path,
+                &content,
+            ));
+        }
+    }
+    issues
 }
 
 /// Source file entry returned by GET /sources.
@@ -770,8 +1040,10 @@ async fn handle_source(
     let content = std::fs::read_to_string(&resolved)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let normalized = normalize_snapshot_lookup_path(&raw_path)
-        .ok_or((StatusCode::BAD_REQUEST, "path traversal not allowed".to_string()))?;
+    let normalized = normalize_snapshot_lookup_path(&raw_path).ok_or((
+        StatusCode::BAD_REQUEST,
+        "path traversal not allowed".to_string(),
+    ))?;
     let content_bytes = content.len() as u64;
     let hash = match snapshot_metadata_for_path(&state, &normalized)? {
         Some((sha, expected_bytes)) if expected_bytes == content_bytes => sha,
@@ -826,6 +1098,7 @@ fn resolve_patch_target(source_root: &Path, raw_path: &str) -> anyhow::Result<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use std::fs;
     use tempfile::tempdir;
 
@@ -855,5 +1128,101 @@ mod tests {
             resolve_source_file(&canonical_root, r"src\Server\init.server.luau").expect("resolve");
 
         assert_eq!(resolved, file_path.canonicalize().expect("canonical file"));
+    }
+
+    #[test]
+    fn plan_patch_ops_rejects_duplicate_targets_after_normalization() {
+        let root_dir = tempdir().expect("tempdir");
+        let canonical_root = root_dir.path().canonicalize().expect("canonical root");
+        let patch_a = PatchEntry {
+            path: r"src\Shared\init.luau".to_string(),
+            action: "write".to_string(),
+            content_base64: Some(base64::engine::general_purpose::STANDARD.encode("return 1\n")),
+            expected_sha256: None,
+        };
+        let patch_b = PatchEntry {
+            path: "./src/Shared/init.luau".to_string(),
+            action: "delete".to_string(),
+            content_base64: None,
+            expected_sha256: None,
+        };
+
+        let errors =
+            plan_patch_ops(&canonical_root, &[patch_a, patch_b]).expect_err("duplicate target");
+
+        assert!(
+            errors
+                .iter()
+                .any(|line| line.contains("duplicate patch target")),
+            "expected duplicate-target error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn verify_patch_expectations_detects_sha_mismatch() {
+        let root_dir = tempdir().expect("tempdir");
+        let src_dir = root_dir.path().join("src");
+        fs::create_dir_all(&src_dir).expect("create src");
+        let file_path = src_dir.join("init.server.luau");
+        fs::write(&file_path, "return 1\n").expect("seed file");
+        let canonical_root = root_dir.path().canonicalize().expect("canonical root");
+
+        let patch = PatchEntry {
+            path: "src/init.server.luau".to_string(),
+            action: "write".to_string(),
+            content_base64: Some(base64::engine::general_purpose::STANDARD.encode("return 2\n")),
+            expected_sha256: Some("deadbeef".to_string()),
+        };
+
+        let planned = plan_patch_ops(&canonical_root, &[patch]).expect("plan");
+        let errors = verify_patch_expectations(&planned);
+        assert!(
+            errors
+                .iter()
+                .any(|line| line.contains("expected_sha256 mismatch")),
+            "expected expected_sha256 mismatch, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn apply_planned_patches_atomically_preserves_existing_file_on_failure() {
+        let root_dir = tempdir().expect("tempdir");
+        let src_dir = root_dir.path().join("src");
+        fs::create_dir_all(&src_dir).expect("create src");
+        let stable_path = src_dir.join("stable.luau");
+        fs::write(&stable_path, "return 'stable-old'\n").expect("seed stable file");
+
+        // Create a file where a directory is expected so the second write fails.
+        let blocking_file = root_dir.path().join("blocked");
+        fs::write(&blocking_file, "not a directory").expect("seed blocking file");
+
+        let canonical_root = root_dir.path().canonicalize().expect("canonical root");
+        let patch_ok = PatchEntry {
+            path: "src/stable.luau".to_string(),
+            action: "write".to_string(),
+            content_base64: Some(
+                base64::engine::general_purpose::STANDARD.encode("return 'stable-new'\n"),
+            ),
+            expected_sha256: None,
+        };
+        let patch_fail = PatchEntry {
+            path: "blocked/file.luau".to_string(),
+            action: "write".to_string(),
+            content_base64: Some(base64::engine::general_purpose::STANDARD.encode("return 0\n")),
+            expected_sha256: None,
+        };
+
+        let planned = plan_patch_ops(&canonical_root, &[patch_ok, patch_fail]).expect("plan");
+        let errors = apply_planned_patches_atomically(&planned).expect_err("apply should fail");
+        assert!(
+            errors.iter().any(|line| {
+                line.contains("apply failed")
+                    || line.contains("failed to read existing file before apply")
+            }),
+            "expected patch application failure, got: {errors:?}"
+        );
+
+        let stable_now = fs::read_to_string(&stable_path).expect("read stable after rollback");
+        assert_eq!(stable_now, "return 'stable-old'\n");
     }
 }

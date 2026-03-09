@@ -16,20 +16,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::get;
-use axum::Router;
 use rbx_dom_weak::WeakDom;
 use rbx_dom_weak::types::Ref;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
-use crate::rbxl::{
-    InstanceNode, MeshEntry, RbxlLoader, SceneGraph, ScriptEntry,
-    build_ref_map,
-};
+use crate::rbxl::{InstanceNode, MeshEntry, RbxlLoader, SceneGraph, ScriptEntry, build_ref_map};
 
 // ---------------------------------------------------------------------------
 // Shared state for the RBXL cache layer
@@ -154,20 +151,14 @@ async fn handle_instance(
     })?;
 
     // Look up the Ref from our map.
-    let inst_ref = lock.ref_map.get(&id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("instance not found: {id}"),
-        )
-    })?;
+    let inst_ref = lock
+        .ref_map
+        .get(&id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("instance not found: {id}")))?;
 
-    RbxlLoader::get_instance_full(dom, *inst_ref).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("ref dangling: {id}"),
-        )
-    })
-    .map(Json)
+    RbxlLoader::get_instance_full(dom, *inst_ref)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("ref dangling: {id}")))
+        .map(Json)
 }
 
 #[derive(Deserialize)]
