@@ -2,7 +2,7 @@
 
 use std::io::Write;
 use tempfile::NamedTempFile;
-use vertigo_sync::rbxl::{InstanceNode, PropertyValue, RbxlLoader, SceneGraph};
+use vertigo_sync::rbxl::{PropertyValue, RbxlLoader, SceneGraph};
 
 /// Minimal .rbxlx file with a Workspace containing a Part and a Script.
 const TEST_RBXLX: &str = r#"
