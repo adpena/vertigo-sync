@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Json;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
@@ -24,6 +24,7 @@ use base64::Engine;
 use serde::Deserialize;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use sha2::{Digest, Sha256};
 
@@ -57,9 +58,28 @@ pub struct SyncPatchAck {
     pub validation: Vec<crate::validate::ValidationIssue>,
 }
 
+/// Maximum request body size (10 MiB). Prevents memory exhaustion from
+/// oversized `/sync/patch` payloads while accommodating large Luau source files.
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 /// Build the Axum router with all endpoints.
 pub fn build_router(state: Arc<ServerState>) -> Router {
     let rbxl_state = new_shared_rbxl_state();
+
+    // CORS: allow browser clients on any localhost port (Vite dev, Strata, etc.)
+    // and the deployed showcase site. Strata WASM needs GET + POST + WebSocket upgrade.
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(|origin, _| {
+            let origin = origin.as_bytes();
+            // Allow any localhost/127.0.0.1 origin (any port).
+            origin.starts_with(b"http://localhost")
+                || origin.starts_with(b"http://127.0.0.1")
+                || origin.starts_with(b"https://localhost")
+                || origin.starts_with(b"https://127.0.0.1")
+        }))
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([axum::http::header::CONTENT_TYPE])
+        .max_age(Duration::from_secs(86400));
 
     Router::new()
         .route("/health", get(handle_health))
@@ -76,6 +96,8 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/mcp/execute", post(handle_mcp_execute))
         .with_state(state)
         .merge(rbxl_router(rbxl_state))
+        .layer(cors)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
 
 /// Start the HTTP server. This blocks until the server exits.
