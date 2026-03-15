@@ -50,7 +50,7 @@ impl EventCoalescer {
     /// (the timer has been reset internally).
     pub fn signal(&self) -> bool {
         let now = Instant::now();
-        let mut lock = self.last_event.lock().unwrap();
+        let mut lock = self.last_event.lock().unwrap_or_else(|e| e.into_inner());
         *lock = Some(now);
 
         // If no pending cycle, start one.
@@ -66,7 +66,7 @@ impl EventCoalescer {
             tokio::time::sleep(self.window).await;
 
             let elapsed = {
-                let lock = self.last_event.lock().unwrap();
+                let lock = self.last_event.lock().unwrap_or_else(|e| e.into_inner());
                 match *lock {
                     Some(ts) => ts.elapsed(),
                     None => self.window, // shouldn't happen, but safe
@@ -1010,7 +1010,7 @@ pub fn run_watch_native(
 // ---------------------------------------------------------------------------
 
 /// Maximum number of history entries to retain before eviction.
-const MAX_HISTORY_ENTRIES: usize = 64;
+const MAX_HISTORY_ENTRIES: usize = 256;
 
 /// Cached .rbxl DOM state, shared between MCP tools and HTTP endpoints.
 pub struct RbxlDomCache {
@@ -1089,8 +1089,7 @@ impl ServerState {
         let new_snapshot = {
             let mut cache_lock = self
                 .cache
-                .lock()
-                .map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
+                .lock().unwrap_or_else(|e| e.into_inner());
             build_snapshot_cached_with_metrics(
                 &self.root,
                 &self.includes,
@@ -1122,8 +1121,7 @@ impl ServerState {
         let current = {
             let lock = self
                 .current
-                .lock()
-                .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                .lock().unwrap_or_else(|e| e.into_inner());
             Arc::clone(&lock)
         };
 
@@ -1140,8 +1138,7 @@ impl ServerState {
         let seq = {
             let mut lock = self
                 .sequence
-                .lock()
-                .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                .lock().unwrap_or_else(|e| e.into_inner());
             *lock += 1;
             *lock
         };
@@ -1158,19 +1155,16 @@ impl ServerState {
         {
             let mut lock = self
                 .current
-                .lock()
-                .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                .lock().unwrap_or_else(|e| e.into_inner());
             *lock = Arc::clone(&new_arc);
         }
         {
             let mut hist_lock = self
                 .history
-                .lock()
-                .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                .lock().unwrap_or_else(|e| e.into_inner());
             let mut order_lock = self
                 .history_order
-                .lock()
-                .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                .lock().unwrap_or_else(|e| e.into_inner());
 
             let fp = new_arc.fingerprint.clone();
             if !hist_lock.contains_key(&fp) {

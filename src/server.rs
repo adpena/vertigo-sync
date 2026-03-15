@@ -228,8 +228,7 @@ async fn handle_snapshot(
 ) -> Result<Json<Snapshot>, StatusCode> {
     let lock = state
         .current
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .lock().unwrap_or_else(|e| e.into_inner());
     Ok(Json((**lock).clone()))
 }
 
@@ -245,8 +244,7 @@ async fn handle_diff(
     let old = {
         let lock = state
             .history
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         lock.get(&query.since).cloned()
     };
 
@@ -260,8 +258,7 @@ async fn handle_diff(
     let current = {
         let lock = state
             .current
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(&lock)
     };
 
@@ -311,10 +308,7 @@ async fn handle_ws_connection(mut socket: WebSocket, state: Arc<ServerState>) {
 
     // Send initial connected message with current fingerprint and entry count.
     let (fingerprint, entries) = {
-        let lock = match state.current.lock() {
-            Ok(lock) => lock,
-            Err(_) => return,
-        };
+        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
         (lock.fingerprint.clone(), lock.entries.len())
     };
 
@@ -390,10 +384,7 @@ async fn handle_ws_connection(mut socket: WebSocket, state: Arc<ServerState>) {
                             match client_msg.msg_type.as_str() {
                                 "request_snapshot" => {
                                     let snap = {
-                                        let lock = match state.current.lock() {
-                                            Ok(l) => l,
-                                            Err(_) => break,
-                                        };
+                                        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
                                         (**lock).clone()
                                     };
                                     let resp = serde_json::json!({
@@ -501,8 +492,7 @@ async fn handle_patch(
     let current_hash = {
         let lock = state
             .current
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         lock.fingerprint.clone()
     };
 
@@ -572,8 +562,7 @@ async fn handle_patch(
     let new_hash = {
         let lock = state
             .current
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         lock.fingerprint.clone()
     };
     let validation_issues = collect_patch_validation_issues(&planned);
@@ -877,8 +866,7 @@ async fn handle_sources(
 ) -> Result<Json<Vec<SourceEntry>>, StatusCode> {
     let lock = state
         .current
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .lock().unwrap_or_else(|e| e.into_inner());
     let entries: Vec<SourceEntry> = lock
         .entries
         .iter()
@@ -1016,8 +1004,7 @@ fn snapshot_metadata_for_paths(
     let requested_set: HashSet<&str> = requested.iter().map(|path| path.as_str()).collect();
     let current = state
         .current
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".into()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
     let mut metadata = HashMap::with_capacity(requested.len());
     for entry in &current.entries {
         if requested_set.contains(entry.path.as_str()) {
@@ -1033,8 +1020,7 @@ fn snapshot_metadata_for_path(
 ) -> Result<Option<(String, u64)>, (StatusCode, String)> {
     let current = state
         .current
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".into()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
     Ok(current
         .entries
         .iter()

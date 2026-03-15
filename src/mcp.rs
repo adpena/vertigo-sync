@@ -735,8 +735,7 @@ fn exec_bridge_manifest(state: &ServerState) -> Result<serde_json::Value, (Statu
     let (source_hash, entry_count) = {
         let lock = state
             .current
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         (lock.fingerprint.clone(), lock.entries.len())
     };
 
@@ -774,8 +773,7 @@ fn exec_bridge_method(
             let (source_hash, entry_count) = {
                 let lock = state
                     .current
-                    .lock()
-                    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+                    .lock().unwrap_or_else(|e| e.into_inner());
                 (lock.fingerprint.clone(), lock.entries.len())
             };
             Ok(serde_json::json!({
@@ -1052,15 +1050,13 @@ fn rebuild_snapshot(state: &ServerState) -> Result<String, (StatusCode, String)>
     {
         let mut lock = state
             .current
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         *lock = Arc::clone(&new_arc);
     }
     {
         let mut lock = state
             .history
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         lock.insert(new_hash.clone(), new_arc);
     }
 
@@ -1089,8 +1085,7 @@ fn exec_health() -> Result<serde_json::Value, (StatusCode, String)> {
 fn exec_snapshot(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
     let lock = state
         .current
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
     serde_json::to_value(&**lock).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
@@ -1108,8 +1103,7 @@ fn exec_diff(
     let old = {
         let lock = state
             .history
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         lock.get(since_hash).cloned()
     };
 
@@ -1123,8 +1117,7 @@ fn exec_diff(
     let current = {
         let lock = state
             .current
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(&lock)
     };
 
@@ -1135,8 +1128,7 @@ fn exec_diff(
 fn exec_sources(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
     let lock = state
         .current
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
 
     let entries: Vec<serde_json::Value> = lock
         .entries
@@ -1356,8 +1348,7 @@ fn exec_search(
 fn exec_stats(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
     let lock = state
         .current
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
 
     Ok(compute_stats(&lock))
 }
@@ -1948,8 +1939,7 @@ fn exec_check_conflict(
     // Collect all existing paths from snapshot to check case-insensitive collisions.
     let lock = state
         .current
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
 
     let proposed_lower = raw_path.to_lowercase();
     let mut conflicts: Vec<serde_json::Value> = Vec::new();
@@ -2106,8 +2096,7 @@ fn exec_describe_changes(
     let old = {
         let lock = state
             .history
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(hash) = since_hash {
             lock.get(hash).cloned()
@@ -2115,8 +2104,7 @@ fn exec_describe_changes(
             // Use the history_order to get the earliest snapshot.
             let order = state
                 .history_order
-                .lock()
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+                .lock().unwrap_or_else(|e| e.into_inner());
             order.front().and_then(|h| lock.get(h).cloned())
         }
     };
@@ -2134,8 +2122,7 @@ fn exec_describe_changes(
     let current = {
         let lock = state
             .current
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(&lock)
     };
 
@@ -2190,8 +2177,7 @@ fn exec_tree(
 
     let lock = state
         .current
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
 
     // Build a tree from the snapshot entries, filtered by prefix.
     let prefix = if raw_path.is_empty() {
@@ -2282,24 +2268,21 @@ fn exec_status(state: &ServerState) -> Result<serde_json::Value, (StatusCode, St
     let current_hash = {
         let lock = state
             .current
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         lock.fingerprint.clone()
     };
 
     let history_count = {
         let lock = state
             .history
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         lock.len()
     };
 
     let sequence = {
         let lock = state
             .sequence
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+            .lock().unwrap_or_else(|e| e.into_inner());
         *lock
     };
 
@@ -2328,13 +2311,11 @@ fn exec_events(
     // History order gives us the chronological sequence of snapshot hashes.
     let order = state
         .history_order
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
 
     let history = state
         .history
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
 
     // Take the last `limit + 1` entries so we can diff consecutive pairs.
     let total = order.len();
@@ -2934,12 +2915,12 @@ async fn execute_auto(
             // Single step — run inline, no spawn overhead.
             let step = &steps[level[0]];
             execution_order.push(step.id.clone());
-            let ns = namespace.lock().unwrap().clone();
+            let ns = namespace.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
             match execute_step(state, step, &ns) {
                 Ok(value) => {
                     completed += 1;
-                    let mut ns = namespace.lock().unwrap();
+                    let mut ns = namespace.lock().unwrap_or_else(|e| e.into_inner());
                     ns.insert(step.id.clone(), value.clone());
                     if let Some(ref collect) = step.collect {
                         ns.insert(collect.clone(), value.clone());
@@ -2962,7 +2943,7 @@ async fn execute_auto(
             for &idx in level {
                 let step = steps[idx].clone();
                 let state_clone = Arc::clone(state);
-                let ns_clone = namespace.lock().unwrap().clone();
+                let ns_clone = namespace.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let handle = tokio::task::spawn_blocking(move || {
                     let result = execute_step(&state_clone, &step, &ns_clone);
                     (step.id.clone(), step.collect.clone(), result)
@@ -2975,7 +2956,7 @@ async fn execute_auto(
                     Ok((id, collect, Ok(value))) => {
                         completed += 1;
                         execution_order.push(id.clone());
-                        let mut ns = namespace.lock().unwrap();
+                        let mut ns = namespace.lock().unwrap_or_else(|e| e.into_inner());
                         ns.insert(id.clone(), value.clone());
                         if let Some(ref collect_name) = collect {
                             ns.insert(collect_name.clone(), value.clone());
@@ -3455,8 +3436,7 @@ fn exec_rbxl_load(
 
     let mut lock = state
         .rbxl
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".to_string()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
     lock.dom = Some(dom);
     lock.ref_map = ref_map;
     lock.loaded_path = Some(resolved.clone());
@@ -3471,8 +3451,7 @@ fn exec_rbxl_load(
 fn exec_rbxl_tree(state: &Arc<ServerState>) -> Result<serde_json::Value, (StatusCode, String)> {
     let lock = state
         .rbxl
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".to_string()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
     let dom = lock.dom.as_ref().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_REQUIRED,
@@ -3490,8 +3469,7 @@ fn exec_rbxl_query(
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let lock = state
         .rbxl
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".to_string()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
     let dom = lock.dom.as_ref().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_REQUIRED,
@@ -3510,8 +3488,7 @@ fn exec_rbxl_query(
 fn exec_rbxl_scripts(state: &Arc<ServerState>) -> Result<serde_json::Value, (StatusCode, String)> {
     let lock = state
         .rbxl
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".to_string()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
     let dom = lock.dom.as_ref().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_REQUIRED,
@@ -3526,8 +3503,7 @@ fn exec_rbxl_scripts(state: &Arc<ServerState>) -> Result<serde_json::Value, (Sta
 fn exec_rbxl_meshes(state: &Arc<ServerState>) -> Result<serde_json::Value, (StatusCode, String)> {
     let lock = state
         .rbxl
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock".to_string()))?;
+        .lock().unwrap_or_else(|e| e.into_inner());
     let dom = lock.dom.as_ref().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_REQUIRED,
