@@ -155,6 +155,10 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/sync/patch", post(handle_patch))
         .route("/validate", get(handle_validate))
         .route("/metrics", get(handle_metrics))
+        .route("/history", get(handle_history))
+        .route("/rewind", get(handle_rewind))
+        .route("/model/{*path}", get(handle_model))
+        .route("/config", get(handle_config))
         .route("/mcp/tools", get(handle_mcp_tools))
         .route("/mcp/execute", post(handle_mcp_execute))
         .with_state(state)
@@ -171,9 +175,12 @@ pub async fn run_serve(
     interval: Duration,
     channel_capacity: usize,
     coalesce_ms: u64,
+    turbo: bool,
 ) -> anyhow::Result<()> {
     let snapshot = build_snapshot(&root, &includes)?;
-    let state = ServerState::new(root, includes, snapshot, channel_capacity);
+    let state = ServerState::with_config(
+        root, includes, snapshot, channel_capacity, turbo, coalesce_ms, false,
+    );
 
     let coalescer = Arc::new(EventCoalescer::new(Duration::from_millis(coalesce_ms)));
 
@@ -846,7 +853,7 @@ fn collect_patch_validation_issues(
         {
             issues.extend(crate::validate::validate_file_content(
                 normalized_path,
-                &content,
+                content,
             ));
         }
     }
@@ -1096,6 +1103,153 @@ async fn handle_metrics(State(state): State<Arc<ServerState>>) -> (HeaderMap, St
         "text/plain; version=0.0.4; charset=utf-8".parse().unwrap(),
     );
     (headers, body)
+}
+
+// ---------------------------------------------------------------------------
+// GET /history?limit=N — recent event log entries
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    #[serde(default = "default_history_limit")]
+    limit: usize,
+}
+
+fn default_history_limit() -> usize {
+    50
+}
+
+async fn handle_history(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<Vec<crate::HistoryEntry>>, (StatusCode, String)> {
+    let limit = query.limit.min(500);
+    let event_log_path = state.root.join(".vertigo-sync-state").join("events.jsonl");
+    let entries = crate::read_history(&event_log_path, limit)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(entries))
+}
+
+// ---------------------------------------------------------------------------
+// GET /rewind?to=<fingerprint> — reverse diff to a historical snapshot
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RewindQuery {
+    to: String,
+}
+
+async fn handle_rewind(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<RewindQuery>,
+) -> Result<Json<crate::SnapshotDiff>, (StatusCode, String)> {
+    let target = {
+        let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        lock.get(&query.to).cloned()
+    };
+
+    let target = target.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!(
+                "fingerprint {} not found in history ring buffer",
+                query.to
+            ),
+        )
+    })?;
+
+    let current = {
+        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
+        std::sync::Arc::clone(&lock)
+    };
+
+    let forward = crate::diff_snapshots(&target, &current);
+    let reversed = crate::reverse_diff(&forward);
+    Ok(Json(reversed))
+}
+
+// ---------------------------------------------------------------------------
+// GET /model/<path> — lazily deserialized model manifest
+// ---------------------------------------------------------------------------
+
+async fn handle_model(
+    State(state): State<Arc<ServerState>>,
+    AxumPath(path): AxumPath<String>,
+) -> Result<Json<crate::ModelManifest>, (StatusCode, String)> {
+    // Verify it's a model file.
+    if !path.ends_with(".rbxm") && !path.ends_with(".rbxmx") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("not a binary model file: {path}"),
+        ));
+    }
+
+    // Path traversal guard: resolve and verify the path stays inside canonical_root.
+    let abs_path = state.canonical_root.join(&path);
+    let canonical = abs_path.canonicalize().map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("model path not found: {path}"),
+        )
+    })?;
+    if !canonical.starts_with(&state.canonical_root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "path traversal detected".to_string(),
+        ));
+    }
+
+    // Find the entry in the current snapshot to get the content hash.
+    let content_hash = {
+        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = lock.entries.iter().find(|e| e.path == path);
+        match entry {
+            Some(e) => e.sha256.clone(),
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("model path not found: {path}"),
+                ))
+            }
+        }
+    };
+
+    // Use the ModelManifestCache for content-addressed caching.
+    let mut cache_lock = state
+        .model_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let manifest = cache_lock
+        .get_or_load(&content_hash, &canonical)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": e.to_string() }).to_string(),
+            )
+        })?;
+
+    Ok(Json(manifest.clone()))
+}
+
+// ---------------------------------------------------------------------------
+// GET /config — current server configuration
+// ---------------------------------------------------------------------------
+
+async fn handle_config(
+    State(state): State<Arc<ServerState>>,
+) -> Json<serde_json::Value> {
+    let history_size = {
+        let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        lock.len()
+    };
+    Json(serde_json::json!({
+        "binary_models": state.binary_models,
+        "model_pool_size": 128,
+        "history_buffer_size": history_size,
+        "history_buffer_capacity": 256,
+        "turbo": state.turbo,
+        "coalesce_ms": state.coalesce_ms,
+    }))
 }
 
 fn resolve_patch_target(source_root: &Path, raw_path: &str) -> anyhow::Result<PathBuf> {

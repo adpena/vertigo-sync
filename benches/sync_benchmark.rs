@@ -261,6 +261,149 @@ fn bench_snapshot_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Benchmark 9: Snapshot with mixed file types (json, txt, csv)
+// ---------------------------------------------------------------------------
+fn create_mixed_file_project(file_count: usize) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(src.join("Server")).unwrap();
+    fs::create_dir_all(src.join("Shared/Config")).unwrap();
+
+    for i in 0..file_count {
+        match i % 5 {
+            0 => {
+                fs::write(
+                    src.join(format!("Server/Mod{i}.luau")),
+                    format!("--!strict\nreturn {i}\n"),
+                )
+                .unwrap();
+            }
+            1 => {
+                fs::write(
+                    src.join(format!("Shared/Config/cfg{i}.json")),
+                    format!(r#"{{"key":{i}}}"#),
+                )
+                .unwrap();
+            }
+            2 => {
+                fs::write(
+                    src.join(format!("Shared/note{i}.txt")),
+                    format!("note content {i}"),
+                )
+                .unwrap();
+            }
+            3 => {
+                fs::write(
+                    src.join(format!("Shared/locale{i}.csv")),
+                    format!("key,en\nhello{i},Hello"),
+                )
+                .unwrap();
+            }
+            _ => {
+                fs::write(
+                    src.join(format!("Server/Mod{i}.luau")),
+                    format!("--!strict\nreturn {i}\n"),
+                )
+                .unwrap();
+            }
+        }
+    }
+    dir
+}
+
+fn bench_snapshot_cold_mixed(c: &mut Criterion) {
+    let dir = create_mixed_file_project(529);
+    let includes = vec!["src".to_string()];
+
+    c.bench_function("snapshot_cold_529_mixed_files", |b| {
+        b.iter(|| {
+            black_box(vertigo_sync::build_snapshot(dir.path(), &includes).unwrap());
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark 10: Snapshot with .meta.json sidecars
+// ---------------------------------------------------------------------------
+fn bench_snapshot_with_meta_json(c: &mut Criterion) {
+    let dir = create_test_project(200);
+    let src = dir.path().join("src");
+
+    // Add .meta.json sidecars for some files.
+    for i in (0..200).step_by(5) {
+        let subdirs = [
+            "Server/Services",
+            "Server/World/Builders",
+            "Client/Controllers",
+            "Client/UI",
+            "Shared/Config",
+            "Shared/Util",
+            "Shared/Net",
+        ];
+        let subdir = subdirs[i % subdirs.len()];
+        let meta_path = src.join(subdir).join(format!("Module{i}.meta.json"));
+        fs::write(
+            &meta_path,
+            r#"{"properties":{"Disabled":false}}"#,
+        )
+        .unwrap();
+    }
+
+    let includes = vec!["src".to_string()];
+    c.bench_function("snapshot_cold_200_files_with_meta_json", |b| {
+        b.iter(|| {
+            black_box(vertigo_sync::build_snapshot(dir.path(), &includes).unwrap());
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark 11: History reading
+// ---------------------------------------------------------------------------
+fn bench_history_read(c: &mut Criterion) {
+    let dir = TempDir::new().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+
+    // Write 256 events.
+    let mut content = String::new();
+    for i in 1..=256 {
+        content.push_str(&format!(
+            r#"{{"seq":{},"snapshot_hash":"hash_{:04x}","timestamp_utc":"2026-01-01T00:00:{}Z","diff":{{"added":1,"modified":0,"deleted":0}}}}"#,
+            i, i, i
+        ));
+        content.push('\n');
+    }
+    fs::write(&log_path, &content).unwrap();
+
+    c.bench_function("history_read_256_entries", |b| {
+        b.iter(|| {
+            black_box(vertigo_sync::read_history(&log_path, 256).unwrap());
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark 12: Reverse diff computation
+// ---------------------------------------------------------------------------
+fn bench_reverse_diff(c: &mut Criterion) {
+    let dir = create_test_project(529);
+    let includes = vec!["src".to_string()];
+
+    let snap_a = vertigo_sync::build_snapshot(dir.path(), &includes).unwrap();
+    for i in 0..20 {
+        touch_file(&dir, i * 26);
+    }
+    let snap_b = vertigo_sync::build_snapshot(dir.path(), &includes).unwrap();
+    let diff = vertigo_sync::diff_snapshots(&snap_a, &snap_b);
+
+    c.bench_function("reverse_diff_computation", |b| {
+        b.iter(|| {
+            black_box(vertigo_sync::reverse_diff(&diff));
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_snapshot_cold,
@@ -272,5 +415,9 @@ criterion_group!(
     bench_health_doctor,
     bench_validation,
     bench_snapshot_scaling,
+    bench_snapshot_cold_mixed,
+    bench_snapshot_with_meta_json,
+    bench_history_read,
+    bench_reverse_diff,
 );
 criterion_main!(benches);

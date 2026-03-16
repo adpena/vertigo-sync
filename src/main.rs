@@ -127,6 +127,9 @@ enum Command {
         /// Project file path (default: default.project.json).
         #[arg(long, default_value = "default.project.json")]
         project: PathBuf,
+        /// Enable binary model (.rbxm/.rbxmx) processing.
+        #[arg(long, default_value_t = false)]
+        binary_models: bool,
     },
 }
 
@@ -145,7 +148,11 @@ async fn main() -> Result<()> {
         Command::Watch => command_watch(&root, &state_dir, &cli),
         Command::WatchNative => command_watch_native(&root, &state_dir, &cli),
         Command::Validate => command_validate(&root, &cli),
-        Command::Build { output, project } => command_build(&root, output, project),
+        Command::Build {
+            output,
+            project,
+            binary_models,
+        } => command_build(&root, output, project, *binary_models),
         Command::Serve => {
             let includes = cli.include.clone();
             let (interval, coalesce_ms) = if cli.turbo {
@@ -164,6 +171,7 @@ async fn main() -> Result<()> {
                 interval,
                 cli.channel_capacity,
                 coalesce_ms,
+                cli.turbo,
             )
             .await
         }
@@ -376,15 +384,14 @@ fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
     }
 
     // Optionally run selene if available.
-    if let Some(selene_output) = validate::run_selene(root, &cli.include) {
-        if !selene_output.is_empty() {
+    if let Some(selene_output) = validate::run_selene(root, &cli.include)
+        && !selene_output.is_empty() {
             println!();
             println!("--- selene output ---");
             for line in &selene_output {
                 println!("{line}");
             }
         }
-    }
 
     println!();
     println!(
@@ -445,7 +452,7 @@ fn command_watch_native(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> 
     )
 }
 
-fn command_build(root: &Path, output: &Path, project: &Path) -> Result<()> {
+fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: bool) -> Result<()> {
     use rbx_dom_weak::{InstanceBuilder, WeakDom};
     use vertigo_sync::project::resolve_instance_class;
 
@@ -481,7 +488,7 @@ fn command_build(root: &Path, output: &Path, project: &Path) -> Result<()> {
         for (i, segment) in segments.iter().enumerate() {
             let existing = dom
                 .get_by_ref(parent_ref)
-                .map(|inst| {
+                .and_then(|inst| {
                     inst.children()
                         .iter()
                         .find(|&&child_ref| {
@@ -490,8 +497,7 @@ fn command_build(root: &Path, output: &Path, project: &Path) -> Result<()> {
                                 .unwrap_or(false)
                         })
                         .copied()
-                })
-                .flatten();
+                });
 
             parent_ref = if let Some(existing_ref) = existing {
                 existing_ref
@@ -598,13 +604,31 @@ fn populate_from_dir(
     // Sort for determinism.
     entries.sort_by_key(|e| e.file_name());
 
-    for entry in entries {
+    // Collect .meta.json filenames for sidecar lookup (zero extra syscalls).
+    let meta_names: std::collections::HashSet<String> = entries
+        .iter()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".meta.json") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for entry in &entries {
         let path = entry.path();
         let file_name = entry.file_name();
         let name_str = file_name.to_string_lossy();
 
-        // Skip hidden files and non-Luau files.
+        // Skip hidden files.
         if name_str.starts_with('.') {
+            continue;
+        }
+
+        // Skip .meta.json sidecars (they are applied to siblings).
+        if name_str.ends_with(".meta.json") {
             continue;
         }
 
@@ -627,14 +651,13 @@ fn populate_from_dir(
             ] {
                 let init_path = path.join(init_name);
                 if init_path.exists() {
-                    if let Ok(source) = std::fs::read_to_string(&init_path) {
-                        if let Some(inst) = dom.get_by_ref_mut(folder_ref) {
+                    if let Ok(source) = std::fs::read_to_string(&init_path)
+                        && let Some(inst) = dom.get_by_ref_mut(folder_ref) {
                             inst.properties.insert(
                                 "Source".into(),
                                 rbx_dom_weak::types::Variant::String(source),
                             );
                         }
-                    }
                     break;
                 }
             }
@@ -647,27 +670,164 @@ fn populate_from_dir(
                 continue;
             }
 
-            // Only process Luau/Lua files.
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext != "luau" && ext != "lua" {
+            let class = resolve_instance_class(&name_str);
+
+            // Skip files that resolve to "Skip" (e.g. .meta.json handled as sidecars).
+            if class == "Skip" {
                 continue;
             }
 
-            let class = resolve_instance_class(&name_str);
-            let instance_name = resolve_instance_name(&name_str);
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-            let mut builder = rbx_dom_weak::InstanceBuilder::new(class).with_name(instance_name);
+            match ext {
+                "luau" | "lua" => {
+                    let instance_name = resolve_instance_name(&name_str);
+                    let mut builder =
+                        rbx_dom_weak::InstanceBuilder::new(class).with_name(instance_name);
 
-            if let Ok(source) = std::fs::read_to_string(&path) {
-                builder =
-                    builder.with_property("Source", rbx_dom_weak::types::Variant::String(source));
+                    if let Ok(source) = std::fs::read_to_string(&path) {
+                        builder = builder.with_property(
+                            "Source",
+                            rbx_dom_weak::types::Variant::String(source),
+                        );
+                    }
+
+                    // Apply .meta.json sidecar if present.
+                    let meta_name = format!("{}.meta.json", name_str);
+                    if meta_names.contains(&meta_name) {
+                        let meta_path = dir.join(&meta_name);
+                        if let Ok(meta_content) = std::fs::read_to_string(&meta_path)
+                            && let Ok(meta) = vertigo_sync::parse_meta_json(&meta_content) {
+                                builder = apply_meta_to_builder(builder, &meta);
+                            }
+                    }
+
+                    dom.insert(parent_ref, builder);
+                }
+                "json" => {
+                    let instance_name = name_str
+                        .strip_suffix(".json")
+                        .unwrap_or(&name_str);
+                    let mut builder =
+                        rbx_dom_weak::InstanceBuilder::new("ModuleScript").with_name(instance_name);
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        builder = builder.with_property(
+                            "Source",
+                            rbx_dom_weak::types::Variant::String(content),
+                        );
+                    }
+                    dom.insert(parent_ref, builder);
+                }
+                "txt" => {
+                    let instance_name = name_str
+                        .strip_suffix(".txt")
+                        .unwrap_or(&name_str);
+                    let mut builder =
+                        rbx_dom_weak::InstanceBuilder::new("StringValue").with_name(instance_name);
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        builder = builder.with_property(
+                            "Value",
+                            rbx_dom_weak::types::Variant::String(content),
+                        );
+                    }
+                    dom.insert(parent_ref, builder);
+                }
+                "csv" => {
+                    let instance_name = name_str
+                        .strip_suffix(".csv")
+                        .unwrap_or(&name_str);
+                    let builder = rbx_dom_weak::InstanceBuilder::new("LocalizationTable")
+                        .with_name(instance_name);
+                    dom.insert(parent_ref, builder);
+                }
+                "rbxm" | "rbxmx" => {
+                    // Binary model — deserialize and merge instances into the DOM tree.
+                    let file = std::fs::File::open(&path);
+                    if let Ok(file) = file {
+                        let reader = std::io::BufReader::new(file);
+                        let model_dom = if ext == "rbxm" {
+                            rbx_binary::from_reader(reader).ok()
+                        } else {
+                            rbx_xml::from_reader_default(reader).ok()
+                        };
+                        if let Some(model_dom) = model_dom {
+                            merge_model_into_dom(dom, parent_ref, &model_dom);
+                        }
+                    }
+                }
+                _ => {
+                    // Unknown file type — skip.
+                }
             }
-
-            dom.insert(parent_ref, builder);
         }
     }
 
     Ok(())
+}
+
+/// Apply InstanceMeta properties to a builder.
+fn apply_meta_to_builder(
+    mut builder: rbx_dom_weak::InstanceBuilder,
+    meta: &vertigo_sync::InstanceMeta,
+) -> rbx_dom_weak::InstanceBuilder {
+    for (key, value) in &meta.properties {
+        match value {
+            serde_json::Value::Bool(b) => {
+                builder = builder.with_property(key.as_str(), rbx_dom_weak::types::Variant::Bool(*b));
+            }
+            serde_json::Value::String(s) => {
+                builder = builder
+                    .with_property(key.as_str(), rbx_dom_weak::types::Variant::String(s.clone()));
+            }
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    builder = builder
+                        .with_property(key.as_str(), rbx_dom_weak::types::Variant::Int32(i as i32));
+                } else if let Some(f) = n.as_f64() {
+                    builder = builder
+                        .with_property(key.as_str(), rbx_dom_weak::types::Variant::Float64(f));
+                }
+            }
+            _ => {}
+        }
+    }
+    builder
+}
+
+/// Merge instances from a model DOM into the build DOM under a parent.
+fn merge_model_into_dom(
+    dom: &mut rbx_dom_weak::WeakDom,
+    parent_ref: rbx_dom_weak::types::Ref,
+    model_dom: &rbx_dom_weak::WeakDom,
+) {
+    let model_root = model_dom.root();
+    for &child_ref in model_root.children() {
+        merge_model_instance(dom, parent_ref, model_dom, child_ref);
+    }
+}
+
+/// Recursively copy an instance from model_dom into dom.
+fn merge_model_instance(
+    dom: &mut rbx_dom_weak::WeakDom,
+    parent_ref: rbx_dom_weak::types::Ref,
+    model_dom: &rbx_dom_weak::WeakDom,
+    model_ref: rbx_dom_weak::types::Ref,
+) {
+    let Some(inst) = model_dom.get_by_ref(model_ref) else {
+        return;
+    };
+    let mut builder =
+        rbx_dom_weak::InstanceBuilder::new(inst.class.as_str()).with_name(inst.name.as_str());
+
+    for (key, variant) in &inst.properties {
+        builder = builder.with_property(key.as_str(), variant.clone());
+    }
+
+    let new_ref = dom.insert(parent_ref, builder);
+
+    for &child_ref in inst.children() {
+        merge_model_instance(dom, new_ref, model_dom, child_ref);
+    }
 }
 
 /// Populate a single file into the DOM.

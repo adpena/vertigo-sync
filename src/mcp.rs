@@ -456,6 +456,42 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
             "Extract all MeshPart instances with their MeshId from the loaded .rbxl",
             vec![],
         ),
+        // ── New: History, rewind, model, config ──────────────────────
+        tool_def(
+            "sync_history",
+            "Get recent sync event history from the event log",
+            vec![param(
+                "limit",
+                "number",
+                "Maximum entries to return (default 50, max 500)",
+                false,
+            )],
+        ),
+        tool_def(
+            "sync_rewind",
+            "Compute reverse diff to rewind to a historical snapshot fingerprint",
+            vec![param(
+                "fingerprint",
+                "string",
+                "Target snapshot fingerprint to rewind to",
+                true,
+            )],
+        ),
+        tool_def(
+            "sync_model_manifest",
+            "Get lazily-deserialized model manifest for a .rbxm/.rbxmx file",
+            vec![param(
+                "path",
+                "string",
+                "Relative path to the .rbxm/.rbxmx model file",
+                true,
+            )],
+        ),
+        tool_def(
+            "sync_config",
+            "Get current server configuration including feature flags",
+            vec![],
+        ),
     ])
 }
 
@@ -524,6 +560,11 @@ pub async fn handle_mcp_execute(
         "vsync_rbxl_query" => exec_rbxl_query(&state, &req.arguments),
         "vsync_rbxl_scripts" => exec_rbxl_scripts(&state),
         "vsync_rbxl_meshes" => exec_rbxl_meshes(&state),
+        // New: History, rewind, model, config
+        "sync_history" => exec_sync_history(&state, &req.arguments),
+        "sync_rewind" => exec_sync_rewind(&state, &req.arguments),
+        "sync_model_manifest" => exec_sync_model_manifest(&state, &req.arguments),
+        "sync_config" => exec_sync_config(&state),
         _ => Err((StatusCode::NOT_FOUND, format!("unknown tool: {}", req.tool))),
     }?;
 
@@ -596,6 +637,22 @@ fn bridge_method_catalog() -> &'static [(&'static str, &'static str)] {
         (
             "metrics.get",
             "Return sync metrics and performance counters",
+        ),
+        (
+            "sync.history",
+            "Get recent sync event history from the event log",
+        ),
+        (
+            "sync.rewind",
+            "Compute reverse diff to rewind to a historical snapshot fingerprint",
+        ),
+        (
+            "sync.model_manifest",
+            "Get lazily-deserialized model manifest for a .rbxm/.rbxmx file",
+        ),
+        (
+            "sync.config",
+            "Get current server configuration including feature flags",
         ),
     ]
 }
@@ -815,6 +872,10 @@ fn exec_bridge_method(
         "sync.project" => exec_project(state),
         "project.mappings" => exec_project(state),
         "metrics.get" => exec_metrics(state),
+        "sync.history" => exec_sync_history(state, params),
+        "sync.rewind" => exec_sync_rewind(state, params),
+        "sync.model_manifest" => exec_sync_model_manifest(state, params),
+        "sync.config" => exec_sync_config(state),
         _ => Err((
             StatusCode::NOT_FOUND,
             format!("unknown bridge method: {method}"),
@@ -979,13 +1040,11 @@ fn exec_bridge_batch(
             }
         }
 
-        if stop_on_error {
-            if let Some(last) = responses.last() {
-                if last["ok"].as_bool() == Some(false) {
+        if stop_on_error
+            && let Some(last) = responses.last()
+                && last["ok"].as_bool() == Some(false) {
                     break;
                 }
-            }
-        }
     }
 
     Ok(serde_json::json!({
@@ -1667,11 +1726,10 @@ fn grep_dir(
             .and_then(|n| n.to_str())
             .unwrap_or_default();
 
-        if let Some(glob) = glob_filter {
-            if !matches_glob(file_name, glob) {
+        if let Some(glob) = glob_filter
+            && !matches_glob(file_name, glob) {
                 continue;
             }
-        }
 
         let rel_path = match path.strip_prefix(root) {
             Ok(r) => r.to_string_lossy().replace('\\', "/"),
@@ -2440,11 +2498,10 @@ fn search_dir(
             .unwrap_or_default();
 
         // Apply glob filter (simple suffix/extension matching).
-        if let Some(glob) = glob_filter {
-            if !matches_glob(file_name, glob) {
+        if let Some(glob) = glob_filter
+            && !matches_glob(file_name, glob) {
                 continue;
             }
-        }
 
         let rel_path = match path.strip_prefix(root) {
             Ok(r) => r.to_string_lossy().replace('\\', "/"),
@@ -2627,6 +2684,10 @@ fn execute_step(
         "vsync_bridge_manifest" => exec_bridge_manifest(state).map_err(|(_, e)| e),
         "vsync_bridge_execute" => exec_bridge_execute(state, &args).map_err(|(_, e)| e),
         "vsync_bridge_batch" => exec_bridge_batch(state, &args).map_err(|(_, e)| e),
+        "sync_history" => exec_sync_history(state, &args).map_err(|(_, e)| e),
+        "sync_rewind" => exec_sync_rewind(state, &args).map_err(|(_, e)| e),
+        "sync_model_manifest" => exec_sync_model_manifest(state, &args).map_err(|(_, e)| e),
+        "sync_config" => exec_sync_config(state).map_err(|(_, e)| e),
         other => Err(format!("unknown tool in pipeline: {other}")),
     }
 }
@@ -2653,9 +2714,9 @@ fn interpolate_args(
                 if let Some(end) = rest.find('}') {
                     let ref_path = &rest[..end];
                     let replacement = resolve_ref(ref_path, namespace)
-                        .and_then(|v| match &v {
-                            serde_json::Value::String(s) => Some(s.clone()),
-                            other => Some(other.to_string()),
+                        .map(|v| match &v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
                         })
                         .unwrap_or_default();
                     result = format!(
@@ -3113,16 +3174,22 @@ mod tests {
                     path: "src/Server/init.server.luau".into(),
                     sha256: "aaa".into(),
                     bytes: 1000,
+                    meta: None,
+                    file_type: None,
                 },
                 crate::SnapshotEntry {
                     path: "src/Client/init.client.luau".into(),
                     sha256: "bbb".into(),
                     bytes: 2000,
+                    meta: None,
+                    file_type: None,
                 },
                 crate::SnapshotEntry {
                     path: "src/Shared/Config/Abilities.luau".into(),
                     sha256: "ccc".into(),
                     bytes: 500,
+                    meta: None,
+                    file_type: None,
                 },
             ],
         };
@@ -3139,7 +3206,7 @@ mod tests {
             .build()
             .unwrap();
         let tools = rt.block_on(async { handle_mcp_tools().await });
-        assert_eq!(tools.0.len(), 36, "expected 36 MCP tools");
+        assert_eq!(tools.0.len(), 40, "expected 40 MCP tools");
     }
 
     #[test]
@@ -3513,4 +3580,159 @@ fn exec_rbxl_meshes(state: &Arc<ServerState>) -> Result<serde_json::Value, (Stat
 
     let meshes = RbxlLoader::extract_meshes(dom);
     serde_json::to_value(&meshes).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// New MCP tool implementations: history, rewind, model, config
+// ---------------------------------------------------------------------------
+
+fn exec_sync_history(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50) as usize;
+    let limit = limit.min(500);
+
+    let event_log_path = state.root.join(".vertigo-sync-state").join("events.jsonl");
+    let entries = crate::read_history(&event_log_path, limit)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    serde_json::to_value(&entries).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn exec_sync_rewind(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let fingerprint = args
+        .get("fingerprint")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "missing required parameter: fingerprint".to_string(),
+            )
+        })?;
+
+    let target = {
+        let lock = state
+            .history
+            .lock().unwrap_or_else(|e| e.into_inner());
+        lock.get(fingerprint).cloned()
+    };
+
+    let target = target.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("fingerprint {} not found in history ring buffer", fingerprint),
+        )
+    })?;
+
+    let current = {
+        let lock = state
+            .current
+            .lock().unwrap_or_else(|e| e.into_inner());
+        std::sync::Arc::clone(&lock)
+    };
+
+    let forward = crate::diff_snapshots(&target, &current);
+    let reversed = crate::reverse_diff(&forward);
+
+    serde_json::to_value(&reversed)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn exec_sync_model_manifest(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "missing required parameter: path".to_string(),
+            )
+        })?;
+
+    if !path.ends_with(".rbxm") && !path.ends_with(".rbxmx") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("not a binary model file: {path}"),
+        ));
+    }
+
+    // Path traversal guard: resolve and verify the path stays inside canonical_root.
+    let abs_path = state.canonical_root.join(path);
+    let canonical = abs_path.canonicalize().map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("model path not found: {path}"),
+        )
+    })?;
+    if !canonical.starts_with(&state.canonical_root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "path traversal detected".to_string(),
+        ));
+    }
+
+    // Look up content hash from snapshot for cache key.
+    let content_hash = {
+        let lock = state
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lock.entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.sha256.clone())
+    };
+
+    let mut cache_lock = state
+        .model_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let manifest = if let Some(hash) = content_hash {
+        cache_lock.get_or_load(&hash, &canonical)
+    } else {
+        // File not in snapshot — deserialize directly without caching.
+        drop(cache_lock);
+        let m = crate::deserialize_model_manifest(&canonical).map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+        return serde_json::to_value(&m)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    };
+
+    let manifest = manifest.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    serde_json::to_value(manifest)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn exec_sync_config(
+    state: &ServerState,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let history_size = {
+        let lock = state
+            .history
+            .lock().unwrap_or_else(|e| e.into_inner());
+        lock.len()
+    };
+    Ok(serde_json::json!({
+        "binary_models": state.binary_models,
+        "model_pool_size": 128,
+        "history_buffer_size": history_size,
+        "history_buffer_capacity": 256,
+        "turbo": state.turbo,
+        "coalesce_ms": state.coalesce_ms,
+    }))
 }

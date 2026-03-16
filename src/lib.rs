@@ -262,11 +262,25 @@ impl Default for SnapshotCache {
     }
 }
 
+/// Optional instance metadata parsed from a sibling `.meta.json` file.
+/// Follows the Rojo meta.json schema for property and attribute overrides.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceMeta {
+    pub properties: BTreeMap<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<BTreeMap<String, serde_json::Value>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotEntry {
     pub path: String,
     pub sha256: String,
     pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<InstanceMeta>,
+    /// File type hint: "luau", "json", "txt", "csv", "rbxm", "rbxmx", "meta_json", "lua", "other".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -416,7 +430,7 @@ pub fn build_snapshot(root: &Path, includes: &[String]) -> Result<Snapshot> {
         collect_files(root, &include_path, &mut files)?;
     }
 
-    files.sort_by(|a, b| normalize_path(a).cmp(&normalize_path(b)));
+    files.sort_by_key(|a| normalize_path(a));
 
     // Parallel hash using rayon — all CPU cores for initial/uncached builds.
     let entries: Result<Vec<SnapshotEntry>> = files
@@ -425,10 +439,14 @@ pub fn build_snapshot(root: &Path, includes: &[String]) -> Result<Snapshot> {
             let absolute = root.join(relative);
             let (sha256, bytes) = hash_file(&absolute)
                 .with_context(|| format!("failed to hash file {}", absolute.display()))?;
+            let normalized = normalize_path(relative);
+            let file_type = Some(classify_file_type(&normalized).to_string());
             Ok(SnapshotEntry {
-                path: normalize_path(relative),
+                path: normalized,
                 sha256,
                 bytes,
+                meta: None,
+                file_type,
             })
         })
         .collect();
@@ -436,6 +454,10 @@ pub fn build_snapshot(root: &Path, includes: &[String]) -> Result<Snapshot> {
     let mut entries = entries?;
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let fingerprint = fingerprint_entries(&entries);
+
+    // Lazy meta.json attachment — only reads .meta.json files that exist as
+    // siblings to Luau/Lua entries. Zero extra syscalls for projects without them.
+    attach_meta_json(root, &mut entries);
 
     Ok(Snapshot {
         version: 1,
@@ -488,7 +510,7 @@ fn build_snapshot_cached_inner(
         collect_files(root, &include_path, &mut files)?;
     }
 
-    files.sort_by(|a, b| normalize_path(a).cmp(&normalize_path(b)));
+    files.sort_by_key(|a| normalize_path(a));
 
     struct FileWork {
         normalized: String,
@@ -539,18 +561,24 @@ fn build_snapshot_cached_inner(
         .par_iter()
         .map(|fw| {
             if let Some(ref sha256) = fw.cached_hash {
+                let file_type = Some(classify_file_type(&fw.normalized).to_string());
                 Ok(SnapshotEntry {
                     path: fw.normalized.clone(),
                     sha256: sha256.clone(),
                     bytes: fw.size,
+                    meta: None,
+                    file_type,
                 })
             } else {
                 let (sha256, bytes) = hash_file(&fw.absolute)
                     .with_context(|| format!("failed to hash file {}", fw.absolute.display()))?;
+                let file_type = Some(classify_file_type(&fw.normalized).to_string());
                 Ok(SnapshotEntry {
                     path: fw.normalized.clone(),
                     sha256,
                     bytes,
+                    meta: None,
+                    file_type,
                 })
             }
         })
@@ -575,6 +603,9 @@ fn build_snapshot_cached_inner(
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let fingerprint = fingerprint_entries(&entries);
+
+    // Lazy meta.json attachment for cached builds too.
+    attach_meta_json(root, &mut entries);
 
     Ok(Snapshot {
         version: 1,
@@ -1019,6 +1050,12 @@ pub struct RbxlDomCache {
     pub loaded_path: Option<PathBuf>,
 }
 
+impl Default for RbxlDomCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RbxlDomCache {
     pub fn new() -> Self {
         Self {
@@ -1044,6 +1081,14 @@ pub struct ServerState {
     pub metrics: Arc<Metrics>,
     /// Cached .rbxl DOM for MCP tool access.
     pub rbxl: Mutex<RbxlDomCache>,
+    /// Whether turbo mode is active (shorter coalesce window).
+    pub turbo: bool,
+    /// Coalesce window in milliseconds.
+    pub coalesce_ms: u64,
+    /// Whether binary model support is enabled.
+    pub binary_models: bool,
+    /// Cached model manifests, keyed by content SHA-256.
+    pub model_cache: Mutex<ModelManifestCache>,
 }
 
 impl ServerState {
@@ -1052,6 +1097,18 @@ impl ServerState {
         includes: Vec<String>,
         initial: Snapshot,
         channel_capacity: usize,
+    ) -> Arc<Self> {
+        Self::with_config(root, includes, initial, channel_capacity, false, 50, false)
+    }
+
+    pub fn with_config(
+        root: PathBuf,
+        includes: Vec<String>,
+        initial: Snapshot,
+        channel_capacity: usize,
+        turbo: bool,
+        coalesce_ms: u64,
+        binary_models: bool,
     ) -> Arc<Self> {
         let capacity = channel_capacity.clamp(32, 16_384);
         let (tx, _rx) = tokio::sync::broadcast::channel::<SyncDiffEvent>(capacity);
@@ -1079,6 +1136,10 @@ impl ServerState {
             cache: Mutex::new(SnapshotCache::new()),
             metrics,
             rbxl: Mutex::new(RbxlDomCache::new()),
+            turbo,
+            coalesce_ms,
+            binary_models,
+            model_cache: Mutex::new(ModelManifestCache::new()),
         })
     }
 
@@ -1345,7 +1406,7 @@ fn collect_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Resu
             children.push(entry.path());
         }
 
-        children.sort_by(|a, b| normalize_path(a).cmp(&normalize_path(b)));
+        children.sort_by_key(|a| normalize_path(a));
         for child in children {
             collect_files(root, &child, output)?;
         }
@@ -1414,6 +1475,364 @@ fn ensure_parent(path: &Path) -> Result<()> {
 
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// Classify a file's type from its path for the `file_type` field.
+/// Returns a `&'static str` — no heap allocation per call.
+fn classify_file_type(path: &str) -> &'static str {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".meta.json") {
+        "meta_json"
+    } else if lower.ends_with(".luau") {
+        "luau"
+    } else if lower.ends_with(".lua") {
+        "lua"
+    } else if lower.ends_with(".json") {
+        "json"
+    } else if lower.ends_with(".txt") {
+        "txt"
+    } else if lower.ends_with(".csv") {
+        "csv"
+    } else if lower.ends_with(".rbxm") {
+        "rbxm"
+    } else if lower.ends_with(".rbxmx") {
+        "rbxmx"
+    } else {
+        "other"
+    }
+}
+
+/// Parse a `.meta.json` sidecar file into an `InstanceMeta`.
+pub fn parse_meta_json(content: &str) -> Result<InstanceMeta> {
+    let raw: serde_json::Value =
+        serde_json::from_str(content).context("failed to parse .meta.json")?;
+    let properties = match raw.get("properties") {
+        Some(serde_json::Value::Object(map)) => {
+            map.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        }
+        _ => BTreeMap::new(),
+    };
+    let attributes = match raw.get("attributes") {
+        Some(serde_json::Value::Object(map)) => {
+            Some(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        }
+        _ => None,
+    };
+    Ok(InstanceMeta {
+        properties,
+        attributes,
+    })
+}
+
+/// Attach `.meta.json` sidecar metadata to snapshot entries.
+/// For each entry ending in `.luau` or `.lua`, checks if a sibling `.meta.json`
+/// exists in the snapshot and reads+parses it lazily from disk.
+pub fn attach_meta_json(root: &Path, entries: &mut [SnapshotEntry]) {
+    // Build a set of paths that are .meta.json files for quick lookup.
+    let meta_paths: HashSet<String> = entries
+        .iter()
+        .filter(|e| e.path.ends_with(".meta.json"))
+        .map(|e| e.path.clone())
+        .collect();
+
+    for entry in entries.iter_mut() {
+        if entry.meta.is_some() {
+            continue;
+        }
+        // For Luau/Lua files, check for a sibling .meta.json.
+        // .server.luau and .client.luau are already covered by the .luau check.
+        let ext_match = entry.path.ends_with(".luau") || entry.path.ends_with(".lua");
+        if !ext_match {
+            continue;
+        }
+
+        // Derive the expected .meta.json path: foo.luau -> foo.meta.json
+        let meta_path = derive_meta_json_path(&entry.path);
+        if let Some(meta_path) = meta_path
+            && meta_paths.contains(&meta_path) {
+                let abs = root.join(&meta_path);
+                if let Ok(content) = fs::read_to_string(&abs)
+                    && let Ok(meta) = parse_meta_json(&content) {
+                        entry.meta = Some(meta);
+                    }
+            }
+    }
+}
+
+/// Derive the `.meta.json` sidecar path from a source file path.
+/// Example: `src/Server/Foo.server.luau` -> `src/Server/Foo.server.luau.meta.json`
+/// (Rojo convention: the meta file name is `{filename}.meta.json`)
+fn derive_meta_json_path(source_path: &str) -> Option<String> {
+    // Rojo meta convention: filename.meta.json sits next to the file.
+    // For "init.server.luau" inside a directory, the meta is on the directory itself,
+    // but we handle the simple case: {path}.meta.json
+    // Actually Rojo convention for files is: `Foo.luau` -> `Foo.meta.json`
+    // and for init scripts: `init.meta.json` in the same directory
+    // Let's handle: strip extension, add .meta.json
+    if let Some(stem) = source_path.strip_suffix(".server.luau") {
+        Some(format!("{stem}.server.luau.meta.json"))
+    } else if let Some(stem) = source_path.strip_suffix(".client.luau") {
+        Some(format!("{stem}.client.luau.meta.json"))
+    } else if let Some(stem) = source_path.strip_suffix(".luau") {
+        Some(format!("{stem}.meta.json"))
+    } else { source_path.strip_suffix(".lua").map(|stem| format!("{stem}.meta.json")) }
+}
+
+// ---------------------------------------------------------------------------
+// Model manifest cache — lazy deserialization of .rbxm/.rbxmx files
+// ---------------------------------------------------------------------------
+
+/// A single instance from a binary model file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelInstance {
+    pub index: usize,
+    pub parent_index: Option<usize>,
+    pub name: String,
+    pub class_name: String,
+    pub properties: BTreeMap<String, serde_json::Value>,
+}
+
+/// Manifest of instances within a binary model file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelManifest {
+    pub instances: Vec<ModelInstance>,
+    pub root_count: usize,
+}
+
+/// Content-addressed cache for lazily deserialized binary model manifests.
+/// Keyed by SHA-256 hash of the model file content — only re-parses when
+/// the file actually changes.
+pub struct ModelManifestCache {
+    entries: HashMap<String, ModelManifest>,
+}
+
+impl ModelManifestCache {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Get or lazily deserialize a model manifest.
+    /// `content_hash` is the SHA-256 of the file content (from snapshot).
+    /// `path` is the absolute path to the .rbxm/.rbxmx file on disk.
+    pub fn get_or_load(&mut self, content_hash: &str, path: &Path) -> Result<&ModelManifest> {
+        if !self.entries.contains_key(content_hash) {
+            let manifest = deserialize_model_manifest(path)?;
+            self.entries.insert(content_hash.to_string(), manifest);
+        }
+        Ok(self.entries.get(content_hash).expect("just inserted"))
+    }
+
+    /// Number of cached manifests.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Default for ModelManifestCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Deserialize a .rbxm/.rbxmx file into a `ModelManifest`.
+pub fn deserialize_model_manifest(path: &Path) -> Result<ModelManifest> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let file = File::open(path)
+        .with_context(|| format!("failed to open model file {}", path.display()))?;
+    let reader = BufReader::new(file);
+
+    let dom = match ext.as_str() {
+        "rbxm" => rbx_binary::from_reader(reader)
+            .with_context(|| format!("failed to parse binary model {}", path.display()))?,
+        "rbxmx" => rbx_xml::from_reader_default(reader)
+            .with_context(|| format!("failed to parse XML model {}", path.display()))?,
+        _ => anyhow::bail!("unsupported model extension: {ext}"),
+    };
+
+    let mut instances = Vec::new();
+    let mut ref_to_index: HashMap<rbx_dom_weak::types::Ref, usize> = HashMap::new();
+    collect_model_instances(&dom, dom.root_ref(), None, &mut instances, &mut ref_to_index);
+
+    let root_count = dom.root().children().len();
+
+    Ok(ModelManifest {
+        instances,
+        root_count,
+    })
+}
+
+/// Recursively collect instances from a model DOM into flat list.
+fn collect_model_instances(
+    dom: &rbx_dom_weak::WeakDom,
+    inst_ref: rbx_dom_weak::types::Ref,
+    parent_index: Option<usize>,
+    out: &mut Vec<ModelInstance>,
+    ref_to_index: &mut HashMap<rbx_dom_weak::types::Ref, usize>,
+) {
+    let Some(inst) = dom.get_by_ref(inst_ref) else {
+        return;
+    };
+
+    let index = out.len();
+    ref_to_index.insert(inst_ref, index);
+
+    let mut properties = BTreeMap::new();
+    for (key, variant) in &inst.properties {
+        // Convert simple property types to JSON values.
+        let value = match variant {
+            rbx_types::Variant::String(s) => serde_json::Value::String(s.clone()),
+            rbx_types::Variant::Bool(b) => serde_json::Value::Bool(*b),
+            rbx_types::Variant::Int32(n) => serde_json::json!(*n),
+            rbx_types::Variant::Float32(n) => serde_json::json!(*n),
+            rbx_types::Variant::Float64(n) => serde_json::json!(*n),
+            rbx_types::Variant::Enum(e) => serde_json::json!(e.to_u32()),
+            _ => serde_json::Value::String(format!("{:?}", std::mem::discriminant(variant))),
+        };
+        properties.insert(key.to_string(), value);
+    }
+
+    out.push(ModelInstance {
+        index,
+        parent_index,
+        name: inst.name.clone(),
+        class_name: inst.class.to_string(),
+        properties,
+    });
+
+    for &child_ref in inst.children() {
+        collect_model_instances(dom, child_ref, Some(index), out, ref_to_index);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// History reading — parse events.jsonl in reverse order
+// ---------------------------------------------------------------------------
+
+/// A single entry from the event log, suitable for the /history endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub seq: u64,
+    pub fingerprint: String,
+    pub timestamp: String,
+    pub added: usize,
+    pub modified: usize,
+    pub deleted: usize,
+}
+
+/// Read the most recent `limit` entries from the event log (NDJSON).
+/// Returns entries in reverse chronological order (newest first).
+pub fn read_history(event_log_path: &Path, limit: usize) -> Result<Vec<HistoryEntry>> {
+    if !event_log_path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(event_log_path)
+        .with_context(|| format!("failed to open event log {}", event_log_path.display()))?;
+    let reader = BufReader::new(file);
+
+    let mut entries: Vec<HistoryEntry> = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let seq = value
+            .get("seq")
+            .and_then(|v| v.as_u64())
+            .or_else(|| value.get("sequence_id").and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+
+        let fingerprint = value
+            .get("snapshot_hash")
+            .or_else(|| value.get("source_hash"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let timestamp = value
+            .get("timestamp_utc")
+            .or_else(|| value.get("timestamp"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let added = value
+            .get("diff")
+            .and_then(|d| d.get("added"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let modified = value
+            .get("diff")
+            .and_then(|d| d.get("modified"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let deleted = value
+            .get("diff")
+            .and_then(|d| d.get("deleted"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        entries.push(HistoryEntry {
+            seq,
+            fingerprint,
+            timestamp,
+            added,
+            modified,
+            deleted,
+        });
+    }
+
+    // Return newest first, limited to `limit`.
+    entries.reverse();
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+// ---------------------------------------------------------------------------
+// Reverse diff computation — swap adds/deletes for rewind support
+// ---------------------------------------------------------------------------
+
+/// Compute a reverse diff that undoes `diff`. Swaps added<->deleted and
+/// inverts modified entry directions.
+pub fn reverse_diff(diff: &SnapshotDiff) -> SnapshotDiff {
+    let reversed_modified: Vec<ModifiedEntry> = diff
+        .modified
+        .iter()
+        .map(|m| ModifiedEntry {
+            path: m.path.clone(),
+            previous_sha256: m.current_sha256.clone(),
+            previous_bytes: m.current_bytes,
+            current_sha256: m.previous_sha256.clone(),
+            current_bytes: m.previous_bytes,
+        })
+        .collect();
+
+    SnapshotDiff {
+        previous_fingerprint: diff.current_fingerprint.clone(),
+        current_fingerprint: diff.previous_fingerprint.clone(),
+        added: diff.deleted.clone(),
+        modified: reversed_modified,
+        deleted: diff.added.clone(),
+    }
 }
 
 fn should_skip_dir(path: &Path) -> bool {
@@ -1511,16 +1930,22 @@ mod tests {
                     path: "src/a.lua".to_string(),
                     sha256: "hash_a".to_string(),
                     bytes: 1,
+                    meta: None,
+                    file_type: None,
                 },
                 SnapshotEntry {
                     path: "src/b.lua".to_string(),
                     sha256: "hash_b_old".to_string(),
                     bytes: 2,
+                    meta: None,
+                    file_type: None,
                 },
                 SnapshotEntry {
                     path: "src/c.lua".to_string(),
                     sha256: "hash_c".to_string(),
                     bytes: 3,
+                    meta: None,
+                    file_type: None,
                 },
             ],
         };
@@ -1534,16 +1959,22 @@ mod tests {
                     path: "src/a.lua".to_string(),
                     sha256: "hash_a".to_string(),
                     bytes: 1,
+                    meta: None,
+                    file_type: None,
                 },
                 SnapshotEntry {
                     path: "src/b.lua".to_string(),
                     sha256: "hash_b_new".to_string(),
                     bytes: 20,
+                    meta: None,
+                    file_type: None,
                 },
                 SnapshotEntry {
                     path: "src/d.lua".to_string(),
                     sha256: "hash_d".to_string(),
                     bytes: 4,
+                    meta: None,
+                    file_type: None,
                 },
             ],
         };
@@ -1572,6 +2003,8 @@ mod tests {
                 path: "src/a.lua".to_string(),
                 sha256: "hash_a".to_string(),
                 bytes: 10,
+                meta: None,
+                file_type: None,
             }],
         };
 
@@ -1799,4 +2232,248 @@ mod tests {
         assert_eq!(large_hash, large_hash2);
         assert_eq!(small_hash, small_hash2);
     }
+
+    // -----------------------------------------------------------------------
+    // InstanceMeta / meta.json tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_meta_json_full() {
+        let content = r#"{
+            "properties": {"Disabled": true, "RunContext": "Client"},
+            "attributes": {"CustomTag": "value"}
+        }"#;
+        let meta = parse_meta_json(content).expect("parse");
+        assert_eq!(meta.properties.len(), 2);
+        assert_eq!(meta.properties["Disabled"], serde_json::json!(true));
+        assert_eq!(meta.properties["RunContext"], serde_json::json!("Client"));
+        assert!(meta.attributes.is_some());
+        let attrs = meta.attributes.unwrap();
+        assert_eq!(attrs["CustomTag"], serde_json::json!("value"));
+    }
+
+    #[test]
+    fn parse_meta_json_properties_only() {
+        let content = r#"{"properties": {"Disabled": false}}"#;
+        let meta = parse_meta_json(content).expect("parse");
+        assert_eq!(meta.properties.len(), 1);
+        assert!(meta.attributes.is_none());
+    }
+
+    #[test]
+    fn parse_meta_json_empty() {
+        let content = r#"{}"#;
+        let meta = parse_meta_json(content).expect("parse");
+        assert!(meta.properties.is_empty());
+        assert!(meta.attributes.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // File type classification tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_file_type_all_variants() {
+        assert_eq!(classify_file_type("src/a.luau"), "luau");
+        assert_eq!(classify_file_type("src/a.lua"), "lua");
+        assert_eq!(classify_file_type("src/a.json"), "json");
+        assert_eq!(classify_file_type("src/a.txt"), "txt");
+        assert_eq!(classify_file_type("src/a.csv"), "csv");
+        assert_eq!(classify_file_type("src/a.rbxm"), "rbxm");
+        assert_eq!(classify_file_type("src/a.rbxmx"), "rbxmx");
+        assert_eq!(classify_file_type("src/a.meta.json"), "meta_json");
+        assert_eq!(classify_file_type("src/a.py"), "other");
+    }
+
+    // -----------------------------------------------------------------------
+    // History reading tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_history_empty_file() {
+        let root = tempdir().expect("tempdir");
+        let log_path = root.path().join("events.jsonl");
+        fs::write(&log_path, "").expect("write empty");
+        let entries = read_history(&log_path, 50).expect("read");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn read_history_returns_newest_first() {
+        let root = tempdir().expect("tempdir");
+        let log_path = root.path().join("events.jsonl");
+        let content = r#"{"seq":1,"snapshot_hash":"aaa","timestamp_utc":"2026-01-01T00:00:00Z","diff":{"added":1,"modified":0,"deleted":0}}
+{"seq":2,"snapshot_hash":"bbb","timestamp_utc":"2026-01-01T00:01:00Z","diff":{"added":0,"modified":1,"deleted":0}}
+{"seq":3,"snapshot_hash":"ccc","timestamp_utc":"2026-01-01T00:02:00Z","diff":{"added":0,"modified":0,"deleted":1}}
+"#;
+        fs::write(&log_path, content).expect("write");
+        let entries = read_history(&log_path, 50).expect("read");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].seq, 3);
+        assert_eq!(entries[1].seq, 2);
+        assert_eq!(entries[2].seq, 1);
+        assert_eq!(entries[0].fingerprint, "ccc");
+    }
+
+    #[test]
+    fn read_history_respects_limit() {
+        let root = tempdir().expect("tempdir");
+        let log_path = root.path().join("events.jsonl");
+        let content = r#"{"seq":1,"snapshot_hash":"aaa","timestamp_utc":"t1","diff":{"added":1,"modified":0,"deleted":0}}
+{"seq":2,"snapshot_hash":"bbb","timestamp_utc":"t2","diff":{"added":0,"modified":1,"deleted":0}}
+{"seq":3,"snapshot_hash":"ccc","timestamp_utc":"t3","diff":{"added":0,"modified":0,"deleted":1}}
+"#;
+        fs::write(&log_path, content).expect("write");
+        let entries = read_history(&log_path, 2).expect("read");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq, 3);
+        assert_eq!(entries[1].seq, 2);
+    }
+
+    #[test]
+    fn read_history_nonexistent_file() {
+        let root = tempdir().expect("tempdir");
+        let log_path = root.path().join("no-such-file.jsonl");
+        let entries = read_history(&log_path, 50).expect("read");
+        assert!(entries.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Reverse diff tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reverse_diff_swaps_adds_and_deletes() {
+        let diff = SnapshotDiff {
+            previous_fingerprint: "old".to_string(),
+            current_fingerprint: "new".to_string(),
+            added: vec![SnapshotEntry {
+                path: "src/new.lua".into(),
+                sha256: "h1".into(),
+                bytes: 10,
+                meta: None,
+                file_type: None,
+            }],
+            modified: vec![ModifiedEntry {
+                path: "src/changed.lua".into(),
+                previous_sha256: "old_h".into(),
+                previous_bytes: 20,
+                current_sha256: "new_h".into(),
+                current_bytes: 25,
+            }],
+            deleted: vec![SnapshotEntry {
+                path: "src/removed.lua".into(),
+                sha256: "h2".into(),
+                bytes: 15,
+                meta: None,
+                file_type: None,
+            }],
+        };
+
+        let rev = reverse_diff(&diff);
+        assert_eq!(rev.previous_fingerprint, "new");
+        assert_eq!(rev.current_fingerprint, "old");
+        // Added in forward = deleted in reverse
+        assert_eq!(rev.deleted.len(), 1);
+        assert_eq!(rev.deleted[0].path, "src/new.lua");
+        // Deleted in forward = added in reverse
+        assert_eq!(rev.added.len(), 1);
+        assert_eq!(rev.added[0].path, "src/removed.lua");
+        // Modified directions are swapped
+        assert_eq!(rev.modified.len(), 1);
+        assert_eq!(rev.modified[0].previous_sha256, "new_h");
+        assert_eq!(rev.modified[0].current_sha256, "old_h");
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshot backward compatibility (entries without meta/file_type)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_entry_deserializes_without_meta_fields() {
+        let json = r#"{"path":"src/a.lua","sha256":"abc","bytes":42}"#;
+        let entry: SnapshotEntry = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(entry.path, "src/a.lua");
+        assert!(entry.meta.is_none());
+        assert!(entry.file_type.is_none());
+    }
+
+    #[test]
+    fn snapshot_entry_serializes_without_none_fields() {
+        let entry = SnapshotEntry {
+            path: "src/a.lua".into(),
+            sha256: "abc".into(),
+            bytes: 42,
+            meta: None,
+            file_type: None,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        assert!(!json.contains("meta"));
+        assert!(!json.contains("file_type"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshot includes non-Luau file types
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_includes_json_txt_csv_files() {
+        let root = tempdir().expect("tempdir");
+        fs::create_dir_all(root.path().join("src")).expect("create src");
+        fs::write(root.path().join("src/config.json"), r#"{"key":"val"}"#).expect("write json");
+        fs::write(root.path().join("src/readme.txt"), "hello").expect("write txt");
+        fs::write(root.path().join("src/locale.csv"), "key,en\nhello,Hello").expect("write csv");
+        fs::write(root.path().join("src/main.luau"), "--!strict\nreturn {}").expect("write luau");
+
+        let includes = vec!["src".to_string()];
+        let snap = build_snapshot(root.path(), &includes).expect("snapshot");
+        let paths: Vec<&str> = snap.entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"src/config.json"));
+        assert!(paths.contains(&"src/readme.txt"));
+        assert!(paths.contains(&"src/locale.csv"));
+        assert!(paths.contains(&"src/main.luau"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Meta.json attachment tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn meta_json_attaches_to_sibling_luau() {
+        let root = tempdir().expect("tempdir");
+        fs::create_dir_all(root.path().join("src")).expect("create src");
+        fs::write(root.path().join("src/Foo.luau"), "return {}").expect("write luau");
+        fs::write(
+            root.path().join("src/Foo.meta.json"),
+            r#"{"properties":{"Disabled":true}}"#,
+        )
+        .expect("write meta");
+
+        let includes = vec!["src".to_string()];
+        let snap = build_snapshot(root.path(), &includes).expect("snapshot");
+
+        let foo_entry = snap.entries.iter().find(|e| e.path == "src/Foo.luau");
+        assert!(foo_entry.is_some());
+        let meta = &foo_entry.unwrap().meta;
+        assert!(meta.is_some());
+        assert_eq!(
+            meta.as_ref().unwrap().properties["Disabled"],
+            serde_json::json!(true)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Model manifest cache tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn model_manifest_cache_empty() {
+        let cache = ModelManifestCache::new();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Extended resolve_instance_class tests (covered in project.rs tests)
+    // -----------------------------------------------------------------------
 }

@@ -221,21 +221,18 @@ impl RbxlLoader {
         let all = Self::to_instance_tree(dom);
         all.into_iter()
             .filter(|node| {
-                if let Some(c) = class {
-                    if node.class_name != c {
+                if let Some(c) = class
+                    && node.class_name != c {
                         return false;
                     }
-                }
-                if let Some(t) = tag {
-                    if !node.tags.contains(&t.to_string()) {
+                if let Some(t) = tag
+                    && !node.tags.contains(&t.to_string()) {
                         return false;
                     }
-                }
-                if let Some(n) = name {
-                    if !node.name.contains(n) {
+                if let Some(n) = name
+                    && !node.name.contains(n) {
                         return false;
                     }
-                }
                 true
             })
             .collect()
@@ -486,11 +483,10 @@ fn is_large_blob(variant: &rbx_types::Variant) -> bool {
 fn extract_tags(inst: &rbx_dom_weak::Instance) -> Vec<String> {
     // Properties in rbx_dom_weak use Ustr keys; find Tags by iterating.
     for (key, value) in &inst.properties {
-        if key.as_str() == "Tags" {
-            if let rbx_types::Variant::Tags(tags) = value {
+        if key.as_str() == "Tags"
+            && let rbx_types::Variant::Tags(tags) = value {
                 return tags.iter().map(|t| t.to_string()).collect();
             }
-        }
     }
     Vec::new()
 }

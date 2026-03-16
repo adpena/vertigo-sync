@@ -158,9 +158,21 @@ fn walk_tree_node(
 // ---------------------------------------------------------------------------
 
 /// Given a filesystem path, determine the Roblox instance class.
+///
+/// Extended to handle non-Luau file types:
+/// - `.json` -> "ModuleScript" (source is JSON content as a string)
+/// - `.txt` -> "StringValue"
+/// - `.csv` -> "LocalizationTable"
+/// - `.rbxm` / `.rbxmx` -> "Model" (marker — actual instances come from manifest)
+/// - `.meta.json` -> skip (sidecar, not a standalone entry)
 pub fn resolve_instance_class(file_path: &str) -> &str {
     let normalized = file_path.replace('\\', "/");
     let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+
+    // Skip .meta.json sidecars — they are not standalone instances.
+    if file_name.ends_with(".meta.json") {
+        return "Skip";
+    }
 
     match file_name {
         "init.server.luau" | "init.server.lua" => "Script",
@@ -172,11 +184,19 @@ pub fn resolve_instance_class(file_path: &str) -> &str {
                 "LocalScript"
             } else if file_name.ends_with(".luau") || file_name.ends_with(".lua") {
                 "ModuleScript"
+            } else if file_name.ends_with(".json") {
+                "ModuleScript"
+            } else if file_name.ends_with(".txt") {
+                "StringValue"
+            } else if file_name.ends_with(".csv") {
+                "LocalizationTable"
+            } else if file_name.ends_with(".rbxm") || file_name.ends_with(".rbxmx") {
+                "Model"
             } else if !file_name.contains('.') {
                 // Directory (no extension).
                 "Folder"
             } else {
-                // Non-Luau file.
+                // Unknown non-Luau file.
                 "ModuleScript"
             }
         }
@@ -295,6 +315,32 @@ mod tests {
         assert_eq!(resolve_instance_class("foo.server.luau"), "Script");
         assert_eq!(resolve_instance_class("bar.client.lua"), "LocalScript");
         assert_eq!(resolve_instance_class("baz.luau"), "ModuleScript");
+    }
+
+    #[test]
+    fn resolve_instance_class_json_files() {
+        assert_eq!(resolve_instance_class("src/config.json"), "ModuleScript");
+    }
+
+    #[test]
+    fn resolve_instance_class_txt_files() {
+        assert_eq!(resolve_instance_class("src/readme.txt"), "StringValue");
+    }
+
+    #[test]
+    fn resolve_instance_class_csv_files() {
+        assert_eq!(resolve_instance_class("src/locale.csv"), "LocalizationTable");
+    }
+
+    #[test]
+    fn resolve_instance_class_binary_models() {
+        assert_eq!(resolve_instance_class("src/model.rbxm"), "Model");
+        assert_eq!(resolve_instance_class("src/model.rbxmx"), "Model");
+    }
+
+    #[test]
+    fn resolve_instance_class_meta_json_skipped() {
+        assert_eq!(resolve_instance_class("src/Foo.meta.json"), "Skip");
     }
 
     #[test]

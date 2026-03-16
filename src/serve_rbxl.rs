@@ -43,6 +43,12 @@ pub struct RbxlState {
     loaded_path: Option<PathBuf>,
 }
 
+impl Default for RbxlState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RbxlState {
     pub fn new() -> Self {
         Self {
