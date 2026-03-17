@@ -21,9 +21,10 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
-use axum::response::Json;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Json, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use base64::Engine;
@@ -131,9 +132,48 @@ const MAX_BATCH_SOURCE_PATHS: usize = 256;
 /// Maximum aggregate UTF-8 payload served in one batched source request.
 const MAX_BATCH_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Bearer token auth middleware for mutating endpoints.
+///
+/// If `VERTIGO_SYNC_API_TOKEN` is set, requires `Authorization: Bearer <token>`
+/// on protected (mutating) routes. Returns 401 if missing or wrong.
+async fn bearer_auth_layer(
+    req: Request,
+    next: Next,
+) -> Response {
+    // Token is stashed in a request extension by the outer layer closure.
+    let expected = req.extensions().get::<ExpectedToken>().cloned();
+    if let Some(ExpectedToken(ref token)) = expected {
+        let auth_header = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        match auth_header {
+            Some(value) if value.strip_prefix("Bearer ").map_or(false, |t| t == token) => {}
+            _ => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "Unauthorized",
+                        "message": "VERTIGO_SYNC_API_TOKEN is set. Provide Authorization: Bearer <token> header."
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
+
+/// Newtype wrapper so we can insert the expected token into request extensions.
+#[derive(Clone)]
+struct ExpectedToken(String);
+
 /// Build the Axum router with all endpoints.
 pub fn build_router(state: Arc<ServerState>) -> Router {
     let rbxl_state = new_shared_rbxl_state();
+
+    // Optional bearer token auth for mutating endpoints.
+    let api_token: Option<String> = std::env::var("VERTIGO_SYNC_API_TOKEN").ok().filter(|t| !t.is_empty());
 
     // CORS: allow browser clients on any localhost port (Vite dev, Strata, etc.)
     // and the deployed showcase site. Strata WASM needs GET + POST + WebSocket upgrade.
@@ -155,10 +195,29 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
                 || is_loopback_origin(origin, b"https://127.0.0.1")
         }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([axum::http::header::CONTENT_TYPE])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ])
         .max_age(Duration::from_secs(86400));
 
-    Router::new()
+    // Mutating routes that require bearer auth when VERTIGO_SYNC_API_TOKEN is set.
+    let token_for_mutating = api_token.clone();
+    let mutating_routes = Router::new()
+        .route("/sync/patch", post(handle_patch))
+        .route("/mcp/execute", post(handle_mcp_execute))
+        .route("/plugin/state", post(handle_post_plugin_state))
+        .route("/plugin/managed", post(handle_post_plugin_managed))
+        .route("/plugin/command/ack", post(handle_plugin_command_ack))
+        .layer(middleware::from_fn(move |mut req: Request, next: Next| {
+            if let Some(ref tok) = token_for_mutating {
+                req.extensions_mut().insert(ExpectedToken(tok.clone()));
+            }
+            bearer_auth_layer(req, next)
+        }));
+
+    // Read-only routes — no auth required.
+    let read_routes = Router::new()
         .route("/health", get(handle_health))
         .route("/snapshot", get(handle_snapshot))
         .route("/diff", get(handle_diff))
@@ -167,7 +226,6 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/sources", get(handle_sources))
         .route("/sources/content", get(handle_sources_content))
         .route("/source/{*path}", get(handle_source))
-        .route("/sync/patch", post(handle_patch))
         .route("/validate", get(handle_validate))
         .route("/metrics", get(handle_metrics))
         .route("/history", get(handle_history))
@@ -176,11 +234,13 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/config", get(handle_config))
         .route("/sourcemap", get(handle_sourcemap))
         .route("/project", get(handle_project))
-        .route("/plugin/state", get(handle_get_plugin_state).post(handle_post_plugin_state))
-        .route("/plugin/managed", get(handle_get_plugin_managed).post(handle_post_plugin_managed))
-        .route("/plugin/command/ack", post(handle_plugin_command_ack))
         .route("/mcp/tools", get(handle_mcp_tools))
-        .route("/mcp/execute", post(handle_mcp_execute))
+        // GET handlers for plugin state/managed (read-only).
+        .route("/plugin/state", get(handle_get_plugin_state))
+        .route("/plugin/managed", get(handle_get_plugin_managed));
+
+    read_routes
+        .merge(mutating_routes)
         .with_state(state)
         .merge(rbxl_router(rbxl_state))
         .layer(cors)
@@ -250,6 +310,24 @@ pub async fn run_serve(
     let addr: std::net::SocketAddr = addr_str
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid serve address '{addr_str}': {e}"))?;
+
+    // Warn if binding to a non-loopback address without bearer token auth.
+    let is_loopback = addr.ip().is_loopback();
+    let has_token = std::env::var("VERTIGO_SYNC_API_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .is_some();
+    if !is_loopback && !has_token {
+        eprintln!(
+            "[vertigo-sync] WARNING: Binding to non-loopback address {addr} without \
+             VERTIGO_SYNC_API_TOKEN set. Mutating endpoints (POST /sync/patch, /mcp/execute, \
+             /plugin/*) are unprotected. Set VERTIGO_SYNC_API_TOKEN to require bearer auth."
+        );
+    }
+    if has_token {
+        eprintln!("[vertigo-sync] Bearer token auth enabled for mutating endpoints.");
+    }
+
     eprintln!(
         "[vertigo-sync] serving on http://{addr} (coalesce={}ms, poll={}ms)",
         coalesce_ms,
