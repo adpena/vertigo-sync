@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use vertigo_sync::errors::SyncError;
+use vertigo_sync::output;
 use vertigo_sync::project::parse_project;
 use vertigo_sync::server::run_serve;
 use vertigo_sync::validate;
@@ -17,7 +19,18 @@ use vertigo_sync::{
 #[command(
     name = "vertigo-sync",
     version,
-    about = "Deterministic source snapshot/diff stream for Vertigo Sync"
+    about = "Fast, deterministic source sync for Roblox Studio",
+    long_about = "Vertigo Sync provides sub-millisecond source synchronization between your \
+                  filesystem and Roblox Studio. It replaces Rojo with better performance, \
+                  built-in validation, and agent-native MCP tools.",
+    after_help = "Examples:\n  \
+                  vertigo-sync serve --turbo        Start syncing in turbo mode\n  \
+                  vertigo-sync build -o game.rbxl   Build a place file\n  \
+                  vertigo-sync doctor               Check project health\n  \
+                  vertigo-sync init                 Create a new project\n  \
+                  vertigo-sync plugin-install       Install Studio plugin\n\n\
+                  Learn more: https://github.com/pena/vertigo-sync",
+    term_width = 100,
 )]
 struct Cli {
     #[arg(
@@ -60,7 +73,7 @@ struct Cli {
         value_name = "PATH",
         action = ArgAction::Append,
         value_delimiter = ',',
-        help = "Relative include roots to hash. Repeat flag or use comma-separated values. Default: src,studio-plugin,scripts/dev"
+        help = "Include roots to sync. Default: auto-detect from project file, or 'src'"
     )]
     include: Vec<String>,
 
@@ -95,6 +108,10 @@ struct Cli {
     )]
     turbo: bool,
 
+    /// Output machine-readable JSON instead of human-readable text
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -102,24 +119,34 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Walk include roots and write deterministic snapshot JSON.
+    #[command(display_order = 1)]
     Snapshot,
     /// Compare previous snapshot vs current and write deterministic diff JSON.
+    #[command(display_order = 2)]
     Diff,
     /// Compute diff and append event JSONL with monotonic sequence number.
+    #[command(display_order = 3)]
     Event,
     /// Run determinism + health checks and fail on non-determinism.
+    #[command(display_order = 10)]
     Doctor,
     /// Run source-tree health checks.
+    #[command(display_order = 11)]
     Health,
+    /// Validate Luau source files for common issues.
+    #[command(display_order = 12)]
+    Validate,
+    /// Serve snapshot/diff/events over HTTP + SSE.
+    #[command(display_order = 20)]
+    Serve,
     /// Blocking watch loop that emits NDJSON diff events to stdout.
+    #[command(display_order = 21)]
     Watch,
     /// Native filesystem watch using FSEvents/inotify (replaces polling).
+    #[command(display_order = 22)]
     WatchNative,
-    /// Serve snapshot/diff/events over HTTP + SSE.
-    Serve,
-    /// Validate Luau source files for common issues.
-    Validate,
     /// Build a .rbxl place file from source (replaces `rojo build`).
+    #[command(display_order = 30)]
     Build {
         /// Output .rbxl file path.
         #[arg(long, short)]
@@ -131,6 +158,16 @@ enum Command {
         #[arg(long, default_value_t = false)]
         binary_models: bool,
     },
+    /// Create a new Vertigo Sync project with standard directory structure.
+    #[command(display_order = 40)]
+    Init {
+        /// Project name (default: current directory name)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Install the Vertigo Sync Studio plugin.
+    #[command(display_order = 41)]
+    PluginInstall,
 }
 
 #[tokio::main]
@@ -153,10 +190,11 @@ async fn main() -> Result<()> {
             project,
             binary_models,
         } => command_build(&root, output, project, *binary_models),
+        Command::Init { name } => command_init(&root, name.as_deref()),
+        Command::PluginInstall => command_plugin_install(),
         Command::Serve => {
-            let includes = cli.include.clone();
+            let includes = resolve_effective_includes(&root, &cli.include);
             let (interval, coalesce_ms) = if cli.turbo {
-                eprintln!("[vertigo-sync] turbo mode: 10ms coalesce, native fsevents");
                 (Duration::from_millis(100), 10u64)
             } else {
                 (
@@ -164,6 +202,20 @@ async fn main() -> Result<()> {
                     cli.coalesce_ms,
                 )
             };
+
+            let mode = if cli.turbo { "turbo (10ms coalesce)" } else { "standard" };
+            let version = env!("CARGO_PKG_VERSION");
+            let http_addr = format!("http://127.0.0.1:{}", cli.port);
+            let ws_addr = format!("ws://127.0.0.1:{}/ws", cli.port);
+            let watching = includes.join(", ");
+
+            output::banner(version, &[
+                ("Server", &http_addr),
+                ("WebSocket", &ws_addr),
+                ("Mode", mode),
+                ("Watching", &watching),
+            ]);
+
             run_serve(
                 root,
                 includes,
@@ -178,8 +230,68 @@ async fn main() -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Include resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve effective include paths: use CLI values if provided, else try to
+/// auto-detect from `default.project.json` `$path` entries, else fall back
+/// to `["src"]`.
+fn resolve_effective_includes(root: &Path, cli_includes: &[String]) -> Vec<String> {
+    if !cli_includes.is_empty() {
+        return cli_includes.to_vec();
+    }
+
+    // Try auto-detect from project file.
+    let project_path = root.join("default.project.json");
+    if project_path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&project_path) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+                let mut paths: Vec<String> = Vec::new();
+                if let Some(tree) = value.get("tree").and_then(|t| t.as_object()) {
+                    collect_dollar_paths(tree, &mut paths);
+                }
+                if !paths.is_empty() {
+                    // Deduplicate and sort for determinism.
+                    paths.sort();
+                    paths.dedup();
+                    return paths;
+                }
+            }
+        }
+    }
+
+    // Fall back.
+    vec!["src".to_string()]
+}
+
+/// Recursively collect `$path` values from a Rojo/Vertigo project tree.
+fn collect_dollar_paths(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    out: &mut Vec<String>,
+) {
+    if let Some(serde_json::Value::String(p)) = obj.get("$path") {
+        // Extract the top-level directory (e.g. "src/Server" -> "src").
+        let top = p.split('/').next().unwrap_or(p);
+        out.push(top.to_string());
+    }
+    for (key, val) in obj {
+        if key.starts_with('$') {
+            continue;
+        }
+        if let Some(child_obj) = val.as_object() {
+            collect_dollar_paths(child_obj, out);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subcommands
+// ---------------------------------------------------------------------------
+
 fn command_snapshot(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
-    let snapshot = build_snapshot(root, &cli.include)?;
+    let includes = resolve_effective_includes(root, &cli.include);
+    let snapshot = build_snapshot(root, &includes)?;
     let snapshot_path = cli
         .snapshot
         .as_ref()
@@ -189,17 +301,20 @@ fn command_snapshot(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
 
     write_json_file(&snapshot_path, &snapshot)?;
 
-    println!(
-        "snapshot path={} entries={} fingerprint={}",
-        snapshot_path.display(),
-        snapshot.entries.len(),
-        snapshot.fingerprint
-    );
+    if cli.json {
+        println!("{}", serde_json::to_string(&snapshot)?);
+    } else {
+        output::success("Snapshot captured");
+        output::kv("Entries", &format!("{} files", snapshot.entries.len()));
+        output::kv("Fingerprint", &snapshot.fingerprint);
+        output::kv("Output", &snapshot_path.display().to_string());
+    }
 
     Ok(())
 }
 
 fn command_diff(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
+    let includes = resolve_effective_includes(root, &cli.include);
     let previous_path = resolve_previous_path(root, state_dir, cli);
     let previous = read_snapshot(&previous_path).with_context(|| {
         format!(
@@ -207,7 +322,7 @@ fn command_diff(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
             previous_path.display()
         )
     })?;
-    let current = build_snapshot(root, &cli.include)?;
+    let current = build_snapshot(root, &includes)?;
     let diff = diff_snapshots(&previous, &current);
 
     let output_path = cli
@@ -221,21 +336,37 @@ fn command_diff(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
     if let Some(snapshot_path) = cli.snapshot.as_ref() {
         let path = resolve_relative_to_root(root, snapshot_path);
         write_json_file(&path, &current)?;
-        println!("updated snapshot={}", path.display());
     }
 
-    println!(
-        "diff path={} added={} modified={} deleted={}",
-        output_path.display(),
-        diff.added.len(),
-        diff.modified.len(),
-        diff.deleted.len()
-    );
+    if cli.json {
+        println!("{}", serde_json::to_string(&diff)?);
+    } else {
+        let added = diff.added.len();
+        let modified = diff.modified.len();
+        let deleted = diff.deleted.len();
+
+        if added == 0 && modified == 0 && deleted == 0 {
+            output::success("No changes detected");
+        } else {
+            output::success("Diff computed");
+            if added > 0 {
+                output::kv("Added", &format!("{added} files"));
+            }
+            if modified > 0 {
+                output::kv("Modified", &format!("{modified} files"));
+            }
+            if deleted > 0 {
+                output::kv("Deleted", &format!("{deleted} files"));
+            }
+        }
+        output::kv("Output", &output_path.display().to_string());
+    }
 
     Ok(())
 }
 
 fn command_event(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
+    let includes = resolve_effective_includes(root, &cli.include);
     let previous_path = resolve_previous_path(root, state_dir, cli);
     let previous = read_snapshot(&previous_path).with_context(|| {
         format!(
@@ -243,7 +374,7 @@ fn command_event(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
             previous_path.display()
         )
     })?;
-    let current = build_snapshot(root, &cli.include)?;
+    let current = build_snapshot(root, &includes)?;
     let diff = diff_snapshots(&previous, &current);
 
     let event_log_path = cli
@@ -302,42 +433,101 @@ fn command_event(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
         .unwrap_or_else(|| default_snapshot_path(state_dir));
     write_json_file(&snapshot_path, &current)?;
 
-    println!(
-        "event log={} seq={} event={} added={} modified={} deleted={} snapshot={} latest_event={} diff={}",
-        event_log_path.display(),
-        seq,
-        event.event,
-        event.diff.added,
-        event.diff.modified,
-        event.diff.deleted,
-        snapshot_path.display(),
-        latest_event_path.display(),
-        diff_output_path.display(),
-    );
+    if cli.json {
+        println!("{}", serde_json::to_string(&event)?);
+    } else {
+        output::success(&format!("Event #{seq} recorded"));
+        output::kv("Added", &format!("{}", event.diff.added));
+        output::kv("Modified", &format!("{}", event.diff.modified));
+        output::kv("Deleted", &format!("{}", event.diff.deleted));
+        output::kv("Log", &event_log_path.display().to_string());
+    }
 
     Ok(())
 }
 
 fn command_doctor(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
-    let determinism = run_doctor(root, &cli.include)?;
-    let health = run_health_doctor(root, &cli.include)?;
-    let report = serde_json::json!({
-        "determinism": determinism,
-        "health": health,
-    });
+    let includes = resolve_effective_includes(root, &cli.include);
+    let determinism = run_doctor(root, &includes)?;
+    let health = run_health_doctor(root, &includes)?;
 
-    if let Some(output_path) = cli.output.as_ref() {
-        let path = resolve_relative_to_root(root, output_path);
-        write_json_file(&path, &report)?;
-        println!("doctor report path={}", path.display());
+    if cli.json {
+        let report = serde_json::json!({
+            "determinism": determinism,
+            "health": health,
+        });
+        if let Some(output_path) = cli.output.as_ref() {
+            let path = resolve_relative_to_root(root, output_path);
+            write_json_file(&path, &report)?;
+        }
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        output::header("Vertigo Sync Doctor");
+        output::separator("Vertigo Sync Doctor");
+        eprintln!();
+
+        // Determinism section.
+        output::header("Determinism");
+        if determinism.deterministic {
+            output::success(&format!("Snapshot 1: {}", determinism.first_fingerprint));
+            output::success(&format!("Snapshot 2: {}", determinism.second_fingerprint));
+            output::success("Hashes match \u{2014} deterministic");
+        } else {
+            output::error_msg(&format!("Snapshot 1: {}", determinism.first_fingerprint));
+            output::error_msg(&format!("Snapshot 2: {}", determinism.second_fingerprint));
+            if let Some(ref path) = determinism.mismatch_path {
+                output::error_msg(&format!("First mismatch: {path}"));
+            }
+            output::error_msg("Hashes differ \u{2014} NON-DETERMINISTIC");
+        }
+        eprintln!();
+
+        // Source health section.
+        output::header("Source Health");
+        output::success(&format!("{} files checked", health.file_count));
+        let warning_count = health
+            .issues
+            .iter()
+            .filter(|i| i.severity == "warning")
+            .count();
+        let error_count = health
+            .issues
+            .iter()
+            .filter(|i| i.severity == "error")
+            .count();
+        if warning_count > 0 {
+            output::warn(&format!("{warning_count} warning(s)"));
+        }
+        if error_count > 0 {
+            output::error_msg(&format!("{error_count} error(s)"));
+        }
+        eprintln!();
+
+        // Summary.
+        if determinism.deterministic && health.healthy {
+            output::success("All checks passed");
+        } else {
+            output::error_msg("Some checks failed");
+        }
+
+        if let Some(output_path) = cli.output.as_ref() {
+            let path = resolve_relative_to_root(root, output_path);
+            let report = serde_json::json!({
+                "determinism": determinism,
+                "health": health,
+            });
+            write_json_file(&path, &report)?;
+        }
     }
 
-    println!("{}", serde_json::to_string_pretty(&report)?);
-
-    if !report["determinism"]["deterministic"]
-        .as_bool()
-        .unwrap_or(false)
-    {
+    if !determinism.deterministic {
+        let err = SyncError::NonDeterministic {
+            hash1: determinism.first_fingerprint.clone(),
+            hash2: determinism.second_fingerprint.clone(),
+        };
+        if !cli.json {
+            output::error_msg(&err.suggestion());
+        }
         bail!("doctor detected non-deterministic snapshots")
     }
 
@@ -345,15 +535,39 @@ fn command_doctor(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
 }
 
 fn command_health(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
-    let report = run_health_doctor(root, &cli.include)?;
+    let includes = resolve_effective_includes(root, &cli.include);
+    let report = run_health_doctor(root, &includes)?;
 
-    if let Some(output_path) = cli.output.as_ref() {
-        let path = resolve_relative_to_root(root, output_path);
-        write_json_file(&path, &report)?;
-        println!("health report path={}", path.display());
+    if cli.json {
+        if let Some(output_path) = cli.output.as_ref() {
+            let path = resolve_relative_to_root(root, output_path);
+            write_json_file(&path, &report)?;
+        }
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        output::header("Source Health");
+        output::success(&format!("{} files checked", report.file_count));
+        output::kv("Fingerprint", &report.fingerprint);
+
+        for issue in &report.issues {
+            match issue.severity.as_str() {
+                "error" => output::error_msg(&format!("{}: {}", issue.path, issue.message)),
+                "warning" => output::warn(&format!("{}: {}", issue.path, issue.message)),
+                _ => output::info(&format!("{}: {}", issue.path, issue.message)),
+            }
+        }
+
+        if report.healthy {
+            output::success("Healthy");
+        } else {
+            output::error_msg("Issues found");
+        }
+
+        if let Some(output_path) = cli.output.as_ref() {
+            let path = resolve_relative_to_root(root, output_path);
+            write_json_file(&path, &report)?;
+        }
     }
-
-    println!("{}", serde_json::to_string_pretty(&report)?);
 
     if !report.healthy {
         bail!("health doctor found blocking issues")
@@ -363,49 +577,80 @@ fn command_health(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
 }
 
 fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
-    let report = validate::validate_source(root, &cli.include)?;
+    let includes = resolve_effective_includes(root, &cli.include);
+    let report = validate::validate_source(root, &includes)?;
 
-    // Print issues in a cargo-style format.
+    if cli.json {
+        println!("{}", serde_json::to_string(&report)?);
+        if let Some(output_path) = cli.output.as_ref() {
+            let path = resolve_relative_to_root(root, output_path);
+            write_json_file(&path, &report)?;
+        }
+        if report.errors > 0 {
+            bail!(
+                "validation failed: {} error(s), {} warning(s)",
+                report.errors,
+                report.warnings
+            )
+        }
+        return Ok(());
+    }
+
+    // Print issues in a cargo-style format with colors.
     for issue in &report.issues {
-        let severity_tag = match issue.severity.as_str() {
-            "error" => "error",
-            "warning" => "warning",
-            _ => "info",
-        };
         let location = if issue.line > 0 {
             format!("{}:{}", issue.path, issue.line)
         } else {
             issue.path.clone()
         };
-        println!(
-            "{severity_tag}[{}]: {location}: {}",
-            issue.rule, issue.message
-        );
+        let msg = format!("[{}]: {location}: {}", issue.rule, issue.message);
+        match issue.severity.as_str() {
+            "error" => output::error_msg(&msg),
+            "warning" => output::warn(&msg),
+            _ => output::info(&msg),
+        }
     }
 
     // Optionally run selene if available.
-    if let Some(selene_output) = validate::run_selene(root, &cli.include)
-        && !selene_output.is_empty() {
-            println!();
-            println!("--- selene output ---");
-            for line in &selene_output {
-                println!("{line}");
-            }
+    if let Some(selene_output) = validate::run_selene(root, &includes)
+        && !selene_output.is_empty()
+    {
+        eprintln!();
+        output::header("selene output");
+        for line in &selene_output {
+            output::info(line);
         }
+    }
 
-    println!();
-    println!(
-        "validate: files={} errors={} warnings={} clean={}",
-        report.files_checked, report.errors, report.warnings, report.clean
-    );
+    eprintln!();
+    if report.clean {
+        output::success(&format!(
+            "{} files checked, no issues",
+            report.files_checked
+        ));
+    } else {
+        let status = format!(
+            "{} files, {} error(s), {} warning(s)",
+            report.files_checked, report.errors, report.warnings
+        );
+        if report.errors > 0 {
+            output::error_msg(&status);
+        } else {
+            output::warn(&status);
+        }
+    }
 
     if let Some(output_path) = cli.output.as_ref() {
         let path = resolve_relative_to_root(root, output_path);
         write_json_file(&path, &report)?;
-        println!("report path={}", path.display());
     }
 
     if report.errors > 0 {
+        let err = SyncError::ValidationFailed {
+            errors: report.errors,
+            warnings: report.warnings,
+        };
+        output::error_msg(&err.suggestion());
         bail!(
             "validation failed: {} error(s), {} warning(s)",
             report.errors,
@@ -417,6 +662,7 @@ fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
 }
 
 fn command_watch(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
+    let includes = resolve_effective_includes(root, &cli.include);
     let output_dir = cli
         .output
         .as_ref()
@@ -425,13 +671,14 @@ fn command_watch(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
 
     run_watch(
         root,
-        &cli.include,
+        &includes,
         Duration::from_secs(cli.interval_seconds.max(1)),
         Some(&output_dir),
     )
 }
 
 fn command_watch_native(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
+    let includes = resolve_effective_includes(root, &cli.include);
     let output_dir = cli
         .output
         .as_ref()
@@ -439,14 +686,14 @@ fn command_watch_native(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> 
         .unwrap_or_else(|| state_dir.to_path_buf());
 
     let coalesce_ms = if cli.turbo {
-        eprintln!("[vertigo-sync] turbo mode: 10ms coalesce, native fsevents");
+        output::info("turbo mode: 10ms coalesce, native fsevents");
         10
     } else {
         cli.coalesce_ms
     };
     run_watch_native(
         root,
-        &cli.include,
+        &includes,
         Some(&output_dir),
         Duration::from_millis(coalesce_ms),
     )
@@ -464,26 +711,23 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
 
     let tree = parse_project(&project_path)?;
 
-    println!("[vertigo-sync] build");
-    println!("  project: {}", project_path.display());
-    println!("  output:  {}", output.display());
-    println!("  name:    {}", tree.name);
-    println!("  mappings: {}", tree.mappings.len());
+    output::header("Build");
+    output::kv("Project", &project_path.display().to_string());
+    output::kv("Output", &output.display().to_string());
+    output::kv("Name", &tree.name);
+    output::kv("Mappings", &tree.mappings.len().to_string());
 
     // Build the DataModel DOM from source files.
     let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
     let data_model_ref = dom.root_ref();
 
     // Create service containers from project tree mappings.
-    // Group mappings by their top-level service (first segment of instance_path).
     let mut service_refs: std::collections::HashMap<String, rbx_dom_weak::types::Ref> =
         std::collections::HashMap::new();
 
     for mapping in &tree.mappings {
-        // Parse instance path: "ServerScriptService.Server" → ["ServerScriptService", "Server"]
         let segments: Vec<&str> = mapping.instance_path.split('.').collect();
 
-        // Ensure each ancestor exists in the DOM.
         let mut parent_ref = data_model_ref;
         for (i, segment) in segments.iter().enumerate() {
             let existing = dom
@@ -502,12 +746,9 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
             parent_ref = if let Some(existing_ref) = existing {
                 existing_ref
             } else {
-                // Determine class name for this segment.
                 let class = if i == 0 {
-                    // Top-level: use the mapping's class_name or the segment name.
                     mapping.class_name.as_str()
                 } else if i == segments.len() - 1 {
-                    // Leaf: this is where the $path points, determine from fs_path.
                     let fs_full = root.join(&mapping.fs_path);
                     if fs_full.is_dir() {
                         resolve_container_class(&fs_full)
@@ -515,7 +756,6 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
                         resolve_instance_class(&mapping.fs_path)
                     }
                 } else {
-                    // Intermediate: use the segment name as class (Roblox service names = class names).
                     segment
                 };
 
@@ -528,7 +768,6 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
                 .or_insert(parent_ref);
         }
 
-        // Now populate the leaf container with source files from the filesystem path.
         let fs_full = root.join(&mapping.fs_path);
         if fs_full.is_dir() {
             populate_from_dir(&mut dom, parent_ref, &fs_full, root)?;
@@ -537,11 +776,9 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
         }
     }
 
-    // Count instances.
     let instance_count = count_instances(&dom, data_model_ref);
-    println!("  instances: {}", instance_count);
+    output::kv("Instances", &instance_count.to_string());
 
-    // Serialize to binary .rbxl format.
     let output_path = if output.is_absolute() {
         output.to_path_buf()
     } else {
@@ -558,7 +795,6 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
             .with_context(|| format!("failed to create output file {}", output_path.display()))?,
     );
 
-    // Determine format from extension.
     let ext = output_path
         .extension()
         .and_then(|e| e.to_str())
@@ -577,15 +813,181 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
     }
 
     let file_size = std::fs::metadata(&output_path)?.len();
-    println!(
-        "  wrote: {} ({:.1} KB)",
+    output::success(&format!(
+        "Wrote {} ({:.1} KB)",
         output_path.display(),
         file_size as f64 / 1024.0
-    );
-    println!("[vertigo-sync] build complete");
+    ));
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Init command
+// ---------------------------------------------------------------------------
+
+fn command_init(root: &Path, name: Option<&str>) -> Result<()> {
+    let project_name = name
+        .map(|n| n.to_string())
+        .or_else(|| {
+            root.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_string())
+        })
+        .unwrap_or_else(|| "my-project".to_string());
+
+    output::header(&format!("Initializing project: {project_name}"));
+    eprintln!();
+
+    let project_path = root.join("default.project.json");
+    if project_path.exists() {
+        output::warn("default.project.json already exists, skipping project file creation");
+    } else {
+        output::step(1, 4, "Creating default.project.json");
+        let project_json = serde_json::json!({
+            "name": project_name,
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "Server": {
+                        "$path": "src/Server"
+                    }
+                },
+                "StarterPlayer": {
+                    "StarterPlayerScripts": {
+                        "Client": {
+                            "$path": "src/Client"
+                        }
+                    }
+                },
+                "ReplicatedStorage": {
+                    "Shared": {
+                        "$path": "src/Shared"
+                    }
+                }
+            }
+        });
+        let formatted = serde_json::to_string_pretty(&project_json)?;
+        std::fs::write(&project_path, formatted.as_bytes())
+            .with_context(|| format!("failed to write {}", project_path.display()))?;
+        output::success("Created default.project.json");
+    }
+
+    // Create source directories and boilerplate files.
+    let dirs_and_files: &[(&str, &str, &str)] = &[
+        (
+            "src/Server",
+            "init.server.luau",
+            "--!strict\nprint(\"[Server] Hello from Vertigo Sync!\")\n",
+        ),
+        (
+            "src/Client",
+            "init.client.luau",
+            "--!strict\nprint(\"[Client] Hello from Vertigo Sync!\")\n",
+        ),
+        (
+            "src/Shared",
+            "init.luau",
+            "--!strict\nreturn {}\n",
+        ),
+    ];
+
+    for (i, (dir, file, content)) in dirs_and_files.iter().enumerate() {
+        let dir_path = root.join(dir);
+        let file_path = dir_path.join(file);
+
+        output::step(i + 2, 4, &format!("Creating {dir}/{file}"));
+
+        std::fs::create_dir_all(&dir_path)
+            .with_context(|| format!("failed to create directory {}", dir_path.display()))?;
+
+        if file_path.exists() {
+            output::warn(&format!("{dir}/{file} already exists, skipping"));
+        } else {
+            std::fs::write(&file_path, content)
+                .with_context(|| format!("failed to write {}", file_path.display()))?;
+            output::success(&format!("Created {dir}/{file}"));
+        }
+    }
+
+    eprintln!();
+    output::success(&format!("Project '{project_name}' initialized"));
+    eprintln!();
+    output::info("Next steps:");
+    output::info("  vertigo-sync serve --turbo     Start syncing");
+    output::info("  vertigo-sync plugin-install     Install Studio plugin");
+    output::info("  vertigo-sync doctor             Verify project health");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Plugin install command
+// ---------------------------------------------------------------------------
+
+/// Embedded Studio plugin source, compiled into the binary.
+const PLUGIN_SOURCE: &str = include_str!("../../../studio-plugin/VertigoSyncPlugin.lua");
+
+fn command_plugin_install() -> Result<()> {
+    let plugins_dir = detect_plugins_dir()?;
+
+    output::step(1, 2, "Detecting Roblox Plugins directory");
+    output::success(&format!("Found: {}", plugins_dir.display()));
+
+    std::fs::create_dir_all(&plugins_dir)
+        .with_context(|| format!("failed to create {}", plugins_dir.display()))?;
+
+    let dest = plugins_dir.join("VertigoSyncPlugin.lua");
+    output::step(2, 2, "Installing VertigoSyncPlugin.lua");
+    std::fs::write(&dest, PLUGIN_SOURCE)
+        .with_context(|| format!("failed to write {}", dest.display()))?;
+
+    output::success(&format!("Installed to {}", dest.display()));
+    eprintln!();
+    output::info("Restart Roblox Studio to load the plugin.");
+
+    Ok(())
+}
+
+/// Detect the OS-appropriate Roblox Studio plugins directory.
+fn detect_plugins_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = dirs_or_home() {
+            let path = home.join("Documents/Roblox/Plugins");
+            return Ok(path);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let path = PathBuf::from(local).join("Roblox").join("Plugins");
+            return Ok(path);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(home) = dirs_or_home() {
+            let path = home.join(".local/share/Roblox/Plugins");
+            if path.parent().map(|p| p.exists()).unwrap_or(false) {
+                return Ok(path);
+            }
+        }
+    }
+
+    Err(SyncError::PluginDirNotFound.into())
+}
+
+/// Get the user home directory without pulling in the `dirs` crate.
+fn dirs_or_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+// ---------------------------------------------------------------------------
+// Build helpers (unchanged logic, kept for the build command)
+// ---------------------------------------------------------------------------
 
 /// Recursively populate a DOM container from a filesystem directory.
 fn populate_from_dir(
@@ -652,12 +1054,13 @@ fn populate_from_dir(
                 let init_path = path.join(init_name);
                 if init_path.exists() {
                     if let Ok(source) = std::fs::read_to_string(&init_path)
-                        && let Some(inst) = dom.get_by_ref_mut(folder_ref) {
-                            inst.properties.insert(
-                                "Source".into(),
-                                rbx_dom_weak::types::Variant::String(source),
-                            );
-                        }
+                        && let Some(inst) = dom.get_by_ref_mut(folder_ref)
+                    {
+                        inst.properties.insert(
+                            "Source".into(),
+                            rbx_dom_weak::types::Variant::String(source),
+                        );
+                    }
                     break;
                 }
             }
@@ -697,17 +1100,16 @@ fn populate_from_dir(
                     if meta_names.contains(&meta_name) {
                         let meta_path = dir.join(&meta_name);
                         if let Ok(meta_content) = std::fs::read_to_string(&meta_path)
-                            && let Ok(meta) = vertigo_sync::parse_meta_json(&meta_content) {
-                                builder = apply_meta_to_builder(builder, &meta);
-                            }
+                            && let Ok(meta) = vertigo_sync::parse_meta_json(&meta_content)
+                        {
+                            builder = apply_meta_to_builder(builder, &meta);
+                        }
                     }
 
                     dom.insert(parent_ref, builder);
                 }
                 "json" => {
-                    let instance_name = name_str
-                        .strip_suffix(".json")
-                        .unwrap_or(&name_str);
+                    let instance_name = name_str.strip_suffix(".json").unwrap_or(&name_str);
                     let mut builder =
                         rbx_dom_weak::InstanceBuilder::new("ModuleScript").with_name(instance_name);
                     if let Ok(content) = std::fs::read_to_string(&path) {
@@ -719,9 +1121,7 @@ fn populate_from_dir(
                     dom.insert(parent_ref, builder);
                 }
                 "txt" => {
-                    let instance_name = name_str
-                        .strip_suffix(".txt")
-                        .unwrap_or(&name_str);
+                    let instance_name = name_str.strip_suffix(".txt").unwrap_or(&name_str);
                     let mut builder =
                         rbx_dom_weak::InstanceBuilder::new("StringValue").with_name(instance_name);
                     if let Ok(content) = std::fs::read_to_string(&path) {
@@ -733,15 +1133,12 @@ fn populate_from_dir(
                     dom.insert(parent_ref, builder);
                 }
                 "csv" => {
-                    let instance_name = name_str
-                        .strip_suffix(".csv")
-                        .unwrap_or(&name_str);
+                    let instance_name = name_str.strip_suffix(".csv").unwrap_or(&name_str);
                     let builder = rbx_dom_weak::InstanceBuilder::new("LocalizationTable")
                         .with_name(instance_name);
                     dom.insert(parent_ref, builder);
                 }
                 "rbxm" | "rbxmx" => {
-                    // Binary model — deserialize and merge instances into the DOM tree.
                     let file = std::fs::File::open(&path);
                     if let Ok(file) = file {
                         let reader = std::io::BufReader::new(file);
@@ -773,7 +1170,8 @@ fn apply_meta_to_builder(
     for (key, value) in &meta.properties {
         match value {
             serde_json::Value::Bool(b) => {
-                builder = builder.with_property(key.as_str(), rbx_dom_weak::types::Variant::Bool(*b));
+                builder =
+                    builder.with_property(key.as_str(), rbx_dom_weak::types::Variant::Bool(*b));
             }
             serde_json::Value::String(s) => {
                 builder = builder
@@ -856,6 +1254,10 @@ fn populate_file(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
 fn resolve_container_class(path: &Path) -> &'static str {
     if path.join("init.server.luau").exists() || path.join("init.server.lua").exists() {
         "Script"
@@ -880,7 +1282,7 @@ fn resolve_instance_name(name: &str) -> &str {
 
 /// Count total instances in a DOM subtree.
 fn count_instances(dom: &rbx_dom_weak::WeakDom, root: rbx_dom_weak::types::Ref) -> usize {
-    let mut count = 1; // Count the root itself.
+    let mut count = 1;
     if let Some(inst) = dom.get_by_ref(root) {
         for &child in inst.children() {
             count += count_instances(dom, child);
@@ -933,6 +1335,14 @@ fn default_event_log_path(state_dir: &Path) -> PathBuf {
     state_dir.join("events.jsonl")
 }
 
+fn default_event_output_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("latest-event.json")
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::{resolve_container_class, resolve_instance_name};
@@ -962,8 +1372,4 @@ mod tests {
         fs::create_dir_all(&folder_dir).expect("create folder dir");
         assert_eq!(resolve_container_class(&folder_dir), "Folder");
     }
-}
-
-fn default_event_output_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("latest-event.json")
 }

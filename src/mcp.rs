@@ -492,6 +492,17 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
             "Get current server configuration including feature flags",
             vec![],
         ),
+        // ── Plugin state reporting ───────────────────────────────
+        tool_def(
+            "sync_plugin_state",
+            "Get Studio plugin internal state (connection, transport, queue depths, throughput, version). Includes staleness indicator.",
+            vec![],
+        ),
+        tool_def(
+            "sync_plugin_managed",
+            "Get Studio plugin managed instance index (paths, hashes, classes). Includes staleness indicator.",
+            vec![],
+        ),
     ])
 }
 
@@ -565,6 +576,9 @@ pub async fn handle_mcp_execute(
         "sync_rewind" => exec_sync_rewind(&state, &req.arguments),
         "sync_model_manifest" => exec_sync_model_manifest(&state, &req.arguments),
         "sync_config" => exec_sync_config(&state),
+        // Plugin state reporting
+        "sync_plugin_state" => exec_sync_plugin_state(&state),
+        "sync_plugin_managed" => exec_sync_plugin_managed(&state),
         _ => Err((StatusCode::NOT_FOUND, format!("unknown tool: {}", req.tool))),
     }?;
 
@@ -653,6 +667,14 @@ fn bridge_method_catalog() -> &'static [(&'static str, &'static str)] {
         (
             "sync.config",
             "Get current server configuration including feature flags",
+        ),
+        (
+            "sync.plugin_state",
+            "Get Studio plugin internal state with staleness indicator",
+        ),
+        (
+            "sync.plugin_managed",
+            "Get Studio plugin managed instance index with staleness indicator",
         ),
     ]
 }
@@ -876,6 +898,8 @@ fn exec_bridge_method(
         "sync.rewind" => exec_sync_rewind(state, params),
         "sync.model_manifest" => exec_sync_model_manifest(state, params),
         "sync.config" => exec_sync_config(state),
+        "sync.plugin_state" => exec_sync_plugin_state(state),
+        "sync.plugin_managed" => exec_sync_plugin_managed(state),
         _ => Err((
             StatusCode::NOT_FOUND,
             format!("unknown bridge method: {method}"),
@@ -2688,6 +2712,8 @@ fn execute_step(
         "sync_rewind" => exec_sync_rewind(state, &args).map_err(|(_, e)| e),
         "sync_model_manifest" => exec_sync_model_manifest(state, &args).map_err(|(_, e)| e),
         "sync_config" => exec_sync_config(state).map_err(|(_, e)| e),
+        "sync_plugin_state" => exec_sync_plugin_state(state).map_err(|(_, e)| e),
+        "sync_plugin_managed" => exec_sync_plugin_managed(state).map_err(|(_, e)| e),
         other => Err(format!("unknown tool in pipeline: {other}")),
     }
 }
@@ -3206,7 +3232,7 @@ mod tests {
             .build()
             .unwrap();
         let tools = rt.block_on(async { handle_mcp_tools().await });
-        assert_eq!(tools.0.len(), 40, "expected 40 MCP tools");
+        assert_eq!(tools.0.len(), 42, "expected 42 MCP tools");
     }
 
     #[test]
@@ -3735,4 +3761,70 @@ fn exec_sync_config(
         "turbo": state.turbo,
         "coalesce_ms": state.coalesce_ms,
     }))
+}
+
+fn exec_sync_plugin_state(
+    state: &ServerState,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let data = state
+        .plugin_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let at = *state
+        .plugin_state_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    match (data, at) {
+        (Some(mut value), Some(instant)) => {
+            let age_secs = instant.elapsed().as_secs_f64();
+            let stale = age_secs > 10.0;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("_stale".to_string(), serde_json::json!(stale));
+                obj.insert(
+                    "_age_seconds".to_string(),
+                    serde_json::json!(age_secs.round() as u64),
+                );
+            }
+            Ok(value)
+        }
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            "no plugin state reported yet".to_string(),
+        )),
+    }
+}
+
+fn exec_sync_plugin_managed(
+    state: &ServerState,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let data = state
+        .plugin_managed
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let at = *state
+        .plugin_managed_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    match (data, at) {
+        (Some(mut value), Some(instant)) => {
+            let age_secs = instant.elapsed().as_secs_f64();
+            let stale = age_secs > 60.0;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("_stale".to_string(), serde_json::json!(stale));
+                obj.insert(
+                    "_age_seconds".to_string(),
+                    serde_json::json!(age_secs.round() as u64),
+                );
+            }
+            Ok(value)
+        }
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            "no plugin managed index reported yet".to_string(),
+        )),
+    }
 }

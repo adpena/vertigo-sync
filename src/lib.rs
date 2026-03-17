@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+pub mod errors;
 pub mod mcp;
+pub mod output;
 pub mod project;
 pub mod rbxl;
 pub mod serve_rbxl;
@@ -1089,6 +1091,16 @@ pub struct ServerState {
     pub binary_models: bool,
     /// Cached model manifests, keyed by content SHA-256.
     pub model_cache: Mutex<ModelManifestCache>,
+    /// Server boot timestamp (set once at construction, never changes).
+    pub boot_time: Instant,
+    /// Latest plugin state reported via POST /plugin/state.
+    pub plugin_state: Mutex<Option<serde_json::Value>>,
+    /// Wall-clock instant of the last plugin state report.
+    pub plugin_state_at: Mutex<Option<Instant>>,
+    /// Latest plugin managed index reported via POST /plugin/managed.
+    pub plugin_managed: Mutex<Option<serde_json::Value>>,
+    /// Wall-clock instant of the last plugin managed index report.
+    pub plugin_managed_at: Mutex<Option<Instant>>,
 }
 
 impl ServerState {
@@ -1140,6 +1152,11 @@ impl ServerState {
             coalesce_ms,
             binary_models,
             model_cache: Mutex::new(ModelManifestCache::new()),
+            boot_time: Instant::now(),
+            plugin_state: Mutex::new(None),
+            plugin_state_at: Mutex::new(None),
+            plugin_managed: Mutex::new(None),
+            plugin_managed_at: Mutex::new(None),
         })
     }
 

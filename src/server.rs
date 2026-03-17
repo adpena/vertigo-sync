@@ -8,6 +8,10 @@
 //!   GET  /sources/content    — batched source fetch for high-rate hotload
 //!   POST /sync/patch         — apply file patches, return ack
 //!   GET  /validate            — run source validation, return report
+//!   POST /plugin/state        — accept plugin state report
+//!   GET  /plugin/state        — return latest plugin state (or 404)
+//!   POST /plugin/managed      — accept plugin managed index report
+//!   GET  /plugin/managed      — return latest plugin managed index (or 404)
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -159,6 +163,8 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/rewind", get(handle_rewind))
         .route("/model/{*path}", get(handle_model))
         .route("/config", get(handle_config))
+        .route("/plugin/state", get(handle_get_plugin_state).post(handle_post_plugin_state))
+        .route("/plugin/managed", get(handle_get_plugin_managed).post(handle_post_plugin_managed))
         .route("/mcp/tools", get(handle_mcp_tools))
         .route("/mcp/execute", post(handle_mcp_execute))
         .with_state(state)
@@ -223,12 +229,84 @@ pub async fn run_serve(
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_health() -> Json<serde_json::Value> {
+async fn handle_health(
+    State(state): State<Arc<ServerState>>,
+) -> Json<serde_json::Value> {
+    let boot_elapsed = state.boot_time.elapsed().as_secs();
     Json(serde_json::json!({
         "status": "ok",
-        "version": "0.1.0"
+        "version": "0.1.0",
+        "server_boot_time": boot_elapsed
     }))
 }
+
+// ---------------------------------------------------------------------------
+// Plugin state reporting endpoints
+// ---------------------------------------------------------------------------
+
+/// POST /plugin/state — plugin pushes its internal state periodically.
+async fn handle_post_plugin_state(
+    State(state): State<Arc<ServerState>>,
+    Json(body): Json<serde_json::Value>,
+) -> StatusCode {
+    *state.plugin_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(body);
+    *state.plugin_state_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    StatusCode::NO_CONTENT
+}
+
+/// GET /plugin/state — returns latest plugin state with staleness indicator.
+async fn handle_get_plugin_state(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let data = state.plugin_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let at = *state.plugin_state_at.lock().unwrap_or_else(|e| e.into_inner());
+
+    match (data, at) {
+        (Some(mut value), Some(instant)) => {
+            let age_secs = instant.elapsed().as_secs_f64();
+            let stale = age_secs > 10.0;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("_stale".to_string(), serde_json::json!(stale));
+                obj.insert("_age_seconds".to_string(), serde_json::json!(age_secs.round() as u64));
+            }
+            Ok(Json(value))
+        }
+        _ => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// POST /plugin/managed — plugin pushes its managed index summary periodically.
+async fn handle_post_plugin_managed(
+    State(state): State<Arc<ServerState>>,
+    Json(body): Json<serde_json::Value>,
+) -> StatusCode {
+    *state.plugin_managed.lock().unwrap_or_else(|e| e.into_inner()) = Some(body);
+    *state.plugin_managed_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    StatusCode::NO_CONTENT
+}
+
+/// GET /plugin/managed — returns latest managed index with staleness indicator.
+async fn handle_get_plugin_managed(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let data = state.plugin_managed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let at = *state.plugin_managed_at.lock().unwrap_or_else(|e| e.into_inner());
+
+    match (data, at) {
+        (Some(mut value), Some(instant)) => {
+            let age_secs = instant.elapsed().as_secs_f64();
+            let stale = age_secs > 60.0;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("_stale".to_string(), serde_json::json!(stale));
+                obj.insert("_age_seconds".to_string(), serde_json::json!(age_secs.round() as u64));
+            }
+            Ok(Json(value))
+        }
+        _ => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 async fn handle_snapshot(
     State(state): State<Arc<ServerState>>,
