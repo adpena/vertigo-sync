@@ -369,12 +369,22 @@ pub struct ModifiedEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenamedEntry {
+    pub old_path: String,
+    pub new_path: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotDiff {
     pub previous_fingerprint: String,
     pub current_fingerprint: String,
     pub added: Vec<SnapshotEntry>,
     pub modified: Vec<ModifiedEntry>,
     pub deleted: Vec<SnapshotEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub renamed: Vec<RenamedEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -437,6 +447,13 @@ pub struct HealthIssue {
 // Watch / SSE event types
 // ---------------------------------------------------------------------------
 
+/// A path rename event (old_path -> new_path) detected via content hash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenamedPathEvent {
+    pub old_path: String,
+    pub new_path: String,
+}
+
 /// SSE / watch diff event payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncDiffEvent {
@@ -445,6 +462,8 @@ pub struct SyncDiffEvent {
     pub added_paths: Vec<String>,
     pub modified_paths: Vec<String>,
     pub deleted_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub renamed_paths: Vec<RenamedPathEvent>,
     pub timestamp: String,
 }
 
@@ -771,6 +790,46 @@ pub fn diff_snapshots(previous: &Snapshot, current: &Snapshot) -> SnapshotDiff {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Rename detection: match deleted entries with added entries by content hash.
+    // When the same SHA-256 appears in both sets, it's a rename, not delete+add.
+    // -----------------------------------------------------------------------
+    let mut renamed = Vec::new();
+    let mut deleted_by_hash: HashMap<&str, usize> = HashMap::new();
+    for (i, entry) in deleted.iter().enumerate() {
+        deleted_by_hash.entry(entry.sha256.as_str()).or_insert(i);
+    }
+
+    let mut rename_added_indices = Vec::new();
+    let mut rename_deleted_indices = Vec::new();
+
+    for (ai, added_entry) in added.iter().enumerate() {
+        if let Some(&di) = deleted_by_hash.get(added_entry.sha256.as_str()) {
+            renamed.push(RenamedEntry {
+                old_path: deleted[di].path.clone(),
+                new_path: added_entry.path.clone(),
+                sha256: added_entry.sha256.clone(),
+                bytes: added_entry.bytes,
+            });
+            rename_added_indices.push(ai);
+            rename_deleted_indices.push(di);
+            // Remove from hash map so each deleted entry matches at most once.
+            deleted_by_hash.remove(added_entry.sha256.as_str());
+        }
+    }
+
+    // Remove matched entries from added/deleted (iterate in reverse to preserve indices).
+    rename_added_indices.sort_unstable();
+    rename_deleted_indices.sort_unstable();
+    for &i in rename_added_indices.iter().rev() {
+        added.remove(i);
+    }
+    for &i in rename_deleted_indices.iter().rev() {
+        deleted.remove(i);
+    }
+
+    renamed.sort_by(|a, b| a.new_path.cmp(&b.new_path));
+
     added.sort_by(|a, b| a.path.cmp(&b.path));
     modified.sort_by(|a, b| a.path.cmp(&b.path));
     deleted.sort_by(|a, b| a.path.cmp(&b.path));
@@ -781,6 +840,7 @@ pub fn diff_snapshots(previous: &Snapshot, current: &Snapshot) -> SnapshotDiff {
         added,
         modified,
         deleted,
+        renamed,
     }
 }
 
@@ -1004,6 +1064,10 @@ pub fn run_watch(
             added_paths: diff.added.iter().map(|f| f.path.clone()).collect(),
             modified_paths: diff.modified.iter().map(|f| f.path.clone()).collect(),
             deleted_paths: diff.deleted.iter().map(|f| f.path.clone()).collect(),
+            renamed_paths: diff.renamed.iter().map(|r| RenamedPathEvent {
+                old_path: r.old_path.clone(),
+                new_path: r.new_path.clone(),
+            }).collect(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -1115,6 +1179,10 @@ pub fn run_watch_native(
             added_paths: diff.added.iter().map(|f| f.path.clone()).collect(),
             modified_paths: diff.modified.iter().map(|f| f.path.clone()).collect(),
             deleted_paths: diff.deleted.iter().map(|f| f.path.clone()).collect(),
+            renamed_paths: diff.renamed.iter().map(|r| RenamedPathEvent {
+                old_path: r.old_path.clone(),
+                new_path: r.new_path.clone(),
+            }).collect(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -1346,6 +1414,10 @@ impl ServerState {
             added_paths: diff.added.iter().map(|f| f.path.clone()).collect(),
             modified_paths: diff.modified.iter().map(|f| f.path.clone()).collect(),
             deleted_paths: diff.deleted.iter().map(|f| f.path.clone()).collect(),
+            renamed_paths: diff.renamed.iter().map(|r| RenamedPathEvent {
+                old_path: r.old_path.clone(),
+                new_path: r.new_path.clone(),
+            }).collect(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -1657,6 +1729,8 @@ fn classify_file_type(path: &str) -> &'static str {
         "rbxmx"
     } else if len >= 5 && ends_with_ci(bytes, b".rbxm") {
         "rbxm"
+    } else if len >= 6 && ends_with_ci(bytes, b".jsonc") {
+        "jsonc"
     } else if len >= 5 && ends_with_ci(bytes, b".json") {
         "json"
     } else if len >= 4 && ends_with_ci(bytes, b".txt") {
@@ -1672,6 +1746,68 @@ fn classify_file_type(path: &str) -> &'static str {
     } else {
         "other"
     }
+}
+
+/// Strip `//` single-line and `/* */` block comments from JSONC content,
+/// producing valid JSON. Correctly handles comments inside quoted strings
+/// (does not strip them). Zero external dependencies.
+pub fn strip_json_comments(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    while i < len {
+        if escape_next {
+            output.push(bytes[i] as char);
+            escape_next = false;
+            i += 1;
+            continue;
+        }
+
+        if in_string {
+            if bytes[i] == b'\\' {
+                escape_next = true;
+                output.push('\\');
+            } else if bytes[i] == b'"' {
+                in_string = false;
+                output.push('"');
+            } else {
+                output.push(bytes[i] as char);
+            }
+            i += 1;
+            continue;
+        }
+
+        // Not in string
+        if bytes[i] == b'"' {
+            in_string = true;
+            output.push('"');
+            i += 1;
+        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            // Single-line comment: skip to end of line
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // Block comment: skip to */
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2; // skip */
+            }
+        } else {
+            output.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+
+    output
 }
 
 /// Parse a `.meta.json` sidecar file into an `InstanceMeta`.
@@ -1999,12 +2135,25 @@ pub fn reverse_diff(diff: &SnapshotDiff) -> SnapshotDiff {
         })
         .collect();
 
+    // Reverse renames: swap old_path <-> new_path
+    let reversed_renamed: Vec<RenamedEntry> = diff
+        .renamed
+        .iter()
+        .map(|r| RenamedEntry {
+            old_path: r.new_path.clone(),
+            new_path: r.old_path.clone(),
+            sha256: r.sha256.clone(),
+            bytes: r.bytes,
+        })
+        .collect();
+
     SnapshotDiff {
         previous_fingerprint: diff.current_fingerprint.clone(),
         current_fingerprint: diff.previous_fingerprint.clone(),
         added: diff.deleted.clone(),
         modified: reversed_modified,
         deleted: diff.added.clone(),
+        renamed: reversed_renamed,
     }
 }
 
@@ -2549,6 +2698,7 @@ mod tests {
                 meta: None,
                 file_type: None,
             }],
+            renamed: vec![],
         };
 
         let rev = reverse_diff(&diff);
@@ -2741,5 +2891,198 @@ mod tests {
         let toml_entry = snapshot.entries.iter().find(|e| e.path.ends_with(".toml"));
         assert!(toml_entry.is_some(), "TOML file should be in snapshot");
         assert_eq!(toml_entry.unwrap().file_type.as_deref(), Some("toml"));
+    }
+
+    // -----------------------------------------------------------------------
+    // JSONC support
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_json_comments_single_line() {
+        assert_eq!(
+            strip_json_comments("{\n  // comment\n  \"key\": 1\n}"),
+            "{\n  \n  \"key\": 1\n}"
+        );
+    }
+
+    #[test]
+    fn strip_json_comments_block() {
+        assert_eq!(
+            strip_json_comments("{ /* block */ \"key\": 1 }"),
+            "{  \"key\": 1 }"
+        );
+    }
+
+    #[test]
+    fn strip_json_comments_in_string() {
+        // Comments inside strings should NOT be stripped
+        assert_eq!(
+            strip_json_comments("{\"url\": \"http://example.com\"}"),
+            "{\"url\": \"http://example.com\"}"
+        );
+    }
+
+    #[test]
+    fn strip_json_comments_nested_block() {
+        // Block comments do not nest — first */ ends the comment
+        assert_eq!(
+            strip_json_comments("{ /* a /* b */ \"k\": 1 }"),
+            "{  \"k\": 1 }"
+        );
+    }
+
+    #[test]
+    fn strip_json_comments_escaped_quote_in_string() {
+        // Escaped quotes inside strings should not end the string
+        assert_eq!(
+            strip_json_comments(r#"{"key": "val\"ue // not a comment"}"#),
+            r#"{"key": "val\"ue // not a comment"}"#
+        );
+    }
+
+    #[test]
+    fn strip_json_comments_empty_input() {
+        assert_eq!(strip_json_comments(""), "");
+    }
+
+    #[test]
+    fn classify_jsonc_file_type() {
+        assert_eq!(classify_file_type("src/config.jsonc"), "jsonc");
+        assert_eq!(classify_file_type("settings.JSONC"), "jsonc");
+    }
+
+    #[test]
+    fn jsonc_files_included_in_snapshot() {
+        let root = tempdir().expect("tempdir");
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::write(
+            src.join("config.jsonc"),
+            "{\n  // this is a comment\n  \"key\": \"value\"\n}",
+        )
+        .expect("write jsonc");
+
+        let includes = vec!["src".to_string()];
+        let snapshot = build_snapshot(root.path(), &includes).expect("snapshot");
+
+        let jsonc_entry = snapshot.entries.iter().find(|e| e.path.ends_with(".jsonc"));
+        assert!(jsonc_entry.is_some(), "JSONC file should be in snapshot");
+        assert_eq!(jsonc_entry.unwrap().file_type.as_deref(), Some("jsonc"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Rename detection
+    // -----------------------------------------------------------------------
+
+    fn make_entry(path: &str, sha: &str, bytes: u64) -> SnapshotEntry {
+        SnapshotEntry {
+            path: path.to_string(),
+            sha256: sha.to_string(),
+            bytes,
+            meta: None,
+            file_type: None,
+        }
+    }
+
+    #[test]
+    fn diff_detects_rename() {
+        let previous = Snapshot {
+            version: 1,
+            include: vec!["src".to_string()],
+            fingerprint: "fp1".to_string(),
+            entries: vec![make_entry("src/old.luau", "abc123", 100)],
+        };
+        let current = Snapshot {
+            version: 1,
+            include: vec!["src".to_string()],
+            fingerprint: "fp2".to_string(),
+            entries: vec![make_entry("src/new.luau", "abc123", 100)],
+        };
+        let diff = diff_snapshots(&previous, &current);
+        assert_eq!(diff.renamed.len(), 1);
+        assert_eq!(diff.renamed[0].old_path, "src/old.luau");
+        assert_eq!(diff.renamed[0].new_path, "src/new.luau");
+        assert_eq!(diff.renamed[0].sha256, "abc123");
+        assert!(diff.added.is_empty());
+        assert!(diff.deleted.is_empty());
+    }
+
+    #[test]
+    fn diff_rename_does_not_match_different_hashes() {
+        let previous = Snapshot {
+            version: 1,
+            include: vec!["src".to_string()],
+            fingerprint: "fp1".to_string(),
+            entries: vec![make_entry("src/a.luau", "hash1", 100)],
+        };
+        let current = Snapshot {
+            version: 1,
+            include: vec!["src".to_string()],
+            fingerprint: "fp2".to_string(),
+            entries: vec![make_entry("src/b.luau", "hash2", 100)],
+        };
+        let diff = diff_snapshots(&previous, &current);
+        assert!(diff.renamed.is_empty());
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(diff.deleted.len(), 1);
+    }
+
+    #[test]
+    fn diff_rename_preserves_unrelated_changes() {
+        let previous = Snapshot {
+            version: 1,
+            include: vec!["src".to_string()],
+            fingerprint: "fp1".to_string(),
+            entries: vec![
+                make_entry("src/old.luau", "same_hash", 50),
+                make_entry("src/keep.luau", "keep_hash", 30),
+                make_entry("src/remove.luau", "remove_hash", 20),
+            ],
+        };
+        let current = Snapshot {
+            version: 1,
+            include: vec!["src".to_string()],
+            fingerprint: "fp2".to_string(),
+            entries: vec![
+                make_entry("src/new.luau", "same_hash", 50),
+                make_entry("src/keep.luau", "keep_hash", 30),
+                make_entry("src/fresh.luau", "fresh_hash", 10),
+            ],
+        };
+        let diff = diff_snapshots(&previous, &current);
+        assert_eq!(diff.renamed.len(), 1);
+        assert_eq!(diff.renamed[0].old_path, "src/old.luau");
+        assert_eq!(diff.renamed[0].new_path, "src/new.luau");
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(diff.added[0].path, "src/fresh.luau");
+        assert_eq!(diff.deleted.len(), 1);
+        assert_eq!(diff.deleted[0].path, "src/remove.luau");
+        assert!(diff.modified.is_empty());
+    }
+
+    #[test]
+    fn diff_rename_multiple_files() {
+        let previous = Snapshot {
+            version: 1,
+            include: vec!["src".to_string()],
+            fingerprint: "fp1".to_string(),
+            entries: vec![
+                make_entry("src/a.luau", "hash_a", 10),
+                make_entry("src/b.luau", "hash_b", 20),
+            ],
+        };
+        let current = Snapshot {
+            version: 1,
+            include: vec!["src".to_string()],
+            fingerprint: "fp2".to_string(),
+            entries: vec![
+                make_entry("src/x.luau", "hash_a", 10),
+                make_entry("src/y.luau", "hash_b", 20),
+            ],
+        };
+        let diff = diff_snapshots(&previous, &current);
+        assert_eq!(diff.renamed.len(), 2);
+        assert!(diff.added.is_empty());
+        assert!(diff.deleted.is_empty());
     }
 }

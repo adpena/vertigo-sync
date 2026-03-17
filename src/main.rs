@@ -1555,6 +1555,21 @@ fn populate_from_dir(
                     }
                     dom.insert(parent_ref, builder);
                 }
+                "jsonc" => {
+                    let instance_name = name_str
+                        .strip_suffix(".jsonc")
+                        .unwrap_or(&name_str);
+                    let mut builder =
+                        rbx_dom_weak::InstanceBuilder::new("ModuleScript").with_name(instance_name);
+                    if let Ok(raw) = std::fs::read_to_string(&path) {
+                        let clean = vertigo_sync::strip_json_comments(&raw);
+                        builder = builder.with_property(
+                            "Source",
+                            rbx_dom_weak::types::Variant::String(clean),
+                        );
+                    }
+                    dom.insert(parent_ref, builder);
+                }
                 "txt" => {
                     let instance_name = name_str.strip_suffix(".txt").unwrap_or(&name_str);
                     let mut builder =
@@ -1846,6 +1861,55 @@ mod tests {
                 "missing Source for {}",
                 child.name
             );
+        }
+    }
+
+    #[test]
+    fn populate_from_dir_handles_jsonc() {
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let src = temp.path().join("src");
+        fs::create_dir_all(&src).expect("create src dir");
+        fs::write(
+            src.join("config.jsonc"),
+            "{\n  // This is a comment\n  \"key\": \"value\"\n}",
+        )
+        .expect("write jsonc");
+
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root_ref = dom.root_ref();
+        let parent_ref = dom.insert(root_ref, InstanceBuilder::new("Folder").with_name("Test"));
+
+        populate_from_dir(&mut dom, parent_ref, &src, temp.path()).expect("populate");
+
+        let parent = dom.get_by_ref(parent_ref).unwrap();
+        let child_names: Vec<String> = parent
+            .children()
+            .iter()
+            .filter_map(|&r| dom.get_by_ref(r).map(|i| i.name.clone()))
+            .collect();
+
+        assert!(
+            child_names.contains(&"config".to_string()),
+            "jsonc file not found: {child_names:?}"
+        );
+
+        // Verify it's a ModuleScript with stripped comments in Source.
+        let source_key: rbx_dom_weak::Ustr = "Source".into();
+        for &child_ref in parent.children() {
+            let child = dom.get_by_ref(child_ref).unwrap();
+            assert_eq!(child.class, "ModuleScript");
+            let source = child.properties.get(&source_key).expect("missing Source");
+            if let rbx_dom_weak::types::Variant::String(s) = source {
+                assert!(
+                    !s.contains("// This is a comment"),
+                    "JSONC comment should be stripped"
+                );
+                assert!(s.contains("\"key\": \"value\""), "JSON content should remain");
+            } else {
+                panic!("Source should be a String variant");
+            }
         }
     }
 

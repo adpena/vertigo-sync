@@ -458,7 +458,7 @@ async fn handle_ws_connection(mut socket: WebSocket, state: Arc<ServerState>) {
                 match result {
                     Ok(event) => {
                         ws_seq += 1;
-                        let msg = serde_json::json!({
+                        let mut msg = serde_json::json!({
                             "type": "sync_diff",
                             "seq": ws_seq,
                             "source_hash": event.source_hash,
@@ -474,6 +474,10 @@ async fn handle_ws_connection(mut socket: WebSocket, state: Arc<ServerState>) {
                             },
                             "timestamp": event.timestamp,
                         });
+                        // Include renamed paths when present (backward-compatible).
+                        if !event.renamed_paths.is_empty() {
+                            msg["paths"]["renamed"] = serde_json::json!(event.renamed_paths);
+                        }
                         if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
                             break;
                         }

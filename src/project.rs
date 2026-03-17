@@ -247,7 +247,7 @@ pub fn resolve_instance_class(file_path: &str) -> &'static str {
                 "LocalScript"
             } else if file_name.ends_with(".luau") || file_name.ends_with(".lua") {
                 "ModuleScript"
-            } else if file_name.ends_with(".json") {
+            } else if file_name.ends_with(".json") || file_name.ends_with(".jsonc") {
                 "ModuleScript"
             } else if file_name.ends_with(".yaml") || file_name.ends_with(".yml") {
                 "ModuleScript"
@@ -488,6 +488,11 @@ mod tests {
     #[test]
     fn resolve_instance_class_json_files() {
         assert_eq!(resolve_instance_class("src/config.json"), "ModuleScript");
+    }
+
+    #[test]
+    fn resolve_instance_class_jsonc_files() {
+        assert_eq!(resolve_instance_class("src/config.jsonc"), "ModuleScript");
     }
 
     #[test]
