@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+pub mod builder_codegen;
 pub mod errors;
 pub mod mcp;
 pub mod output;

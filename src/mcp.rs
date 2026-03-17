@@ -536,6 +536,26 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
                 param("limit", "integer", "Max events to return (default 20)", false),
             ],
         ),
+        // ── Builder codegen tools ────────────────────────────────────
+        tool_def(
+            "sync_scaffold_builder",
+            "Create a new builder module from template. The builder generates geometry procedurally in Edit mode.",
+            vec![
+                param("name", "string", "Builder name (e.g. CoralCaveBuilder)", true),
+                param("zone", "string", "Zone name (e.g. Coral Cave, Hub, Abyss)", true),
+                param("y_range", "string", "Vertical range (e.g. '-50 to -20')", false),
+                param("description", "string", "What this builder creates", false),
+            ],
+        ),
+        tool_def(
+            "sync_convert_to_builder",
+            "Convert a .model.json instance tree into a builder .luau module that generates the same geometry procedurally",
+            vec![
+                param("input_path", "string", "Path to .model.json file to convert", true),
+                param("output_path", "string", "Path for the generated builder .luau (default: same directory, .luau extension)", false),
+                param("builder_name", "string", "Module name for the builder (default: derived from filename)", false),
+            ],
+        ),
     ])
 }
 
@@ -621,6 +641,9 @@ pub async fn handle_mcp_execute(
         "sync_watch_status" => exec_sync_watch_status(&state),
         // File change history
         "sync_file_history" => exec_sync_file_history(&state, &req.arguments),
+        // Builder codegen tools
+        "sync_scaffold_builder" => exec_scaffold_builder(&state, &req.arguments),
+        "sync_convert_to_builder" => exec_convert_to_builder(&state, &req.arguments),
         _ => Err((StatusCode::NOT_FOUND, format!("unknown tool: {}", req.tool))),
     }?;
 
@@ -729,6 +752,14 @@ fn bridge_method_catalog() -> &'static [(&'static str, &'static str)] {
         (
             "sync.file_history",
             "Get change history for a specific file path across snapshots",
+        ),
+        (
+            "sync.scaffold_builder",
+            "Create a new builder module from template for procedural geometry generation",
+        ),
+        (
+            "sync.convert_to_builder",
+            "Convert a .model.json instance tree into a builder .luau module",
         ),
     ]
 }
@@ -958,6 +989,8 @@ fn exec_bridge_method(
         // Use the MCP tool directly for plugin commands that need wait support.
         "sync.watch_status" => exec_sync_watch_status(state),
         "sync.file_history" => exec_sync_file_history(state, params),
+        "sync.scaffold_builder" => exec_scaffold_builder(state, params),
+        "sync.convert_to_builder" => exec_convert_to_builder(state, params),
         _ => Err((
             StatusCode::NOT_FOUND,
             format!("unknown bridge method: {method}"),
@@ -2780,6 +2813,8 @@ fn execute_step(
         // Note: sync_plugin_command is async and not supported in synchronous pipeline steps.
         "sync_watch_status" => exec_sync_watch_status(state).map_err(|(_, e)| e),
         "sync_file_history" => exec_sync_file_history(state, &args).map_err(|(_, e)| e),
+        "sync_scaffold_builder" => exec_scaffold_builder(state, &args).map_err(|(_, e)| e),
+        "sync_convert_to_builder" => exec_convert_to_builder(state, &args).map_err(|(_, e)| e),
         other => Err(format!("unknown tool in pipeline: {other}")),
     }
 }
@@ -3203,6 +3238,159 @@ async fn exec_pipeline(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Builder codegen tool executors
+// ---------------------------------------------------------------------------
+
+use crate::builder_codegen;
+
+fn exec_scaffold_builder(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let name = args["name"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: name".into(),
+        )
+    })?;
+    let zone = args["zone"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: zone".into(),
+        )
+    })?;
+    let y_range = args["y_range"].as_str();
+    let description = args["description"].as_str();
+
+    // Generate the builder code.
+    let code = builder_codegen::scaffold_builder(name, zone, y_range, description)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    // Write via the safe_write path (validate + write + rebuild snapshot).
+    let rel_path = format!("src/Server/World/Builders/{name}.luau");
+
+    // Check that file doesn't already exist.
+    let source_root = canon_root(state)?;
+    let target = validate_path(&source_root, &rel_path)?;
+    if target.exists() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("builder already exists: {rel_path}"),
+        ));
+    }
+
+    // Delegate to safe_write for validation + write + snapshot rebuild.
+    let safe_write_args = serde_json::json!({
+        "path": rel_path,
+        "content": code,
+        "require_strict": true,
+    });
+    let write_result = exec_safe_write(state, &safe_write_args)?;
+
+    // Augment the result with builder-specific metadata.
+    let mut result = write_result;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("builder_name".into(), serde_json::json!(name));
+        obj.insert("zone".into(), serde_json::json!(zone));
+        if let Some(yr) = y_range {
+            obj.insert("y_range".into(), serde_json::json!(yr));
+        }
+    }
+
+    Ok(result)
+}
+
+fn exec_convert_to_builder(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let input_path = args["input_path"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required param: input_path".into(),
+        )
+    })?;
+
+    // Resolve the input path relative to the project root.
+    let source_root = canon_root(state)?;
+    let input_resolved = if Path::new(input_path).is_absolute() {
+        PathBuf::from(input_path)
+    } else {
+        source_root.join(input_path)
+    };
+
+    if !input_resolved.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("input file not found: {input_path}"),
+        ));
+    }
+
+    // Read and parse the model.json.
+    let content = std::fs::read_to_string(&input_resolved).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read error: {e}"),
+        )
+    })?;
+    let model: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid JSON in {input_path}: {e}"),
+        )
+    })?;
+
+    // Derive builder name from filename or explicit param.
+    let builder_name = if let Some(explicit) = args["builder_name"].as_str() {
+        explicit.to_string()
+    } else {
+        // Derive from filename: "CoralCave.model.json" -> "CoralCaveBuilder"
+        let stem = Path::new(input_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Generated");
+        // Strip ".model" suffix if present.
+        let base = stem.strip_suffix(".model").unwrap_or(stem);
+        let sanitized = builder_codegen::sanitize_var_name(base);
+        if sanitized.ends_with("Builder") {
+            sanitized
+        } else {
+            format!("{sanitized}Builder")
+        }
+    };
+
+    // Generate the builder Luau code.
+    let luau_code = builder_codegen::generate_builder_luau(&model, &builder_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Determine output path.
+    let output_path = if let Some(explicit) = args["output_path"].as_str() {
+        explicit.to_string()
+    } else {
+        // Default: same directory as input, with .luau extension.
+        format!("src/Server/World/Builders/{builder_name}.luau")
+    };
+
+    // Write via safe_write path.
+    let safe_write_args = serde_json::json!({
+        "path": output_path,
+        "content": luau_code,
+        "require_strict": true,
+    });
+    let write_result = exec_safe_write(state, &safe_write_args)?;
+
+    // Augment result.
+    let mut result = write_result;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("builder_name".into(), serde_json::json!(builder_name));
+        obj.insert("input_path".into(), serde_json::json!(input_path));
+        obj.insert("output_path".into(), serde_json::json!(output_path));
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3298,7 +3486,7 @@ mod tests {
             .build()
             .unwrap();
         let tools = rt.block_on(async { handle_mcp_tools().await });
-        assert_eq!(tools.0.len(), 45, "expected 45 MCP tools (42 existing + 3 new: plugin_command, watch_status, file_history)");
+        assert_eq!(tools.0.len(), 47, "expected 47 MCP tools (45 existing + 2 new: scaffold_builder, convert_to_builder)");
     }
 
     #[test]
