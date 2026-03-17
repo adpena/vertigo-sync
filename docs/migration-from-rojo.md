@@ -1,6 +1,6 @@
 # Migrating from Rojo
 
-Vertigo Sync is a drop-in replacement for Rojo. Your existing `default.project.json` works without modification.
+Vertigo Sync reads the same `default.project.json` format that Rojo established. Your existing project file works without modification. The migration is fully reversible -- you can switch back to Rojo at any time without changing your source files.
 
 ## Command Mapping
 
@@ -66,7 +66,7 @@ The Vertigo Sync plugin connects automatically. You should see a green "Connecte
 
 ### Validation
 
-Rojo does not validate your Luau source. Vertigo Sync includes a 36-rule linter that runs on every snapshot:
+Rojo intentionally defers linting to dedicated tools like Selene, which is a reasonable design choice for a sync-focused tool. Vertigo Sync takes a different approach and bundles a 36-rule linter for convenience:
 
 ```bash
 vertigo-sync validate
