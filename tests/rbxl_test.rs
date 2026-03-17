@@ -256,7 +256,7 @@ fn test_json_roundtrip_property_values() {
         PropertyValue::Number(42.5),
         PropertyValue::Bool(true),
         PropertyValue::Int32(-100),
-        PropertyValue::Float32(3.14),
+        PropertyValue::Float32(std::f32::consts::PI),
         PropertyValue::Vector3(1.0, 2.0, 3.0),
         PropertyValue::CFrame([
             1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 10.0, 20.0, 30.0,
