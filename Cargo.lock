@@ -1902,6 +1902,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "itoa",
  "memmap2",
  "notify",
  "owo-colors",

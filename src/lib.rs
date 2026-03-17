@@ -626,12 +626,14 @@ pub fn fingerprint_entries(entries: &[SnapshotEntry]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"vertigo-sync-snapshot-v1\n");
 
+    // Stack-allocated buffer for u64 formatting — avoids heap allocation per entry.
+    let mut itoa_buf = itoa::Buffer::new();
     for entry in entries {
         hasher.update(entry.path.as_bytes());
         hasher.update([0]);
         hasher.update(entry.sha256.as_bytes());
         hasher.update([0]);
-        hasher.update(entry.bytes.to_string().as_bytes());
+        hasher.update(itoa_buf.format(entry.bytes).as_bytes());
         hasher.update(b"\n");
     }
 
@@ -644,29 +646,32 @@ pub fn fingerprint_entries(entries: &[SnapshotEntry]) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn diff_snapshots(previous: &Snapshot, current: &Snapshot) -> SnapshotDiff {
-    let mut previous_map = BTreeMap::new();
+    // Use borrowed keys (&str) to avoid cloning every path into the lookup maps.
+    let mut previous_map: BTreeMap<&str, &SnapshotEntry> = BTreeMap::new();
     for entry in &previous.entries {
-        previous_map.insert(entry.path.clone(), entry);
+        previous_map.insert(&entry.path, entry);
     }
 
-    let mut current_map = BTreeMap::new();
+    let mut current_map: BTreeMap<&str, &SnapshotEntry> = BTreeMap::new();
     for entry in &current.entries {
-        current_map.insert(entry.path.clone(), entry);
+        current_map.insert(&entry.path, entry);
     }
 
-    let mut added = Vec::new();
-    let mut modified = Vec::new();
-    let mut deleted = Vec::new();
+    // Pre-size based on typical diff proportions to reduce reallocation.
+    let estimate = current_map.len().max(previous_map.len()) / 8 + 4;
+    let mut added = Vec::with_capacity(estimate);
+    let mut modified = Vec::with_capacity(estimate);
+    let mut deleted = Vec::with_capacity(estimate);
 
-    for (path, current_entry) in &current_map {
+    for (&path, &current_entry) in &current_map {
         match previous_map.get(path) {
-            None => added.push((*current_entry).clone()),
-            Some(previous_entry) => {
+            None => added.push(current_entry.clone()),
+            Some(&previous_entry) => {
                 if previous_entry.sha256 != current_entry.sha256
                     || previous_entry.bytes != current_entry.bytes
                 {
                     modified.push(ModifiedEntry {
-                        path: path.clone(),
+                        path: path.to_string(),
                         previous_sha256: previous_entry.sha256.clone(),
                         previous_bytes: previous_entry.bytes,
                         current_sha256: current_entry.sha256.clone(),
@@ -677,9 +682,9 @@ pub fn diff_snapshots(previous: &Snapshot, current: &Snapshot) -> SnapshotDiff {
         }
     }
 
-    for (path, previous_entry) in &previous_map {
+    for (&path, &previous_entry) in &previous_map {
         if !current_map.contains_key(path) {
-            deleted.push((*previous_entry).clone());
+            deleted.push(previous_entry.clone());
         }
     }
 
