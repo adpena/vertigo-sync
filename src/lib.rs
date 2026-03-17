@@ -90,6 +90,25 @@ impl EventCoalescer {
             }
         }
     }
+
+    /// Return current coalescer state for observability.
+    pub fn status(&self) -> CoalescerStatus {
+        let lock = self.last_event.lock().unwrap_or_else(|e| e.into_inner());
+        let last_event_elapsed = lock.map(|ts| ts.elapsed());
+        CoalescerStatus {
+            pending: self.pending.load(Ordering::Acquire),
+            last_event_elapsed,
+            window: self.window,
+        }
+    }
+}
+
+/// Snapshot of coalescer state for observability endpoints.
+#[derive(Debug, Clone)]
+pub struct CoalescerStatus {
+    pub pending: bool,
+    pub last_event_elapsed: Option<Duration>,
+    pub window: Duration,
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +485,39 @@ pub struct SyncDiffEvent {
     pub renamed_paths: Vec<RenamedPathEvent>,
     pub timestamp: String,
 }
+
+// ---------------------------------------------------------------------------
+// Plugin command channel
+// ---------------------------------------------------------------------------
+
+/// A command queued for the Studio plugin to execute on its next poll.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginCommand {
+    pub id: String,
+    /// One of: "toggle_sync", "force_resync", "set_frame_budget", "run_builders", "set_log_level"
+    pub command: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+    /// Epoch seconds when the command was created (serialization-friendly).
+    pub created_at_epoch: f64,
+    /// Monotonic instant for GC — not serialized.
+    #[serde(skip)]
+    pub created_at: Option<Instant>,
+}
+
+/// Acknowledgment from the plugin after executing a command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginCommandAck {
+    pub command_id: String,
+    pub success: bool,
+    pub message: String,
+}
+
+/// Maximum number of pending plugin commands. Rejects new commands when full.
+pub const PLUGIN_COMMAND_QUEUE_CAPACITY: usize = 32;
+
+/// Commands older than this are garbage-collected.
+pub const PLUGIN_COMMAND_TTL: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Includes resolution
@@ -1264,6 +1316,12 @@ pub struct ServerState {
     pub plugin_managed_at: Mutex<Option<Instant>>,
     /// Compiled glob ignore patterns from the project file.
     pub glob_ignores: GlobIgnoreSet,
+    /// Pending commands for the Studio plugin (bounded FIFO).
+    pub plugin_commands: Mutex<VecDeque<PluginCommand>>,
+    /// Acknowledgments from the plugin, keyed by command ID.
+    pub plugin_command_acks: Mutex<HashMap<String, PluginCommandAck>>,
+    /// Reference to the filesystem event coalescer (set by the serve loop).
+    pub coalescer: Mutex<Option<Arc<EventCoalescer>>>,
 }
 
 impl ServerState {
@@ -1343,7 +1401,44 @@ impl ServerState {
             plugin_managed: Mutex::new(None),
             plugin_managed_at: Mutex::new(None),
             glob_ignores,
+            plugin_commands: Mutex::new(VecDeque::new()),
+            plugin_command_acks: Mutex::new(HashMap::new()),
+            coalescer: Mutex::new(None),
         })
+    }
+
+    /// Garbage-collect expired plugin commands (older than TTL).
+    pub fn gc_plugin_commands(&self) {
+        let mut queue = self.plugin_commands.lock().unwrap_or_else(|e| e.into_inner());
+        queue.retain(|cmd| {
+            cmd.created_at
+                .map(|t| t.elapsed() < PLUGIN_COMMAND_TTL)
+                .unwrap_or(false)
+        });
+        // Also GC old acks (keep for 2x TTL at most).
+        let ttl2 = PLUGIN_COMMAND_TTL * 2;
+        let mut acks = self
+            .plugin_command_acks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Acks don't have timestamps, but we bound the map size.
+        if acks.len() > PLUGIN_COMMAND_QUEUE_CAPACITY * 2 {
+            // Remove oldest half (HashMap doesn't preserve order, so just truncate).
+            let to_remove = acks.len() - PLUGIN_COMMAND_QUEUE_CAPACITY;
+            let keys: Vec<String> = acks.keys().take(to_remove).cloned().collect();
+            for k in keys {
+                acks.remove(&k);
+            }
+        }
+        let _ = ttl2; // suppress unused warning
+    }
+
+    /// Drain all pending plugin commands (for the POST /plugin/state response).
+    /// Also runs GC first.
+    pub fn drain_plugin_commands(&self) -> Vec<PluginCommand> {
+        self.gc_plugin_commands();
+        let mut queue = self.plugin_commands.lock().unwrap_or_else(|e| e.into_inner());
+        queue.drain(..).collect()
     }
 
     /// Poll source tree and broadcast diff if changed.

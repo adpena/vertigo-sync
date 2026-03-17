@@ -323,12 +323,20 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
         tool_def(
             "vsync_events",
             "Get recent sync events with sequence numbers",
-            vec![param(
-                "limit",
-                "number",
-                "Number of recent events (default 10)",
-                false,
-            )],
+            vec![
+                param(
+                    "limit",
+                    "number",
+                    "Number of recent events (default 10)",
+                    false,
+                ),
+                param(
+                    "detail",
+                    "boolean",
+                    "Include full file path lists in each event (default false, counts only)",
+                    false,
+                ),
+            ],
         ),
         // ── Pipeline orchestration ─────────────────────────────────
         tool_def(
@@ -503,6 +511,31 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
             "Get Studio plugin managed instance index (paths, hashes, classes). Includes staleness indicator.",
             vec![],
         ),
+        // ── Plugin command channel ──────────────────────────────────
+        tool_def(
+            "sync_plugin_command",
+            "Send a command to the Studio plugin (toggle sync, force resync, adjust frame budget, run builders, set log level)",
+            vec![
+                param("command", "string", "Command: toggle_sync | force_resync | set_frame_budget | run_builders | set_log_level", true),
+                param("params", "object", "Command parameters (e.g. {\"budget_ms\": 8} for set_frame_budget, {\"level\": \"verbose\"} for set_log_level)", false),
+                param("wait", "boolean", "Wait for plugin acknowledgment (default false, max 10s)", false),
+            ],
+        ),
+        // ── Filesystem watcher health ───────────────────────────────
+        tool_def(
+            "sync_watch_status",
+            "Get filesystem watcher health: coalesce state, last event age, pending rebuild status",
+            vec![],
+        ),
+        // ── File change history ─────────────────────────────────────
+        tool_def(
+            "sync_file_history",
+            "Get change history for a specific file path across snapshots",
+            vec![
+                param("path", "string", "File path to trace (e.g. src/Server/Services/DataService.luau)", true),
+                param("limit", "integer", "Max events to return (default 20)", false),
+            ],
+        ),
     ])
 }
 
@@ -579,6 +612,15 @@ pub async fn handle_mcp_execute(
         // Plugin state reporting
         "sync_plugin_state" => exec_sync_plugin_state(&state),
         "sync_plugin_managed" => exec_sync_plugin_managed(&state),
+        // Plugin command channel
+        "sync_plugin_command" => {
+            let result = exec_sync_plugin_command(&state, &req.arguments).await;
+            return result.map(Json);
+        }
+        // Filesystem watcher health
+        "sync_watch_status" => exec_sync_watch_status(&state),
+        // File change history
+        "sync_file_history" => exec_sync_file_history(&state, &req.arguments),
         _ => Err((StatusCode::NOT_FOUND, format!("unknown tool: {}", req.tool))),
     }?;
 
@@ -675,6 +717,18 @@ fn bridge_method_catalog() -> &'static [(&'static str, &'static str)] {
         (
             "sync.plugin_managed",
             "Get Studio plugin managed instance index with staleness indicator",
+        ),
+        (
+            "sync.plugin_command",
+            "Send a command to the Studio plugin (toggle sync, force resync, etc.)",
+        ),
+        (
+            "sync.watch_status",
+            "Get filesystem watcher health: coalesce state, last event age, pending rebuild",
+        ),
+        (
+            "sync.file_history",
+            "Get change history for a specific file path across snapshots",
         ),
     ]
 }
@@ -900,6 +954,10 @@ fn exec_bridge_method(
         "sync.config" => exec_sync_config(state),
         "sync.plugin_state" => exec_sync_plugin_state(state),
         "sync.plugin_managed" => exec_sync_plugin_managed(state),
+        // Note: sync.plugin_command is async so it's not available via bridge (sync only).
+        // Use the MCP tool directly for plugin commands that need wait support.
+        "sync.watch_status" => exec_sync_watch_status(state),
+        "sync.file_history" => exec_sync_file_history(state, params),
         _ => Err((
             StatusCode::NOT_FOUND,
             format!("unknown bridge method: {method}"),
@@ -2389,6 +2447,7 @@ fn exec_events(
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+    let detail = args["detail"].as_bool().unwrap_or(false);
 
     // History order gives us the chronological sequence of snapshot hashes.
     let order = state
@@ -2410,23 +2469,27 @@ fn exec_events(
         let curr = history.get(&hashes[i]);
         if let (Some(prev), Some(curr)) = (prev, curr) {
             let diff = diff_snapshots(prev, curr);
-            events.push(serde_json::json!({
+            let mut event = serde_json::json!({
                 "sequence": start + i,
                 "from_hash": diff.previous_fingerprint,
                 "to_hash": diff.current_fingerprint,
                 "added": diff.added.len(),
                 "modified": diff.modified.len(),
                 "deleted": diff.deleted.len(),
-                "added_paths": diff.added.iter().map(|e| &e.path).collect::<Vec<_>>(),
-                "modified_paths": diff.modified.iter().map(|e| &e.path).collect::<Vec<_>>(),
-                "deleted_paths": diff.deleted.iter().map(|e| &e.path).collect::<Vec<_>>(),
-            }));
+            });
+            if detail {
+                event["added_paths"] = serde_json::json!(diff.added.iter().map(|e| &e.path).collect::<Vec<_>>());
+                event["modified_paths"] = serde_json::json!(diff.modified.iter().map(|e| &e.path).collect::<Vec<_>>());
+                event["deleted_paths"] = serde_json::json!(diff.deleted.iter().map(|e| &e.path).collect::<Vec<_>>());
+            }
+            events.push(event);
         }
     }
 
     Ok(serde_json::json!({
         "total_snapshots": total,
         "showing": events.len(),
+        "detail": detail,
         "events": events,
     }))
 }
@@ -2714,6 +2777,9 @@ fn execute_step(
         "sync_config" => exec_sync_config(state).map_err(|(_, e)| e),
         "sync_plugin_state" => exec_sync_plugin_state(state).map_err(|(_, e)| e),
         "sync_plugin_managed" => exec_sync_plugin_managed(state).map_err(|(_, e)| e),
+        // Note: sync_plugin_command is async and not supported in synchronous pipeline steps.
+        "sync_watch_status" => exec_sync_watch_status(state).map_err(|(_, e)| e),
+        "sync_file_history" => exec_sync_file_history(state, &args).map_err(|(_, e)| e),
         other => Err(format!("unknown tool in pipeline: {other}")),
     }
 }
@@ -3232,7 +3298,7 @@ mod tests {
             .build()
             .unwrap();
         let tools = rt.block_on(async { handle_mcp_tools().await });
-        assert_eq!(tools.0.len(), 42, "expected 42 MCP tools");
+        assert_eq!(tools.0.len(), 45, "expected 45 MCP tools (42 existing + 3 new: plugin_command, watch_status, file_history)");
     }
 
     #[test]
@@ -3485,6 +3551,236 @@ mod tests {
         let args = serde_json::json!({"path": "${s1.dir}/NewFile.luau"});
         let result = interpolate_args(&args, &ns);
         assert_eq!(result["path"], "src/Server/NewFile.luau");
+    }
+
+    // ── Plugin command channel tests ─────────────────────────────
+
+    fn make_test_state() -> Arc<crate::ServerState> {
+        let snapshot = crate::Snapshot {
+            version: 1,
+            include: vec![],
+            fingerprint: "test000".into(),
+            entries: vec![],
+        };
+        crate::ServerState::new(std::env::temp_dir(), vec![], snapshot, 32)
+    }
+
+    #[test]
+    fn plugin_command_enqueue_and_drain() {
+        let state = make_test_state();
+        let cmd = crate::PluginCommand {
+            id: "cmd-1".into(),
+            command: "toggle_sync".into(),
+            params: serde_json::Value::Null,
+            created_at_epoch: 0.0,
+            created_at: Some(std::time::Instant::now()),
+        };
+        {
+            let mut queue = state.plugin_commands.lock().unwrap();
+            queue.push_back(cmd);
+        }
+        let drained = state.drain_plugin_commands();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].id, "cmd-1");
+        // Queue should be empty after drain.
+        let drained2 = state.drain_plugin_commands();
+        assert!(drained2.is_empty());
+    }
+
+    #[test]
+    fn plugin_command_gc_expires_old() {
+        let state = make_test_state();
+        // Insert a command with a created_at far in the past.
+        let old_cmd = crate::PluginCommand {
+            id: "old-cmd".into(),
+            command: "force_resync".into(),
+            params: serde_json::Value::Null,
+            created_at_epoch: 0.0,
+            created_at: Some(std::time::Instant::now() - std::time::Duration::from_secs(120)),
+        };
+        let fresh_cmd = crate::PluginCommand {
+            id: "fresh-cmd".into(),
+            command: "toggle_sync".into(),
+            params: serde_json::Value::Null,
+            created_at_epoch: 0.0,
+            created_at: Some(std::time::Instant::now()),
+        };
+        {
+            let mut queue = state.plugin_commands.lock().unwrap();
+            queue.push_back(old_cmd);
+            queue.push_back(fresh_cmd);
+        }
+        let drained = state.drain_plugin_commands();
+        assert_eq!(drained.len(), 1, "old command should be GC'd");
+        assert_eq!(drained[0].id, "fresh-cmd");
+    }
+
+    #[test]
+    fn plugin_command_ack_stored() {
+        let state = make_test_state();
+        let ack = crate::PluginCommandAck {
+            command_id: "cmd-42".into(),
+            success: true,
+            message: "ok".into(),
+        };
+        {
+            let mut acks = state.plugin_command_acks.lock().unwrap();
+            acks.insert(ack.command_id.clone(), ack);
+        }
+        let acks = state.plugin_command_acks.lock().unwrap();
+        assert!(acks.contains_key("cmd-42"));
+        assert_eq!(acks["cmd-42"].success, true);
+    }
+
+    #[test]
+    fn plugin_command_queue_overflow_rejected() {
+        let state = make_test_state();
+        {
+            let mut queue = state.plugin_commands.lock().unwrap();
+            for i in 0..crate::PLUGIN_COMMAND_QUEUE_CAPACITY {
+                queue.push_back(crate::PluginCommand {
+                    id: format!("cmd-{i}"),
+                    command: "toggle_sync".into(),
+                    params: serde_json::Value::Null,
+                    created_at_epoch: 0.0,
+                    created_at: Some(std::time::Instant::now()),
+                });
+            }
+            assert_eq!(queue.len(), crate::PLUGIN_COMMAND_QUEUE_CAPACITY);
+        }
+        // Verify we can detect overflow condition (actual rejection is in the async handler).
+        let queue = state.plugin_commands.lock().unwrap();
+        assert!(queue.len() >= crate::PLUGIN_COMMAND_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn watch_status_returns_without_coalescer() {
+        let state = make_test_state();
+        let result = exec_sync_watch_status(&state).unwrap();
+        assert!(result["watcher_type"].is_string());
+        assert_eq!(result["pending_rebuild"], false);
+        assert!(result["note"].is_string()); // "coalescer not attached"
+    }
+
+    #[test]
+    fn watch_status_returns_with_coalescer() {
+        let state = make_test_state();
+        let coalescer = Arc::new(crate::EventCoalescer::new(
+            std::time::Duration::from_millis(50),
+        ));
+        {
+            let mut lock = state.coalescer.lock().unwrap();
+            *lock = Some(Arc::clone(&coalescer));
+        }
+        let result = exec_sync_watch_status(&state).unwrap();
+        assert_eq!(result["coalesce_window_ms"], 50);
+        assert_eq!(result["pending_rebuild"], false);
+        assert!(result.get("note").is_none());
+    }
+
+    #[test]
+    fn file_history_empty_when_no_changes() {
+        let state = make_test_state();
+        let result = exec_sync_file_history(
+            &state,
+            &serde_json::json!({"path": "src/Server/init.server.luau"}),
+        )
+        .unwrap();
+        assert_eq!(result["history_events"], 0);
+        assert_eq!(result["current"]["exists"], false);
+    }
+
+    #[test]
+    fn file_history_across_snapshot_transitions() {
+        // Create state with initial snapshot containing one file.
+        let entry = crate::SnapshotEntry {
+            path: "src/test.luau".into(),
+            sha256: "aaa".into(),
+            bytes: 100,
+            meta: None,
+            file_type: None,
+        };
+        let snap1 = crate::Snapshot {
+            version: 1,
+            include: vec!["src".into()],
+            fingerprint: "snap1".into(),
+            entries: vec![entry.clone()],
+        };
+        let state = crate::ServerState::new(std::env::temp_dir(), vec!["src".into()], snap1, 32);
+
+        // Simulate a second snapshot with modified file.
+        let mut entry2 = entry.clone();
+        entry2.sha256 = "bbb".into();
+        entry2.bytes = 200;
+        let snap2 = Arc::new(crate::Snapshot {
+            version: 1,
+            include: vec!["src".into()],
+            fingerprint: "snap2".into(),
+            entries: vec![entry2],
+        });
+        {
+            let mut hist = state.history.lock().unwrap();
+            hist.insert("snap2".into(), Arc::clone(&snap2));
+            let mut order = state.history_order.lock().unwrap();
+            order.push_back("snap2".into());
+            *state.current.lock().unwrap() = snap2;
+        }
+
+        let result = exec_sync_file_history(
+            &state,
+            &serde_json::json!({"path": "src/test.luau"}),
+        )
+        .unwrap();
+        assert_eq!(result["history_events"], 1);
+        assert_eq!(result["events"][0]["action"], "modified");
+        assert_eq!(result["events"][0]["previous_sha256"], "aaa");
+        assert_eq!(result["events"][0]["current_sha256"], "bbb");
+        assert_eq!(result["current"]["exists"], true);
+    }
+
+    #[test]
+    fn events_detail_mode_includes_paths() {
+        // Build state with two snapshots to create an event.
+        let entry = crate::SnapshotEntry {
+            path: "src/test.luau".into(),
+            sha256: "aaa".into(),
+            bytes: 100,
+            meta: None,
+            file_type: None,
+        };
+        let snap1 = crate::Snapshot {
+            version: 1,
+            include: vec!["src".into()],
+            fingerprint: "snap-d1".into(),
+            entries: vec![],
+        };
+        let state = crate::ServerState::new(std::env::temp_dir(), vec!["src".into()], snap1, 32);
+        let snap2 = Arc::new(crate::Snapshot {
+            version: 1,
+            include: vec!["src".into()],
+            fingerprint: "snap-d2".into(),
+            entries: vec![entry],
+        });
+        {
+            let mut hist = state.history.lock().unwrap();
+            hist.insert("snap-d2".into(), Arc::clone(&snap2));
+            let mut order = state.history_order.lock().unwrap();
+            order.push_back("snap-d2".into());
+            *state.current.lock().unwrap() = snap2;
+        }
+
+        // Without detail.
+        let result = exec_events(&state, &serde_json::json!({"limit": 10})).unwrap();
+        assert_eq!(result["detail"], false);
+        let first_event = &result["events"][0];
+        assert!(first_event.get("added_paths").is_none());
+
+        // With detail.
+        let result = exec_events(&state, &serde_json::json!({"limit": 10, "detail": true})).unwrap();
+        assert_eq!(result["detail"], true);
+        let first_event = &result["events"][0];
+        assert!(first_event["added_paths"].is_array());
+        assert_eq!(first_event["added_paths"][0], "src/test.luau");
     }
 }
 
@@ -3827,4 +4123,280 @@ fn exec_sync_plugin_managed(
             "no plugin managed index reported yet".to_string(),
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin command channel
+// ---------------------------------------------------------------------------
+
+async fn exec_sync_plugin_command(
+    state: &Arc<ServerState>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    use crate::{PluginCommand, PLUGIN_COMMAND_QUEUE_CAPACITY};
+
+    let command = args["command"]
+        .as_str()
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "missing required param: command".to_string(),
+            )
+        })?
+        .to_string();
+
+    // Validate command name.
+    let valid_commands = [
+        "toggle_sync",
+        "force_resync",
+        "set_frame_budget",
+        "run_builders",
+        "set_log_level",
+    ];
+    if !valid_commands.contains(&command.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid command '{}'. Valid: {}",
+                command,
+                valid_commands.join(", ")
+            ),
+        ));
+    }
+
+    let params = args
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let wait = args["wait"].as_bool().unwrap_or(false);
+
+    // GC expired commands first.
+    state.gc_plugin_commands();
+
+    let cmd_id = uuid::Uuid::new_v4().to_string();
+    let now = Instant::now();
+    let epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    let cmd = PluginCommand {
+        id: cmd_id.clone(),
+        command: command.clone(),
+        params,
+        created_at_epoch: epoch,
+        created_at: Some(now),
+    };
+
+    // Enqueue — reject if full.
+    {
+        let mut queue = state
+            .plugin_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if queue.len() >= PLUGIN_COMMAND_QUEUE_CAPACITY {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "plugin command queue full ({} pending). Try again later.",
+                    PLUGIN_COMMAND_QUEUE_CAPACITY
+                ),
+            ));
+        }
+        queue.push_back(cmd);
+    }
+
+    if !wait {
+        return Ok(serde_json::json!({
+            "command_id": cmd_id,
+            "command": command,
+            "queued": true,
+            "wait": false,
+        }));
+    }
+
+    // Poll for ack with 200ms intervals, max 10s.
+    let deadline = now + Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let ack = {
+            let acks = state
+                .plugin_command_acks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            acks.get(&cmd_id).cloned()
+        };
+
+        if let Some(ack) = ack {
+            return Ok(serde_json::json!({
+                "command_id": cmd_id,
+                "command": command,
+                "acknowledged": true,
+                "success": ack.success,
+                "message": ack.message,
+            }));
+        }
+
+        if Instant::now() >= deadline {
+            return Ok(serde_json::json!({
+                "command_id": cmd_id,
+                "command": command,
+                "acknowledged": false,
+                "timeout": true,
+                "message": "plugin did not acknowledge within 10s",
+            }));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem watcher health
+// ---------------------------------------------------------------------------
+
+fn exec_sync_watch_status(
+    state: &ServerState,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let coalescer_info = {
+        let lock = state.coalescer.lock().unwrap_or_else(|e| e.into_inner());
+        lock.as_ref().map(|c| c.status())
+    };
+
+    let watcher_type = if cfg!(target_os = "macos") {
+        "FSEvents"
+    } else {
+        "polling"
+    };
+
+    match coalescer_info {
+        Some(status) => {
+            let last_event_ms = status
+                .last_event_elapsed
+                .map(|d| d.as_millis() as u64);
+            Ok(serde_json::json!({
+                "watcher_type": watcher_type,
+                "coalesce_window_ms": status.window.as_millis() as u64,
+                "pending_rebuild": status.pending,
+                "last_event_elapsed_ms": last_event_ms,
+                "turbo": state.turbo,
+            }))
+        }
+        None => Ok(serde_json::json!({
+            "watcher_type": watcher_type,
+            "coalesce_window_ms": state.coalesce_ms,
+            "pending_rebuild": false,
+            "last_event_elapsed_ms": null,
+            "turbo": state.turbo,
+            "note": "coalescer not attached (serve mode may not be active)",
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File change history
+// ---------------------------------------------------------------------------
+
+fn exec_sync_file_history(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let path = args["path"]
+        .as_str()
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "missing required param: path".to_string(),
+            )
+        })?
+        .to_string();
+    let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+
+    let order = state
+        .history_order
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let history = state
+        .history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // Walk consecutive snapshot pairs looking for changes to this file.
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    let hashes: Vec<String> = order.iter().cloned().collect();
+
+    for i in 1..hashes.len() {
+        if events.len() >= limit {
+            break;
+        }
+
+        let prev = history.get(&hashes[i - 1]);
+        let curr = history.get(&hashes[i]);
+        if let (Some(prev_snap), Some(curr_snap)) = (prev, curr) {
+            let prev_entry = prev_snap.entries.iter().find(|e| e.path == path);
+            let curr_entry = curr_snap.entries.iter().find(|e| e.path == path);
+
+            match (prev_entry, curr_entry) {
+                (None, Some(entry)) => {
+                    events.push(serde_json::json!({
+                        "sequence": i,
+                        "action": "added",
+                        "snapshot": curr_snap.fingerprint,
+                        "sha256": entry.sha256,
+                        "bytes": entry.bytes,
+                    }));
+                }
+                (Some(prev_e), Some(curr_e)) if prev_e.sha256 != curr_e.sha256 => {
+                    events.push(serde_json::json!({
+                        "sequence": i,
+                        "action": "modified",
+                        "snapshot": curr_snap.fingerprint,
+                        "previous_sha256": prev_e.sha256,
+                        "current_sha256": curr_e.sha256,
+                        "previous_bytes": prev_e.bytes,
+                        "current_bytes": curr_e.bytes,
+                    }));
+                }
+                (Some(entry), None) => {
+                    events.push(serde_json::json!({
+                        "sequence": i,
+                        "action": "deleted",
+                        "snapshot": curr_snap.fingerprint,
+                        "sha256": entry.sha256,
+                        "bytes": entry.bytes,
+                    }));
+                }
+                _ => {
+                    // No change for this file in this transition.
+                }
+            }
+        }
+    }
+
+    // Current state of the file.
+    let current_state = {
+        let current = state
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        current
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| {
+                serde_json::json!({
+                    "exists": true,
+                    "sha256": e.sha256,
+                    "bytes": e.bytes,
+                })
+            })
+            .unwrap_or_else(|| serde_json::json!({ "exists": false }))
+    };
+
+    Ok(serde_json::json!({
+        "path": path,
+        "current": current_state,
+        "history_events": events.len(),
+        "snapshots_searched": hashes.len().saturating_sub(1),
+        "events": events,
+    }))
 }

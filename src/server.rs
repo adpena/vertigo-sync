@@ -178,6 +178,7 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/project", get(handle_project))
         .route("/plugin/state", get(handle_get_plugin_state).post(handle_post_plugin_state))
         .route("/plugin/managed", get(handle_get_plugin_managed).post(handle_post_plugin_managed))
+        .route("/plugin/command/ack", post(handle_plugin_command_ack))
         .route("/mcp/tools", get(handle_mcp_tools))
         .route("/mcp/execute", post(handle_mcp_execute))
         .with_state(state)
@@ -215,6 +216,12 @@ pub async fn run_serve(
     );
 
     let coalescer = Arc::new(EventCoalescer::new(Duration::from_millis(coalesce_ms)));
+
+    // Wire coalescer into state for observability (sync_watch_status tool).
+    {
+        let mut lock = state.coalescer.lock().unwrap_or_else(|e| e.into_inner());
+        *lock = Some(Arc::clone(&coalescer));
+    }
 
     // Background poller with coalescing.
     let poll_state = Arc::clone(&state);
@@ -274,12 +281,33 @@ async fn handle_health(
 // ---------------------------------------------------------------------------
 
 /// POST /plugin/state — plugin pushes its internal state periodically.
+/// Returns 200 with pending commands if any, or 204 if none (backward compatible).
 async fn handle_post_plugin_state(
     State(state): State<Arc<ServerState>>,
     Json(body): Json<serde_json::Value>,
-) -> StatusCode {
+) -> (StatusCode, axum::response::Response) {
     *state.plugin_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(body);
     *state.plugin_state_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+
+    let commands = state.drain_plugin_commands();
+    if commands.is_empty() {
+        (StatusCode::NO_CONTENT, axum::response::IntoResponse::into_response(StatusCode::NO_CONTENT))
+    } else {
+        let json_body = serde_json::json!({ "commands": commands });
+        (StatusCode::OK, axum::response::IntoResponse::into_response(Json(json_body)))
+    }
+}
+
+/// POST /plugin/command/ack — plugin acknowledges executed commands.
+async fn handle_plugin_command_ack(
+    State(state): State<Arc<ServerState>>,
+    Json(body): Json<crate::PluginCommandAck>,
+) -> StatusCode {
+    let mut acks = state
+        .plugin_command_acks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    acks.insert(body.command_id.clone(), body);
     StatusCode::NO_CONTENT
 }
 
