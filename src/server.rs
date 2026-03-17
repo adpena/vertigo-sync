@@ -36,7 +36,10 @@ use sha2::{Digest, Sha256};
 
 use crate::mcp::{handle_mcp_execute, handle_mcp_tools};
 use crate::serve_rbxl::{new_shared_rbxl_state, rbxl_router};
-use crate::{EventCoalescer, ServerState, Snapshot, SnapshotDiff, build_snapshot, diff_snapshots};
+use crate::{
+    EventCoalescer, GlobIgnoreSet, ServerState, Snapshot, SnapshotDiff, build_snapshot,
+    build_snapshot_with_ignores, diff_snapshots,
+};
 use std::sync::atomic::Ordering;
 
 /// Patch request accepted by POST /sync/patch.
@@ -171,6 +174,8 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/rewind", get(handle_rewind))
         .route("/model/{*path}", get(handle_model))
         .route("/config", get(handle_config))
+        .route("/sourcemap", get(handle_sourcemap))
+        .route("/project", get(handle_project))
         .route("/plugin/state", get(handle_get_plugin_state).post(handle_post_plugin_state))
         .route("/plugin/managed", get(handle_get_plugin_managed).post(handle_post_plugin_managed))
         .route("/mcp/tools", get(handle_mcp_tools))
@@ -190,10 +195,23 @@ pub async fn run_serve(
     channel_capacity: usize,
     coalesce_ms: u64,
     turbo: bool,
+    address: String,
 ) -> anyhow::Result<()> {
-    let snapshot = build_snapshot(&root, &includes)?;
-    let state = ServerState::with_config(
-        root, includes, snapshot, channel_capacity, turbo, coalesce_ms, false,
+    // Load glob ignore patterns from project file if available.
+    let project_path = root.join("default.project.json");
+    let glob_ignores = if project_path.is_file() {
+        if let Ok(tree) = crate::project::parse_project(&project_path) {
+            GlobIgnoreSet::new(&tree.glob_ignore_paths)
+        } else {
+            GlobIgnoreSet::empty()
+        }
+    } else {
+        GlobIgnoreSet::empty()
+    };
+
+    let snapshot = build_snapshot_with_ignores(&root, &includes, &glob_ignores)?;
+    let state = ServerState::with_full_config(
+        root, includes, snapshot, channel_capacity, turbo, coalesce_ms, false, glob_ignores,
     );
 
     let coalescer = Arc::new(EventCoalescer::new(Duration::from_millis(coalesce_ms)));
@@ -221,7 +239,10 @@ pub async fn run_serve(
 
     let app = build_router(state);
 
-    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let addr_str = format!("{address}:{port}");
+    let addr: std::net::SocketAddr = addr_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid serve address '{addr_str}': {e}"))?;
     eprintln!(
         "[vertigo-sync] serving on http://{addr} (coalesce={}ms, poll={}ms)",
         coalesce_ms,
@@ -1336,6 +1357,50 @@ async fn handle_config(
         "turbo": state.turbo,
         "coalesce_ms": state.coalesce_ms,
     }))
+}
+
+/// Generate a Rojo-compatible sourcemap for luau-lsp integration.
+async fn handle_sourcemap(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let include_non_scripts = params
+        .get("include_non_scripts")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(true);
+
+    let project_path = state.root.join("default.project.json");
+    let tree = match crate::project::parse_project(&project_path) {
+        Ok(t) => t,
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    let sourcemap =
+        match crate::sourcemap::generate_sourcemap(&state.root, &tree, include_non_scripts) {
+            Ok(s) => s,
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        };
+
+    match serde_json::to_value(&sourcemap) {
+        Ok(v) => Ok(Json(v)),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// Expose project-level properties and attributes for the plugin to apply.
+async fn handle_project(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let project_path = state.root.join("default.project.json");
+    let tree = match crate::project::parse_project(&project_path) {
+        Ok(t) => t,
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    match serde_json::to_value(&tree) {
+        Ok(v) => Ok(Json(v)),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 fn resolve_patch_target(source_root: &Path, raw_path: &str) -> anyhow::Result<PathBuf> {

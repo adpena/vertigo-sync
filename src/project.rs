@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -17,6 +17,23 @@ use std::path::Path;
 pub struct ProjectTree {
     pub name: String,
     pub mappings: Vec<PathMapping>,
+    /// Glob patterns for paths to exclude from the snapshot (Rojo-compatible).
+    #[serde(default)]
+    pub glob_ignore_paths: Vec<String>,
+    /// When `false`, all scripts emit as `Script` with `RunContext` instead of
+    /// `LocalScript` / `Script` based on filename suffix. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub emit_legacy_scripts: bool,
+    /// Optional serve port from project file (Rojo `servePort` parity).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub serve_port: Option<u16>,
+    /// Optional serve address from project file (Rojo `serveAddress` parity).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub serve_address: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A single filesystem path mapped to a Roblox DataModel instance path.
@@ -30,6 +47,12 @@ pub struct PathMapping {
     pub class_name: String,
     /// Whether unknown instances should be ignored during sync.
     pub ignore_unknown: bool,
+    /// `$properties` from the project tree node — applied to the instance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<BTreeMap<String, serde_json::Value>>,
+    /// `$attributes` from the project tree node — applied as instance attributes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -40,6 +63,20 @@ pub struct PathMapping {
 struct RawProject {
     name: String,
     tree: RawTreeNode,
+    /// Optional JSON Schema URL — ignored but must not create a phantom instance.
+    #[serde(rename = "$schema", default)]
+    #[allow(dead_code)]
+    schema: Option<String>,
+    #[serde(rename = "globIgnorePaths", default)]
+    glob_ignore_paths: Vec<String>,
+    #[serde(rename = "emitLegacyScripts", default = "default_true")]
+    emit_legacy_scripts: bool,
+    /// Optional serve port from project file (Rojo parity).
+    #[serde(rename = "servePort", default)]
+    pub serve_port: Option<u16>,
+    /// Optional serve address from project file (Rojo parity).
+    #[serde(rename = "serveAddress", default)]
+    pub serve_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +123,8 @@ fn parse_project_str(content: &str, source_path: &Path) -> Result<ProjectTree> {
             instance_path: raw.name.clone(),
             class_name: root_class.clone(),
             ignore_unknown: root_ignore,
+            properties: None,
+            attributes: None,
         });
     }
 
@@ -103,6 +142,10 @@ fn parse_project_str(content: &str, source_path: &Path) -> Result<ProjectTree> {
     Ok(ProjectTree {
         name: raw.name,
         mappings,
+        glob_ignore_paths: raw.glob_ignore_paths,
+        emit_legacy_scripts: raw.emit_legacy_scripts,
+        serve_port: raw.serve_port,
+        serve_address: raw.serve_address,
     })
 }
 
@@ -128,12 +171,26 @@ fn walk_tree_node(
         .and_then(|v| v.as_bool())
         .unwrap_or(parent_ignore);
 
+    // Extract $properties if present.
+    let properties = obj
+        .get("$properties")
+        .and_then(|v| v.as_object())
+        .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+
+    // Extract $attributes if present.
+    let attributes = obj
+        .get("$attributes")
+        .and_then(|v| v.as_object())
+        .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+
     if let Some(fs_path) = obj.get("$path").and_then(|v| v.as_str()) {
         mappings.push(PathMapping {
             fs_path: normalize_fs_path(fs_path),
             instance_path: instance_path.to_string(),
             class_name: class_name.clone(),
             ignore_unknown,
+            properties,
+            attributes,
         });
     }
 
@@ -165,13 +222,19 @@ fn walk_tree_node(
 /// - `.csv` -> "LocalizationTable"
 /// - `.rbxm` / `.rbxmx` -> "Model" (marker — actual instances come from manifest)
 /// - `.meta.json` -> skip (sidecar, not a standalone entry)
-pub fn resolve_instance_class(file_path: &str) -> &str {
+pub fn resolve_instance_class(file_path: &str) -> &'static str {
     let normalized = file_path.replace('\\', "/");
     let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
 
     // Skip .meta.json sidecars — they are not standalone instances.
     if file_name.ends_with(".meta.json") {
         return "Skip";
+    }
+
+    // .model.json files define instance trees — treat as ModuleScript for
+    // classification purposes (actual class comes from the JSON content).
+    if file_name.ends_with(".model.json") {
+        return "ModuleScript";
     }
 
     match file_name {
@@ -185,6 +248,10 @@ pub fn resolve_instance_class(file_path: &str) -> &str {
             } else if file_name.ends_with(".luau") || file_name.ends_with(".lua") {
                 "ModuleScript"
             } else if file_name.ends_with(".json") {
+                "ModuleScript"
+            } else if file_name.ends_with(".yaml") || file_name.ends_with(".yml") {
+                "ModuleScript"
+            } else if file_name.ends_with(".toml") {
                 "ModuleScript"
             } else if file_name.ends_with(".txt") {
                 "StringValue"
@@ -201,6 +268,107 @@ pub fn resolve_instance_class(file_path: &str) -> &str {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// emitLegacyScripts support
+// ---------------------------------------------------------------------------
+
+/// The RunContext property value for scripts when `emitLegacyScripts` is false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunContext {
+    Server,
+    Client,
+}
+
+/// Resolved instance class with optional RunContext for non-legacy script mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedClass {
+    pub class_name: &'static str,
+    pub run_context: Option<RunContext>,
+}
+
+/// Like `resolve_instance_class`, but when `emit_legacy_scripts` is false,
+/// both server and client scripts are emitted as `"Script"` with a `RunContext`.
+/// Module scripts remain `"ModuleScript"` in all modes.
+pub fn resolve_instance_class_with_context(
+    file_path: &str,
+    emit_legacy_scripts: bool,
+) -> ResolvedClass {
+    let base = resolve_instance_class(file_path);
+
+    if emit_legacy_scripts || base == "ModuleScript" || base == "Skip" || base == "Folder" {
+        return ResolvedClass {
+            class_name: base,
+            run_context: None,
+        };
+    }
+
+    let normalized = file_path.replace('\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+
+    if file_name.ends_with(".server.luau")
+        || file_name.ends_with(".server.lua")
+        || file_name == "init.server.luau"
+        || file_name == "init.server.lua"
+    {
+        ResolvedClass {
+            class_name: "Script",
+            run_context: Some(RunContext::Server),
+        }
+    } else if file_name.ends_with(".client.luau")
+        || file_name.ends_with(".client.lua")
+        || file_name == "init.client.luau"
+        || file_name == "init.client.lua"
+    {
+        ResolvedClass {
+            class_name: "Script",
+            run_context: Some(RunContext::Client),
+        }
+    } else {
+        ResolvedClass {
+            class_name: base,
+            run_context: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Nested project inclusion
+// ---------------------------------------------------------------------------
+
+/// Discover nested `default.project.json` files within a directory and parse
+/// them as sub-projects.
+pub fn discover_nested_projects(
+    base_dir: &Path,
+    parent_ignore_unknown: bool,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<Vec<ProjectTree>> {
+    let canonical = base_dir
+        .canonicalize()
+        .unwrap_or_else(|_| base_dir.to_path_buf());
+
+    if !visited.insert(canonical.clone()) {
+        anyhow::bail!(
+            "circular nested project reference detected at {}",
+            base_dir.display()
+        );
+    }
+
+    let project_file = base_dir.join("default.project.json");
+    if !project_file.is_file() {
+        return Ok(Vec::new());
+    }
+
+    let mut tree = parse_project(&project_file)?;
+
+    for mapping in &mut tree.mappings {
+        if !mapping.ignore_unknown {
+            mapping.ignore_unknown = parent_ignore_unknown;
+        }
+    }
+
+    Ok(vec![tree])
 }
 
 // ---------------------------------------------------------------------------
@@ -355,5 +523,217 @@ mod tests {
                 mapping.fs_path
             );
         }
+    }
+
+    // P0: $properties/$attributes
+    #[test]
+    fn parse_project_extracts_properties_and_attributes() {
+        let json = r#"{
+            "name": "test",
+            "tree": {
+                "$className": "DataModel",
+                "Lighting": {
+                    "$className": "Lighting",
+                    "$properties": {
+                        "Ambient": [0.3, 0.3, 0.3],
+                        "Brightness": 2.0,
+                        "ClockTime": 14.5
+                    },
+                    "$attributes": {
+                        "ZoneName": "overworld",
+                        "FogEnabled": true
+                    },
+                    "$path": "src/Lighting"
+                }
+            }
+        }"#;
+        let tree = parse_project_str(json, &PathBuf::from("test.project.json")).unwrap();
+        let lighting = tree.mappings.iter().find(|m| m.instance_path == "Lighting").expect("lighting mapping");
+        let props = lighting.properties.as_ref().expect("should have properties");
+        assert!(props.contains_key("Brightness"));
+        assert_eq!(props["Brightness"], serde_json::json!(2.0));
+        let attrs = lighting.attributes.as_ref().expect("should have attributes");
+        assert!(attrs.contains_key("ZoneName"));
+        assert_eq!(attrs["ZoneName"], serde_json::json!("overworld"));
+    }
+
+    #[test]
+    fn parse_project_no_properties_returns_none() {
+        let tree = parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
+        let server = tree.mappings.iter().find(|m| m.fs_path == "src/Server").expect("server mapping");
+        assert!(server.properties.is_none());
+        assert!(server.attributes.is_none());
+    }
+
+    #[test]
+    fn resolve_instance_class_model_json() {
+        assert_eq!(resolve_instance_class("src/Net/Remotes.model.json"), "ModuleScript");
+    }
+
+    // P1-A: globIgnorePaths
+    #[test]
+    fn glob_ignore_paths_parsed() {
+        let json = r#"{
+            "name": "test",
+            "globIgnorePaths": ["**/*.spec.luau", "src/vendor/**"],
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "$className": "ServerScriptService",
+                    "Server": { "$path": "src/Server" }
+                }
+            }
+        }"#;
+        let tree = parse_project_str(json, &PathBuf::from("test.project.json")).unwrap();
+        assert_eq!(tree.glob_ignore_paths, vec!["**/*.spec.luau", "src/vendor/**"]);
+    }
+
+    #[test]
+    fn glob_ignore_paths_defaults_empty() {
+        let tree = parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
+        assert!(tree.glob_ignore_paths.is_empty());
+    }
+
+    // P1-A: emitLegacyScripts
+    #[test]
+    fn emit_legacy_scripts_defaults_true() {
+        let tree = parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
+        assert!(tree.emit_legacy_scripts);
+    }
+
+    #[test]
+    fn emit_legacy_scripts_false_parsed() {
+        let json = r#"{
+            "name": "test",
+            "emitLegacyScripts": false,
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "$className": "ServerScriptService",
+                    "Server": { "$path": "src/Server" }
+                }
+            }
+        }"#;
+        let tree = parse_project_str(json, &PathBuf::from("test.project.json")).unwrap();
+        assert!(!tree.emit_legacy_scripts);
+    }
+
+    #[test]
+    fn resolve_class_with_context_legacy_mode() {
+        let r = resolve_instance_class_with_context("foo.server.luau", true);
+        assert_eq!(r.class_name, "Script");
+        assert_eq!(r.run_context, None);
+        let r = resolve_instance_class_with_context("bar.client.luau", true);
+        assert_eq!(r.class_name, "LocalScript");
+        assert_eq!(r.run_context, None);
+    }
+
+    #[test]
+    fn resolve_class_with_context_non_legacy_mode() {
+        let r = resolve_instance_class_with_context("foo.server.luau", false);
+        assert_eq!(r.class_name, "Script");
+        assert_eq!(r.run_context, Some(RunContext::Server));
+        let r = resolve_instance_class_with_context("bar.client.luau", false);
+        assert_eq!(r.class_name, "Script");
+        assert_eq!(r.run_context, Some(RunContext::Client));
+        let r = resolve_instance_class_with_context("baz.luau", false);
+        assert_eq!(r.class_name, "ModuleScript");
+        assert_eq!(r.run_context, None);
+    }
+
+    #[test]
+    fn resolve_instance_class_toml_files() {
+        assert_eq!(resolve_instance_class("src/config.toml"), "ModuleScript");
+    }
+
+    // P2: yaml/yml
+    #[test]
+    fn resolve_instance_class_yaml_files() {
+        assert_eq!(resolve_instance_class("src/config.yaml"), "ModuleScript");
+        assert_eq!(resolve_instance_class("src/config.yml"), "ModuleScript");
+    }
+
+    // P2: $schema
+    #[test]
+    fn schema_field_does_not_create_phantom_instance() {
+        let json = r#"{
+            "$schema": "https://raw.githubusercontent.com/rojo-rbx/vscode-rojo/main/schemas/project.json",
+            "name": "test-schema",
+            "tree": {
+                "$className": "DataModel",
+                "ReplicatedStorage": {
+                    "$className": "ReplicatedStorage",
+                    "Shared": { "$path": "src/Shared" }
+                }
+            }
+        }"#;
+        let tree = parse_project_str(json, &PathBuf::from("schema.project.json")).unwrap();
+        assert_eq!(tree.name, "test-schema");
+        assert_eq!(tree.mappings.len(), 1);
+        assert_eq!(tree.mappings[0].fs_path, "src/Shared");
+    }
+
+    // P2: servePort/Address
+    #[test]
+    fn serve_port_and_address_from_project() {
+        let json = r#"{
+            "name": "test-serve",
+            "servePort": 8080,
+            "serveAddress": "0.0.0.0",
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "Server": { "$path": "src/Server" }
+                }
+            }
+        }"#;
+        let tree = parse_project_str(json, &PathBuf::from("serve.project.json")).unwrap();
+        assert_eq!(tree.serve_port, Some(8080));
+        assert_eq!(tree.serve_address, Some("0.0.0.0".to_string()));
+    }
+
+    #[test]
+    fn serve_port_absent_returns_none() {
+        let tree = parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
+        assert_eq!(tree.serve_port, None);
+        assert_eq!(tree.serve_address, None);
+    }
+
+    // P1-A: nested projects
+    #[test]
+    fn discover_nested_project_basic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("Packages/Signal");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        std::fs::write(
+            sub.join("default.project.json"),
+            r#"{"name":"Signal","tree":{"$className":"ModuleScript","$path":"src"}}"#,
+        ).expect("write");
+        std::fs::create_dir_all(sub.join("src")).expect("mkdir src");
+        std::fs::write(sub.join("src/init.luau"), "return {}").expect("write init");
+
+        let mut visited = std::collections::HashSet::new();
+        let trees = discover_nested_projects(&sub, true, &mut visited).unwrap();
+        assert_eq!(trees.len(), 1);
+        assert_eq!(trees[0].name, "Signal");
+        for m in &trees[0].mappings {
+            assert!(m.ignore_unknown);
+        }
+    }
+
+    #[test]
+    fn discover_nested_project_circular_detection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("pkg");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        std::fs::write(
+            sub.join("default.project.json"),
+            r#"{"name":"loop","tree":{"$className":"Folder"}}"#,
+        ).expect("write");
+
+        let mut visited = std::collections::HashSet::new();
+        let _ = discover_nested_projects(&sub, false, &mut visited).unwrap();
+        let result = discover_nested_projects(&sub, false, &mut visited);
+        assert!(result.is_err());
     }
 }

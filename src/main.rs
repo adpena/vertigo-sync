@@ -84,8 +84,11 @@ struct Cli {
     )]
     interval_seconds: u64,
 
-    #[arg(long, default_value_t = 7575, help = "HTTP port used by serve mode")]
-    port: u16,
+    #[arg(long, help = "HTTP port used by serve mode (default: 7575, or servePort from project)")]
+    port: Option<u16>,
+
+    #[arg(long, help = "HTTP bind address used by serve mode (default: 127.0.0.1, or serveAddress from project)")]
+    address: Option<String>,
 
     #[arg(
         long,
@@ -158,6 +161,39 @@ enum Command {
         #[arg(long, default_value_t = false)]
         binary_models: bool,
     },
+    /// Extract scripts from a place file back to the filesystem (rojo syncback equivalent).
+    #[command(display_order = 31)]
+    Syncback {
+        /// Input .rbxl or .rbxlx file.
+        #[arg(long, short)]
+        input: PathBuf,
+        /// Project file for path mapping.
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
+        /// Dry run — show what would be written without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Generate a Rojo-compatible sourcemap.json for luau-lsp integration.
+    ///
+    /// Produces a tree-structured JSON file that luau-lsp uses for
+    /// require resolution, type checking, and autocomplete across the
+    /// entire DataModel — without Rojo running.
+    #[command(display_order = 32)]
+    Sourcemap {
+        /// Output path (default: sourcemap.json).
+        #[arg(long, short, default_value = "sourcemap.json")]
+        output: PathBuf,
+        /// Project file path.
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
+        /// Include non-script instances (Folders, StringValues, etc.) in the sourcemap.
+        #[arg(long, default_value_t = true)]
+        include_non_scripts: bool,
+        /// Watch for filesystem changes and regenerate automatically.
+        #[arg(long, default_value_t = false)]
+        watch: bool,
+    },
     /// Create a new Vertigo Sync project with standard directory structure.
     #[command(display_order = 40)]
     Init {
@@ -190,6 +226,19 @@ async fn main() -> Result<()> {
             project,
             binary_models,
         } => command_build(&root, output, project, *binary_models),
+        Command::Syncback {
+            input,
+            project,
+            dry_run,
+        } => command_syncback(&root, input, project, *dry_run),
+        Command::Sourcemap {
+            output,
+            project,
+            include_non_scripts,
+            watch,
+        } => {
+            command_sourcemap(&root, output, project, *include_non_scripts, *watch, &cli).await
+        }
         Command::Init { name } => command_init(&root, name.as_deref()),
         Command::PluginInstall => command_plugin_install(),
         Command::Serve => {
@@ -203,10 +252,31 @@ async fn main() -> Result<()> {
                 )
             };
 
+            // Resolve port and address: CLI flags > project file > defaults.
+            let project_path = root.join("default.project.json");
+            let project_tree = if project_path.is_file() {
+                parse_project(&project_path).ok()
+            } else {
+                None
+            };
+            let port = cli
+                .port
+                .or_else(|| project_tree.as_ref().and_then(|t| t.serve_port))
+                .unwrap_or(7575);
+            let address = cli
+                .address
+                .clone()
+                .or_else(|| {
+                    project_tree
+                        .as_ref()
+                        .and_then(|t| t.serve_address.clone())
+                })
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+
             let mode = if cli.turbo { "turbo (10ms coalesce)" } else { "standard" };
             let version = env!("CARGO_PKG_VERSION");
-            let http_addr = format!("http://127.0.0.1:{}", cli.port);
-            let ws_addr = format!("ws://127.0.0.1:{}/ws", cli.port);
+            let http_addr = format!("http://{address}:{port}");
+            let ws_addr = format!("ws://{address}:{port}/ws");
             let watching = includes.join(", ");
 
             output::banner(version, &[
@@ -219,11 +289,12 @@ async fn main() -> Result<()> {
             run_serve(
                 root,
                 includes,
-                cli.port,
+                port,
                 interval,
                 cli.channel_capacity,
                 coalesce_ms,
                 cli.turbo,
+                address,
             )
             .await
         }
@@ -823,8 +894,367 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
 }
 
 // ---------------------------------------------------------------------------
+// Syncback command
+// ---------------------------------------------------------------------------
+
+fn command_syncback(
+    root: &Path,
+    input: &Path,
+    project: &Path,
+    dry_run: bool,
+) -> Result<()> {
+    use rbx_dom_weak::WeakDom;
+
+    let input_path = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        root.join(input)
+    };
+
+    let project_path = if project.is_absolute() {
+        project.to_path_buf()
+    } else {
+        root.join(project)
+    };
+
+    if !input_path.exists() {
+        bail!("input file does not exist: {}", input_path.display());
+    }
+
+    let tree = parse_project(&project_path)?;
+
+    output::header("Syncback");
+    output::kv("Input", &input_path.display().to_string());
+    output::kv("Project", &project_path.display().to_string());
+    if dry_run {
+        output::kv("Mode", "dry-run");
+    }
+
+    // Parse place file.
+    let file = std::fs::File::open(&input_path)
+        .with_context(|| format!("failed to open {}", input_path.display()))?;
+    let reader = std::io::BufReader::new(file);
+
+    let ext = input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("rbxl");
+
+    let dom: WeakDom = match ext {
+        "rbxlx" => {
+            rbx_xml::from_reader_default(reader).context("failed to parse .rbxlx place file")?
+        }
+        _ => rbx_binary::from_reader(reader).context("failed to parse .rbxl place file")?,
+    };
+
+    // Build reverse mapping: DataModel instance path -> filesystem path.
+    let mut instance_to_fs: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for mapping in &tree.mappings {
+        instance_to_fs.insert(mapping.instance_path.clone(), mapping.fs_path.clone());
+    }
+
+    // Walk the DOM and extract scripts.
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+
+    syncback_walk(
+        &dom,
+        dom.root_ref(),
+        "",
+        &instance_to_fs,
+        root,
+        dry_run,
+        &mut written,
+        &mut skipped,
+    )?;
+
+    eprintln!();
+    if dry_run {
+        output::success(&format!(
+            "Dry run complete: {written} files would be written, {skipped} skipped"
+        ));
+    } else {
+        output::success(&format!(
+            "Syncback complete: {written} files written, {skipped} skipped"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Recursively walk DOM instances and extract script sources to the filesystem.
+fn syncback_walk(
+    dom: &rbx_dom_weak::WeakDom,
+    inst_ref: rbx_dom_weak::types::Ref,
+    parent_dm_path: &str,
+    instance_to_fs: &std::collections::HashMap<String, String>,
+    root: &Path,
+    dry_run: bool,
+    written: &mut usize,
+    skipped: &mut usize,
+) -> Result<()> {
+    let Some(inst) = dom.get_by_ref(inst_ref) else {
+        return Ok(());
+    };
+
+    let dm_path = if parent_dm_path.is_empty() {
+        inst.name.clone()
+    } else if inst.name.is_empty() {
+        parent_dm_path.to_string()
+    } else {
+        format!("{parent_dm_path}.{}", inst.name)
+    };
+
+    // Check if this instance is a script with source.
+    let is_script = matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript");
+
+    if is_script {
+        let source_key: rbx_dom_weak::Ustr = "Source".into();
+        if let Some(rbx_dom_weak::types::Variant::String(source)) = inst.properties.get(&source_key) {
+            // Try to find the best filesystem mapping for this instance.
+            if let Some(fs_path) = resolve_syncback_path(&dm_path, instance_to_fs, inst, dom) {
+                let full_path = root.join(&fs_path);
+                if dry_run {
+                    output::kv("  [dry-run]", &fs_path);
+                } else {
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent).with_context(|| {
+                            format!("failed to create directory {}", parent.display())
+                        })?;
+                    }
+                    std::fs::write(&full_path, source).with_context(|| {
+                        format!("failed to write {}", full_path.display())
+                    })?;
+                    output::kv("  wrote", &fs_path);
+                }
+                *written += 1;
+            } else {
+                *skipped += 1;
+            }
+        }
+    }
+
+    // Recurse into children.
+    for &child_ref in inst.children() {
+        syncback_walk(
+            dom,
+            child_ref,
+            &dm_path,
+            instance_to_fs,
+            root,
+            dry_run,
+            written,
+            skipped,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Resolve the filesystem path for a script instance during syncback.
+///
+/// Finds the longest matching prefix in the instance-to-filesystem mapping,
+/// then appends the remaining path segments with the appropriate file extension.
+fn resolve_syncback_path(
+    dm_path: &str,
+    instance_to_fs: &std::collections::HashMap<String, String>,
+    inst: &rbx_dom_weak::Instance,
+    _dom: &rbx_dom_weak::WeakDom,
+) -> Option<String> {
+    // Find the longest matching prefix.
+    let mut best_prefix = "";
+    let mut best_fs = "";
+    for (inst_path, fs_path) in instance_to_fs {
+        if dm_path.starts_with(inst_path.as_str())
+            && inst_path.len() > best_prefix.len()
+            && (dm_path.len() == inst_path.len()
+                || dm_path.as_bytes().get(inst_path.len()) == Some(&b'.'))
+        {
+            best_prefix = inst_path;
+            best_fs = fs_path;
+        }
+    }
+
+    if best_fs.is_empty() {
+        return None;
+    }
+
+    let suffix = if dm_path.len() > best_prefix.len() {
+        &dm_path[best_prefix.len() + 1..] // skip the '.'
+    } else {
+        ""
+    };
+
+    let ext = match inst.class.as_str() {
+        "Script" => ".server.luau",
+        "LocalScript" => ".client.luau",
+        _ => ".luau",
+    };
+
+    // Check if this script is the "init" script for its parent (direct child of a mapped node).
+    let is_init = if suffix.is_empty() {
+        true
+    } else if !suffix.contains('.') {
+        // Single segment — check if this is a directory with children.
+        !inst.children().is_empty()
+    } else {
+        false
+    };
+
+    if is_init && suffix.is_empty() {
+        // Root-level init script for the mapped directory.
+        let init_name = match inst.class.as_str() {
+            "Script" => "init.server.luau",
+            "LocalScript" => "init.client.luau",
+            _ => "init.luau",
+        };
+        Some(format!("{best_fs}/{init_name}"))
+    } else if is_init {
+        // Init script for a subdirectory.
+        let dir_path = suffix.replace('.', "/");
+        let init_name = match inst.class.as_str() {
+            "Script" => "init.server.luau",
+            "LocalScript" => "init.client.luau",
+            _ => "init.luau",
+        };
+        Some(format!("{best_fs}/{dir_path}/{init_name}"))
+    } else {
+        // Regular script file.
+        let segments: Vec<&str> = suffix.split('.').collect();
+        if segments.len() == 1 {
+            Some(format!("{best_fs}/{}{ext}", segments[0]))
+        } else {
+            let dir_part = segments[..segments.len() - 1].join("/");
+            let file_name = segments[segments.len() - 1];
+            Some(format!("{best_fs}/{dir_part}/{file_name}{ext}"))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Init command
 // ---------------------------------------------------------------------------
+
+async fn command_sourcemap(
+    root: &Path,
+    output: &Path,
+    project: &Path,
+    include_non_scripts: bool,
+    watch: bool,
+    cli: &Cli,
+) -> Result<()> {
+    use vertigo_sync::sourcemap::generate_sourcemap;
+
+    let project_path = if project.is_absolute() {
+        project.to_path_buf()
+    } else {
+        root.join(project)
+    };
+
+    let output_path = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        root.join(output)
+    };
+
+    let tree = parse_project(&project_path)?;
+
+    let write_sourcemap = |tree: &vertigo_sync::project::ProjectTree| -> Result<()> {
+        let sourcemap = generate_sourcemap(root, tree, include_non_scripts)?;
+        let json = serde_json::to_string_pretty(&sourcemap)
+            .context("failed to serialize sourcemap")?;
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&output_path, json.as_bytes())
+            .with_context(|| format!("failed to write sourcemap to {}", output_path.display()))?;
+        Ok(())
+    };
+
+    write_sourcemap(&tree)?;
+
+    if cli.json {
+        let sourcemap = generate_sourcemap(root, &tree, include_non_scripts)?;
+        println!("{}", serde_json::to_string(&sourcemap)?);
+    } else {
+        output::success("Sourcemap generated");
+        output::kv("Output", &output_path.display().to_string());
+        output::kv("Project", &project_path.display().to_string());
+    }
+
+    if watch {
+        if !cli.json {
+            output::info("Watching for changes (Ctrl+C to stop)...");
+        }
+
+        let includes = resolve_effective_includes(root, &cli.include);
+
+        use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event};
+        use std::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+        let mut watcher = RecommendedWatcher::new(tx, Config::default())
+            .context("failed to create filesystem watcher")?;
+
+        for inc in &includes {
+            let watch_path = root.join(inc);
+            if watch_path.exists() {
+                watcher
+                    .watch(&watch_path, RecursiveMode::Recursive)
+                    .with_context(|| format!("failed to watch {}", watch_path.display()))?;
+            }
+        }
+
+        watcher
+            .watch(&project_path, RecursiveMode::NonRecursive)
+            .with_context(|| format!("failed to watch project file {}", project_path.display()))?;
+
+        let coalesce_window = Duration::from_millis(100);
+        loop {
+            match rx.recv() {
+                Ok(Ok(_event)) => {}
+                Ok(Err(e)) => {
+                    output::warn(&format!("watch error: {e}"));
+                    continue;
+                }
+                Err(_) => break,
+            }
+
+            let deadline = std::time::Instant::now() + coalesce_window;
+            while std::time::Instant::now() < deadline {
+                match rx.recv_timeout(
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                ) {
+                    Ok(_) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            let new_tree = match parse_project(&project_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    output::warn(&format!("project parse error: {e}"));
+                    continue;
+                }
+            };
+
+            match write_sourcemap(&new_tree) {
+                Ok(()) => {
+                    if !cli.json {
+                        output::success("Sourcemap regenerated");
+                    }
+                }
+                Err(e) => {
+                    output::warn(&format!("sourcemap generation error: {e}"));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
 
 fn command_init(root: &Path, name: Option<&str>) -> Result<()> {
     let project_name = name
@@ -1108,8 +1538,13 @@ fn populate_from_dir(
 
                     dom.insert(parent_ref, builder);
                 }
-                "json" => {
-                    let instance_name = name_str.strip_suffix(".json").unwrap_or(&name_str);
+                "json" | "yaml" | "yml" | "toml" => {
+                    let instance_name = name_str
+                        .strip_suffix(".json")
+                        .or_else(|| name_str.strip_suffix(".yaml"))
+                        .or_else(|| name_str.strip_suffix(".yml"))
+                        .or_else(|| name_str.strip_suffix(".toml"))
+                        .unwrap_or(&name_str);
                     let mut builder =
                         rbx_dom_weak::InstanceBuilder::new("ModuleScript").with_name(instance_name);
                     if let Ok(content) = std::fs::read_to_string(&path) {
@@ -1345,7 +1780,7 @@ fn default_event_output_path(state_dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_container_class, resolve_instance_name};
+    use super::{populate_from_dir, resolve_container_class, resolve_instance_name, resolve_syncback_path};
     use std::fs;
 
     #[test]
@@ -1371,5 +1806,75 @@ mod tests {
         let folder_dir = temp.path().join("PlainFolder");
         fs::create_dir_all(&folder_dir).expect("create folder dir");
         assert_eq!(resolve_container_class(&folder_dir), "Folder");
+    }
+
+    #[test]
+    fn populate_from_dir_handles_yaml_and_toml() {
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let src = temp.path().join("src");
+        fs::create_dir_all(&src).expect("create src dir");
+        fs::write(src.join("config.yaml"), "key: value").expect("write yaml");
+        fs::write(src.join("data.yml"), "items:\n  - a").expect("write yml");
+        fs::write(src.join("settings.toml"), "[section]\nkey = true").expect("write toml");
+
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root_ref = dom.root_ref();
+        let parent_ref = dom.insert(root_ref, InstanceBuilder::new("Folder").with_name("Test"));
+
+        populate_from_dir(&mut dom, parent_ref, &src, temp.path()).expect("populate");
+
+        let parent = dom.get_by_ref(parent_ref).unwrap();
+        let child_names: Vec<String> = parent
+            .children()
+            .iter()
+            .filter_map(|&r| dom.get_by_ref(r).map(|i| i.name.clone()))
+            .collect();
+
+        assert!(child_names.contains(&"config".to_string()), "yaml file not found: {child_names:?}");
+        assert!(child_names.contains(&"data".to_string()), "yml file not found: {child_names:?}");
+        assert!(child_names.contains(&"settings".to_string()), "toml file not found: {child_names:?}");
+
+        // Verify they are all ModuleScripts with Source property.
+        let source_key: rbx_dom_weak::Ustr = "Source".into();
+        for &child_ref in parent.children() {
+            let child = dom.get_by_ref(child_ref).unwrap();
+            assert_eq!(child.class, "ModuleScript", "wrong class for {}", child.name);
+            assert!(
+                child.properties.contains_key(&source_key),
+                "missing Source for {}",
+                child.name
+            );
+        }
+    }
+
+    #[test]
+    fn syncback_resolve_path_basic() {
+        let mut instance_to_fs = std::collections::HashMap::new();
+        instance_to_fs.insert(
+            "ServerScriptService.Server".to_string(),
+            "src/Server".to_string(),
+        );
+
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root_ref = dom.root_ref();
+        let script_ref = dom.insert(
+            root_ref,
+            InstanceBuilder::new("ModuleScript").with_name("DataService"),
+        );
+
+        let inst = dom.get_by_ref(script_ref).unwrap();
+        let result = resolve_syncback_path(
+            "ServerScriptService.Server.Services.DataService",
+            &instance_to_fs,
+            inst,
+            &dom,
+        );
+        assert_eq!(
+            result,
+            Some("src/Server/Services/DataService.luau".to_string())
+        );
     }
 }

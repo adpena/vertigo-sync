@@ -19,6 +19,7 @@ pub mod project;
 pub mod rbxl;
 pub mod serve_rbxl;
 pub mod server;
+pub mod sourcemap;
 pub mod validate;
 
 // ---------------------------------------------------------------------------
@@ -172,6 +173,63 @@ impl Default for Metrics {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Glob ignore pattern matching
+// ---------------------------------------------------------------------------
+
+/// Pre-compiled set of glob patterns used to exclude paths during directory
+/// traversal. Compiles once, matches O(1) per path via `globset`-style
+/// sequential matching (using the `glob` crate's `Pattern`).
+pub struct GlobIgnoreSet {
+    patterns: Vec<glob::Pattern>,
+}
+
+impl GlobIgnoreSet {
+    /// Compile a set of glob pattern strings. Invalid patterns are silently
+    /// skipped (logged to stderr).
+    pub fn new(patterns: &[String]) -> Self {
+        let compiled: Vec<glob::Pattern> = patterns
+            .iter()
+            .filter_map(|p| {
+                glob::Pattern::new(p)
+                    .map_err(|e| {
+                        eprintln!("[vertigo-sync] invalid glob pattern '{}': {}", p, e);
+                        e
+                    })
+                    .ok()
+            })
+            .collect();
+        Self { patterns: compiled }
+    }
+
+    /// Returns an empty set that matches nothing.
+    pub fn empty() -> Self {
+        Self {
+            patterns: Vec::new(),
+        }
+    }
+
+    /// Test whether a relative path matches any of the ignore patterns.
+    #[inline]
+    pub fn is_ignored(&self, relative_path: &str) -> bool {
+        self.patterns.iter().any(|p| p.matches(relative_path))
+    }
+
+    /// Test whether a directory path (or any child) could match any pattern.
+    #[inline]
+    pub fn could_match_under(&self, dir_prefix: &str) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let _ = dir_prefix;
+        true
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+}
+
 pub const DEFAULT_INCLUDES: &[&str] = &["src", "studio-plugin", "scripts/dev"];
 const SKIP_DIR_NAMES: &[&str] = &[
     ".git",
@@ -305,6 +363,9 @@ pub struct ModifiedEntry {
     pub previous_bytes: u64,
     pub current_sha256: String,
     pub current_bytes: u64,
+    /// File type hint propagated from the current snapshot entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -426,6 +487,15 @@ pub fn resolve_includes(includes: &[String]) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 pub fn build_snapshot(root: &Path, includes: &[String]) -> Result<Snapshot> {
+    build_snapshot_with_ignores(root, includes, &GlobIgnoreSet::empty())
+}
+
+/// Build a snapshot with glob-based path exclusions applied during traversal.
+pub fn build_snapshot_with_ignores(
+    root: &Path,
+    includes: &[String],
+    ignores: &GlobIgnoreSet,
+) -> Result<Snapshot> {
     let resolved_includes = resolve_includes(includes);
     let mut files = Vec::new();
 
@@ -434,7 +504,7 @@ pub fn build_snapshot(root: &Path, includes: &[String]) -> Result<Snapshot> {
         if !include_path.exists() {
             continue;
         }
-        collect_files(root, &include_path, &mut files)?;
+        collect_files(root, &include_path, &mut files, ignores)?;
     }
 
     files.sort_by_key(|a| normalize_path(a));
@@ -484,7 +554,7 @@ pub fn build_snapshot_cached(
     includes: &[String],
     cache: &mut SnapshotCache,
 ) -> Result<Snapshot> {
-    build_snapshot_cached_inner(root, includes, cache, None)
+    build_snapshot_cached_inner(root, includes, cache, None, &GlobIgnoreSet::empty())
 }
 
 /// Like `build_snapshot_cached` but also records cache hit/miss counts
@@ -495,7 +565,18 @@ pub fn build_snapshot_cached_with_metrics(
     cache: &mut SnapshotCache,
     metrics: &Metrics,
 ) -> Result<Snapshot> {
-    build_snapshot_cached_inner(root, includes, cache, Some(metrics))
+    build_snapshot_cached_inner(root, includes, cache, Some(metrics), &GlobIgnoreSet::empty())
+}
+
+/// Cached snapshot build with glob ignore patterns.
+pub fn build_snapshot_cached_with_ignores(
+    root: &Path,
+    includes: &[String],
+    cache: &mut SnapshotCache,
+    metrics: &Metrics,
+    ignores: &GlobIgnoreSet,
+) -> Result<Snapshot> {
+    build_snapshot_cached_inner(root, includes, cache, Some(metrics), ignores)
 }
 
 /// Shared implementation for cached snapshot builds. When `metrics` is
@@ -505,6 +586,7 @@ fn build_snapshot_cached_inner(
     includes: &[String],
     cache: &mut SnapshotCache,
     metrics: Option<&Metrics>,
+    ignores: &GlobIgnoreSet,
 ) -> Result<Snapshot> {
     let resolved_includes = resolve_includes(includes);
     let mut files = Vec::new();
@@ -514,7 +596,7 @@ fn build_snapshot_cached_inner(
         if !include_path.exists() {
             continue;
         }
-        collect_files(root, &include_path, &mut files)?;
+        collect_files(root, &include_path, &mut files, ignores)?;
     }
 
     files.sort_by_key(|a| normalize_path(a));
@@ -676,6 +758,7 @@ pub fn diff_snapshots(previous: &Snapshot, current: &Snapshot) -> SnapshotDiff {
                         previous_bytes: previous_entry.bytes,
                         current_sha256: current_entry.sha256.clone(),
                         current_bytes: current_entry.bytes,
+                        file_type: current_entry.file_type.clone(),
                     });
                 }
             }
@@ -1111,6 +1194,8 @@ pub struct ServerState {
     pub plugin_managed: Mutex<Option<serde_json::Value>>,
     /// Wall-clock instant of the last plugin managed index report.
     pub plugin_managed_at: Mutex<Option<Instant>>,
+    /// Compiled glob ignore patterns from the project file.
+    pub glob_ignores: GlobIgnoreSet,
 }
 
 impl ServerState {
@@ -1131,6 +1216,28 @@ impl ServerState {
         turbo: bool,
         coalesce_ms: u64,
         binary_models: bool,
+    ) -> Arc<Self> {
+        Self::with_full_config(
+            root,
+            includes,
+            initial,
+            channel_capacity,
+            turbo,
+            coalesce_ms,
+            binary_models,
+            GlobIgnoreSet::empty(),
+        )
+    }
+
+    pub fn with_full_config(
+        root: PathBuf,
+        includes: Vec<String>,
+        initial: Snapshot,
+        channel_capacity: usize,
+        turbo: bool,
+        coalesce_ms: u64,
+        binary_models: bool,
+        glob_ignores: GlobIgnoreSet,
     ) -> Arc<Self> {
         let capacity = channel_capacity.clamp(32, 16_384);
         let (tx, _rx) = tokio::sync::broadcast::channel::<SyncDiffEvent>(capacity);
@@ -1167,6 +1274,7 @@ impl ServerState {
             plugin_state_at: Mutex::new(None),
             plugin_managed: Mutex::new(None),
             plugin_managed_at: Mutex::new(None),
+            glob_ignores,
         })
     }
 
@@ -1178,11 +1286,12 @@ impl ServerState {
             let mut cache_lock = self
                 .cache
                 .lock().unwrap_or_else(|e| e.into_inner());
-            build_snapshot_cached_with_metrics(
+            build_snapshot_cached_with_ignores(
                 &self.root,
                 &self.includes,
                 &mut cache_lock,
                 &self.metrics,
+                &self.glob_ignores,
             )?
         };
         let elapsed = start.elapsed();
@@ -1396,7 +1505,12 @@ fn write_snapshot_file(dir: &Path, snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 
-fn collect_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_files(
+    root: &Path,
+    current: &Path,
+    output: &mut Vec<PathBuf>,
+    ignores: &GlobIgnoreSet,
+) -> Result<()> {
     let metadata = fs::symlink_metadata(current)
         .with_context(|| format!("failed to inspect {}", current.display()))?;
 
@@ -1415,6 +1529,13 @@ fn collect_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Resu
                 current.display()
             )
         })?;
+        // Apply glob ignore check on the normalized relative path.
+        if !ignores.is_empty() {
+            let rel_str = normalize_path(relative);
+            if ignores.is_ignored(&rel_str) {
+                return Ok(());
+            }
+        }
         output.push(relative.to_path_buf());
         return Ok(());
     }
@@ -1435,7 +1556,7 @@ fn collect_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Resu
 
         children.sort_by_key(|a| normalize_path(a));
         for child in children {
-            collect_files(root, &child, output)?;
+            collect_files(root, &child, output, ignores)?;
         }
     }
 
@@ -1523,8 +1644,10 @@ fn classify_file_type(path: &str) -> &'static str {
             .all(|(a, b)| a.to_ascii_lowercase() == *b)
     }
 
-    // Check longest suffixes first to avoid false matches (.meta.json before .json).
-    if len >= 10 && ends_with_ci(bytes, b".meta.json") {
+    // Check longest suffixes first to avoid false matches (.model.json / .meta.json before .json).
+    if len >= 11 && ends_with_ci(bytes, b".model.json") {
+        "model_json"
+    } else if len >= 10 && ends_with_ci(bytes, b".meta.json") {
         "meta_json"
     } else if len >= 5 && ends_with_ci(bytes, b".luau") {
         "luau"
@@ -1540,6 +1663,12 @@ fn classify_file_type(path: &str) -> &'static str {
         "txt"
     } else if len >= 4 && ends_with_ci(bytes, b".csv") {
         "csv"
+    } else if len >= 5 && ends_with_ci(bytes, b".yaml") {
+        "yaml"
+    } else if len >= 4 && ends_with_ci(bytes, b".yml") {
+        "yaml"
+    } else if len >= 5 && ends_with_ci(bytes, b".toml") {
+        "toml"
     } else {
         "other"
     }
@@ -1866,6 +1995,7 @@ pub fn reverse_diff(diff: &SnapshotDiff) -> SnapshotDiff {
             previous_bytes: m.current_bytes,
             current_sha256: m.previous_sha256.clone(),
             current_bytes: m.previous_bytes,
+            file_type: m.file_type.clone(),
         })
         .collect();
 
@@ -2325,6 +2455,13 @@ mod tests {
         assert_eq!(classify_file_type("src/a.rbxm"), "rbxm");
         assert_eq!(classify_file_type("src/a.rbxmx"), "rbxmx");
         assert_eq!(classify_file_type("src/a.meta.json"), "meta_json");
+        assert_eq!(classify_file_type("src/a.model.json"), "model_json");
+        assert_eq!(classify_file_type("src/a.yaml"), "yaml");
+        assert_eq!(classify_file_type("src/a.yml"), "yaml");
+        assert_eq!(classify_file_type("src/a.YAML"), "yaml");
+        assert_eq!(classify_file_type("src/a.YML"), "yaml");
+        assert_eq!(classify_file_type("src/a.toml"), "toml");
+        assert_eq!(classify_file_type("src/a.TOML"), "toml");
         assert_eq!(classify_file_type("src/a.py"), "other");
     }
 
@@ -2403,6 +2540,7 @@ mod tests {
                 previous_bytes: 20,
                 current_sha256: "new_h".into(),
                 current_bytes: 25,
+                file_type: Some("lua".to_string()),
             }],
             deleted: vec![SnapshotEntry {
                 path: "src/removed.lua".into(),
@@ -2519,4 +2657,89 @@ mod tests {
     // -----------------------------------------------------------------------
     // Extended resolve_instance_class tests (covered in project.rs tests)
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // globIgnorePaths filtering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn glob_ignore_paths_filters_files() {
+        let root = tempdir().expect("tempdir");
+        let src = root.path().join("src");
+        fs::create_dir_all(src.join("tests")).expect("mkdir tests");
+        fs::write(src.join("init.luau"), "return {}").expect("write init");
+        fs::write(src.join("tests/foo.spec.luau"), "-- test").expect("write spec");
+        fs::write(src.join("tests/bar.luau"), "-- bar").expect("write bar");
+        fs::write(src.join("game.luau"), "-- game").expect("write game");
+
+        let ignores = GlobIgnoreSet::new(&vec!["**/*.spec.luau".to_string()]);
+        let includes = vec!["src".to_string()];
+        let snapshot =
+            build_snapshot_with_ignores(root.path(), &includes, &ignores).expect("snapshot");
+
+        let paths: Vec<&str> = snapshot.entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(
+            !paths.iter().any(|p| p.contains("spec")),
+            "spec files should be excluded, got: {:?}",
+            paths
+        );
+        assert!(paths.iter().any(|p| p.contains("init.luau")));
+        assert!(paths.iter().any(|p| p.contains("bar.luau")));
+        assert!(paths.iter().any(|p| p.contains("game.luau")));
+    }
+
+    #[test]
+    fn glob_ignore_paths_multiple_patterns() {
+        let root = tempdir().expect("tempdir");
+        let src = root.path().join("src");
+        let vendor = src.join("vendor");
+        fs::create_dir_all(&vendor).expect("mkdir vendor");
+        fs::write(src.join("main.luau"), "-- main").expect("write");
+        fs::write(src.join("test.spec.luau"), "-- test").expect("write");
+        fs::write(vendor.join("lib.luau"), "-- vendor lib").expect("write");
+
+        let ignores = GlobIgnoreSet::new(&vec![
+            "**/*.spec.luau".to_string(),
+            "src/vendor/**".to_string(),
+        ]);
+        let includes = vec!["src".to_string()];
+        let snapshot =
+            build_snapshot_with_ignores(root.path(), &includes, &ignores).expect("snapshot");
+
+        let paths: Vec<&str> = snapshot.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/main.luau"]);
+    }
+
+    #[test]
+    fn glob_ignore_set_empty_matches_nothing() {
+        let ignores = GlobIgnoreSet::empty();
+        assert!(!ignores.is_ignored("src/foo.spec.luau"));
+        assert!(ignores.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // .toml / .yaml file type classification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_toml_file_type() {
+        assert_eq!(classify_file_type("src/config.toml"), "toml");
+        assert_eq!(classify_file_type("Packages/wally.toml"), "toml");
+    }
+
+    #[test]
+    fn toml_files_included_in_snapshot() {
+        let root = tempdir().expect("tempdir");
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::write(src.join("config.toml"), "[settings]\nkey = \"value\"").expect("write toml");
+        fs::write(src.join("init.luau"), "return {}").expect("write luau");
+
+        let includes = vec!["src".to_string()];
+        let snapshot = build_snapshot(root.path(), &includes).expect("snapshot");
+
+        let toml_entry = snapshot.entries.iter().find(|e| e.path.ends_with(".toml"));
+        assert!(toml_entry.is_some(), "TOML file should be in snapshot");
+        assert_eq!(toml_entry.unwrap().file_type.as_deref(), Some("toml"));
+    }
 }
