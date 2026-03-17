@@ -137,11 +137,19 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin, _| {
             let origin = origin.as_bytes();
-            // Allow any localhost/127.0.0.1 origin (any port).
-            origin.starts_with(b"http://localhost")
-                || origin.starts_with(b"http://127.0.0.1")
-                || origin.starts_with(b"https://localhost")
-                || origin.starts_with(b"https://127.0.0.1")
+            // Allow localhost/127.0.0.1 origins with explicit port delimiter.
+            // The `:` or end-of-string check prevents matching localhost.evil.com.
+            fn is_loopback_origin(o: &[u8], prefix: &[u8]) -> bool {
+                if !o.starts_with(prefix) {
+                    return false;
+                }
+                let rest = &o[prefix.len()..];
+                rest.is_empty() || rest.starts_with(b":")
+            }
+            is_loopback_origin(origin, b"http://localhost")
+                || is_loopback_origin(origin, b"http://127.0.0.1")
+                || is_loopback_origin(origin, b"https://localhost")
+                || is_loopback_origin(origin, b"https://127.0.0.1")
         }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([axum::http::header::CONTENT_TYPE])

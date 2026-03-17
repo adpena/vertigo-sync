@@ -247,6 +247,11 @@ impl SnapshotCache {
         self.entries.retain(|key, _| live_paths.contains(key));
     }
 
+    /// Remove entries for paths no longer present — borrows path refs to avoid cloning.
+    pub fn retain_paths_ref(&mut self, live_paths: &HashSet<&str>) {
+        self.entries.retain(|key, _| live_paths.contains(key.as_str()));
+    }
+
     /// Number of cached entries (for diagnostics).
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -599,9 +604,9 @@ fn build_snapshot_cached_inner(
         }
     }
 
-    // Prune deleted files from cache.
-    let live_paths: HashSet<String> = entries.iter().map(|e| e.path.clone()).collect();
-    cache.retain_paths(&live_paths);
+    // Prune deleted files from cache (borrow paths to avoid cloning).
+    let live_paths: HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    cache.retain_paths_ref(&live_paths);
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let fingerprint = fingerprint_entries(&entries);
@@ -1495,25 +1500,41 @@ fn normalize_path(path: &Path) -> String {
 }
 
 /// Classify a file's type from its path for the `file_type` field.
-/// Returns a `&'static str` — no heap allocation per call.
+/// Zero heap allocation — uses byte-level ASCII-insensitive suffix matching.
 fn classify_file_type(path: &str) -> &'static str {
-    let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".meta.json") {
+    let bytes = path.as_bytes();
+    let len = bytes.len();
+
+    // Helper: case-insensitive suffix check without allocation.
+    #[inline(always)]
+    fn ends_with_ci(bytes: &[u8], suffix: &[u8]) -> bool {
+        if bytes.len() < suffix.len() {
+            return false;
+        }
+        let start = bytes.len() - suffix.len();
+        bytes[start..]
+            .iter()
+            .zip(suffix.iter())
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+    }
+
+    // Check longest suffixes first to avoid false matches (.meta.json before .json).
+    if len >= 10 && ends_with_ci(bytes, b".meta.json") {
         "meta_json"
-    } else if lower.ends_with(".luau") {
+    } else if len >= 5 && ends_with_ci(bytes, b".luau") {
         "luau"
-    } else if lower.ends_with(".lua") {
+    } else if len >= 4 && ends_with_ci(bytes, b".lua") {
         "lua"
-    } else if lower.ends_with(".json") {
-        "json"
-    } else if lower.ends_with(".txt") {
-        "txt"
-    } else if lower.ends_with(".csv") {
-        "csv"
-    } else if lower.ends_with(".rbxm") {
-        "rbxm"
-    } else if lower.ends_with(".rbxmx") {
+    } else if len >= 6 && ends_with_ci(bytes, b".rbxmx") {
         "rbxmx"
+    } else if len >= 5 && ends_with_ci(bytes, b".rbxm") {
+        "rbxm"
+    } else if len >= 5 && ends_with_ci(bytes, b".json") {
+        "json"
+    } else if len >= 4 && ends_with_ci(bytes, b".txt") {
+        "txt"
+    } else if len >= 4 && ends_with_ci(bytes, b".csv") {
+        "csv"
     } else {
         "other"
     }

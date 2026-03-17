@@ -17,7 +17,7 @@ Vertigo Sync is a next-generation source synchronization engine for Roblox Studi
 | **Diff computation** | Instance-level | **194 us** (file-level) |
 | **Transport** | HTTP polling | **WebSocket + SSE + HTTP** |
 | **Built-in validation** | None | **36-rule Luau linter** |
-| **MCP tools** | None | **31 tools** |
+| **MCP tools** | None | **42 tools** |
 | **Time-travel** | No | **Yes** |
 | **Prometheus metrics** | No | **Yes** |
 | **Binary size** | ~8-12 MB | **5.5 MB** |
@@ -44,7 +44,7 @@ Open Roblox Studio -- the plugin connects automatically.
 - **Built-in Luau validation** -- 36 rules catching NCG deopt, strict mode violations, deprecated APIs, hot-path allocations
 - **WebSocket + SSE + HTTP** -- triple-transport with automatic fallback and lag recovery
 - **Time-travel** -- rewind and fast-forward through your sync history with a scrubber UI
-- **31 MCP tools** -- full agent-native read/write/validate surface for AI-assisted development
+- **42 MCP tools** -- full agent-native read/write/validate surface for AI-assisted development
 - **Prometheus metrics** -- production observability at `/metrics`
 - **Instance pooling** -- pre-allocated instance pool eliminates GC pressure during sync
 - **Rojo-compatible** -- works with existing `default.project.json` files, no migration required
@@ -62,7 +62,7 @@ cargo install vertigo-sync
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://github.com/vertigo-sync/vertigo-sync/releases/latest/download/install.sh | sh
+# Coming soon: curl -fsSL https://vertigo-sync.dev/install.sh | sh
 ```
 
 **Windows (PowerShell):**
@@ -280,7 +280,7 @@ All patch operations return deterministic ack/reject envelopes with structured r
 
 ## MCP Tools
 
-Vertigo Sync exposes 31 MCP tools for agent-native source manipulation. See the [Agent DSL Reference](../../docs/vertigo-sync-agent-dsl.md) for the full catalog.
+Vertigo Sync exposes 42 MCP tools for agent-native source manipulation. See the [Agent DSL Reference](../../docs/vertigo-sync-agent-dsl.md) for the full catalog.
 
 ### Categories
 
