@@ -514,10 +514,10 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
         // ── Plugin command channel ──────────────────────────────────
         tool_def(
             "sync_plugin_command",
-            "Send a command to the Studio plugin (toggle sync, force resync, adjust frame budget, run builders, set log level)",
+            "Send a command to the Studio plugin (toggle sync, force resync, adjust frame budget, run builders, set log level, time travel)",
             vec![
-                param("command", "string", "Command: toggle_sync | force_resync | set_frame_budget | run_builders | set_log_level", true),
-                param("params", "object", "Command parameters (e.g. {\"budget_ms\": 8} for set_frame_budget, {\"level\": \"verbose\"} for set_log_level)", false),
+                param("command", "string", "Command: toggle_sync | force_resync | set_frame_budget | run_builders | set_log_level | time_travel", true),
+                param("params", "object", "Command parameters (e.g. {\"budget_ms\": 8} for set_frame_budget, {\"level\": \"verbose\"} for set_log_level, {\"action\": \"rewind\", \"fingerprint\": \"abc123\"} for time_travel — actions: rewind, step_back, step_forward, jump_oldest, resume_live)", false),
                 param("wait", "boolean", "Wait for plugin acknowledgment (default false, max 10s)", false),
             ],
         ),
