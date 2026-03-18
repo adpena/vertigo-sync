@@ -2700,7 +2700,6 @@ local function syncFromSnapshot(reason: string): boolean
 	consecutiveErrors = 0
 	pollInterval = POLL_INTERVAL_FAST
 	info(string.format("Snapshot reconciled (%s). fingerprint=%s entries=%d", reason, snapshot.fingerprint, #snapshot.entries))
-	showToast(string.format("Synced %d files", #snapshot.entries), TOAST_COLOR_SUCCESS)
 	return true
 end
 
@@ -2811,9 +2810,6 @@ local function pollDiff()
 		+ (if type(diff.modified) == "table" then #diff.modified else 0)
 		+ (if type(diff.deleted) == "table" then #diff.deleted else 0)
 		+ (if type(diff.renamed) == "table" then #diff.renamed else 0)
-	if diffFileCount > 0 then
-		showToast(string.format("Synced %d files", diffFileCount), TOAST_COLOR_SUCCESS)
-	end
 end
 
 -- ─── Fetch workers ──────────────────────────────────────────────────────────
@@ -3735,7 +3731,7 @@ local TWEEN_FAST = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirecti
 local TWEEN_MEDIUM = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local TWEEN_SLOW = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local TWEEN_POP = TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
-local TWEEN_PULSE = TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
+local TWEEN_PULSE = TweenInfo.new(3.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
 
 -- Theme-relative hover/press colors (computed once, not hardcoded)
 local THEME_HOVER = Color3.fromRGB(
@@ -4207,13 +4203,13 @@ welcomeFrame.Visible = false -- controlled by connection state machine
 
 -- ═══ Status Panel ═══════════════════════════════════════════════════════════
 
-local statusPanel: Frame = createPanel(mainFrame, "StatusPanel", 1, 64)
+local statusPanel: Frame = createPanel(mainFrame, "StatusPanel", 1, 58)
 
 -- Status row: dot + text
 local statusDot: Frame = Instance.new("Frame")
 statusDot.Name = "StatusDot"
-statusDot.Size = UDim2.new(0, 8, 0, 8)
-statusDot.Position = UDim2.new(0, 0, 0, 4)
+statusDot.Size = UDim2.new(0, 6, 0, 6)
+statusDot.Position = UDim2.new(0, 0, 0, 5)
 statusDot.BackgroundColor3 = THEME_YELLOW
 statusDot.BorderSizePixel = 0
 local dotCorner: UICorner = Instance.new("UICorner")
@@ -4222,26 +4218,26 @@ dotCorner.Parent = statusDot
 statusDot.Parent = statusPanel
 
 local statusLine1: TextLabel = createLabel(statusPanel, "StatusLine1", "Disconnected", {
-	position = UDim2.new(0, 14, 0, 0),
-	size = UDim2.new(1, -14, 0, 16),
+	position = UDim2.new(0, 12, 0, 0),
+	size = UDim2.new(1, -12, 0, 15),
 	color = THEME_TEXT,
-	fontSize = 13,
-	font = Enum.Font.GothamBold,
+	fontSize = 12,
+	font = Enum.Font.GothamMedium,
 })
 
-local statusLine2: TextLabel = createLabel(statusPanel, "StatusLine2", "0 applies/s  ·  4ms  ·  queue:0", {
+local statusLine2: TextLabel = createLabel(statusPanel, "StatusLine2", "apply 0/s  ·  4ms  ·  q0", {
 	position = UDim2.new(0, 0, 0, 22),
 	size = UDim2.new(1, 0, 0, 14),
 	color = THEME_TEXT_DIM,
-	fontSize = 11,
+	fontSize = 10,
 	font = Enum.Font.RobotoMono,
 })
 
-local statusLine3: TextLabel = createLabel(statusPanel, "StatusLine3", "fetch:0  ·  reconnects:0  ·  v0.1.0", {
-	position = UDim2.new(0, 0, 0, 38),
+local statusLine3: TextLabel = createLabel(statusPanel, "StatusLine3", "project dynamic  ·  fetch 0  ·  r0", {
+	position = UDim2.new(0, 0, 0, 36),
 	size = UDim2.new(1, 0, 0, 14),
 	color = THEME_TEXT_DIM,
-	fontSize = 10,
+	fontSize = 9,
 	font = Enum.Font.Gotham,
 })
 
@@ -4488,12 +4484,20 @@ local settingsTitle: TextLabel = createLabel(settingsHeaderRow, "Title", "Settin
 	font = Enum.Font.GothamBold,
 })
 
+local settingsSubtitle: TextLabel = createLabel(settingsPanel, "Subtitle", "Sync is automatic. These settings are local and optional.", {
+	color = THEME_TEXT_DIM,
+	fontSize = 10,
+	font = Enum.Font.Gotham,
+	layoutOrder = 1,
+	wrap = true,
+})
+
 local settingsLayout: UIListLayout = Instance.new("UIListLayout")
 settingsLayout.SortOrder = Enum.SortOrder.LayoutOrder
 settingsLayout.Padding = UDim.new(0, 4)
 settingsLayout.Parent = settingsPanel
 
-local historyBufferLabel: TextLabel = createLabel(settingsPanel, "HistoryBufferLabel", "History buffer: " .. tostring(settingHistoryBuffer), {
+local historyBufferLabel: TextLabel = createLabel(settingsPanel, "HistoryBufferLabel", "Timeline depth", {
 	color = THEME_TEXT_DIM,
 	fontSize = 10,
 	font = Enum.Font.Gotham,
@@ -4562,7 +4566,7 @@ settingsToggleLabel.Parent = settingsToggleRow
 -- ─── UI Event Handlers ──────────────────────────────────────────────────────
 
 local function updateHistoryBufferUI()
-	historyBufferLabel.Text = "History buffer: " .. tostring(settingHistoryBuffer)
+	historyBufferLabel.Text = "Timeline depth"
 	historyBufferValueLabel.Text = tostring(settingHistoryBuffer)
 end
 
@@ -4688,7 +4692,6 @@ welcomeCheckBtn.MouseButton1Click:Connect(function()
 			welcomeFrame.BackgroundTransparency = 0
 		end)
 		resyncRequested = true
-		showToast("Server found -- connecting...", TOAST_COLOR_SUCCESS)
 	else
 		connectionState = "error"
 		showToast("Server not found on :7575", TOAST_COLOR_ERROR)
@@ -4759,11 +4762,12 @@ local function refreshStatusUI()
 	-- Status line 1: connection indicator with dot
 	local statusText: string
 	local dotColor: Color3
+	local line1Color: Color3 = THEME_TEXT
 	if connectionState == "connected" then
 		statusText = "Connected"
 		dotColor = THEME_GREEN
 	elseif connectionState == "reconnecting" then
-		statusText = string.format("Reconnecting... (attempt %d)", connectionReconnectAttempt)
+		statusText = string.format("Reconnecting %d", connectionReconnectAttempt)
 		dotColor = THEME_YELLOW
 	elseif connectionState == "connecting" then
 		statusText = "Connecting..."
@@ -4779,21 +4783,24 @@ local function refreshStatusUI()
 		end
 		statusText = errDetail
 		dotColor = THEME_RED
+		line1Color = THEME_RED
 	else -- "waiting"
-		statusText = "Looking for server on :7575..."
+		statusText = "Waiting for server"
 		dotColor = THEME_ACCENT
 	end
 
 	local hashShort: string = if lastHash ~= nil then string.sub(lastHash, 1, 8) else "--------"
 	local transportLabel: string = if transportMode == "ws" then "ws" elseif transportMode == "poll" then "poll" else "idle"
-	local nextStatusLine1Text = string.format("%s  ·  %s  ·  #%s", statusText, transportLabel, hashShort)
+	local nextStatusLine1Text = string.format("%s  ·  %s  ·  %s", statusText, transportLabel, hashShort)
 	if lastStatusLine1Text ~= nextStatusLine1Text then
 		lastStatusLine1Text = nextStatusLine1Text
 		statusLine1.Text = nextStatusLine1Text
 	end
-	if lastStatusLine1Color ~= dotColor then
-		lastStatusLine1Color = dotColor
-		TweenService:Create(statusLine1, TWEEN_SLOW, { TextColor3 = dotColor }):Play()
+	if lastStatusLine1Color ~= line1Color then
+		lastStatusLine1Color = line1Color
+		statusLine1.TextColor3 = line1Color
+	end
+	if statusDot.BackgroundColor3 ~= dotColor then
 		TweenService:Create(statusDot, TWEEN_SLOW, { BackgroundColor3 = dotColor }):Play()
 	end
 
@@ -4804,14 +4811,14 @@ local function refreshStatusUI()
 			statusPulseTween:Cancel()
 			statusPulseTween = nil
 		end
-		if connectionState == "connected" then
-			-- Solid green with slow pulse
-			statusPulseTween = TweenService:Create(statusDot, TWEEN_PULSE, { BackgroundTransparency = 0.5 })
+		if connectionState == "connecting" or connectionState == "reconnecting" then
+			statusDot.BackgroundTransparency = 0.2
+			statusPulseTween = TweenService:Create(statusDot, TWEEN_PULSE, { BackgroundTransparency = 0.55 })
 			statusPulseTween:Play()
-		elseif connectionState == "waiting" or connectionState == "reconnecting" then
-			-- Pulsing dot for waiting/reconnecting states
-			statusPulseTween = TweenService:Create(statusDot, TWEEN_PULSE, { BackgroundTransparency = 0.6 })
-			statusPulseTween:Play()
+		elseif connectionState == "waiting" then
+			statusDot.BackgroundTransparency = 0.35
+		elseif connectionState == "connected" then
+			statusDot.BackgroundTransparency = 0
 		else
 			statusDot.BackgroundTransparency = 0
 		end
@@ -4820,7 +4827,7 @@ local function refreshStatusUI()
 	-- Status line 2: throughput metrics
 	local budgetMs: number = math.floor(adaptiveApplyBudgetSeconds * 1000 + 0.5)
 	local queueDepth: number = math.max(#pendingQueue - pendingQueueHead + 1, 0)
-	local nextStatusLine2Text = string.format("%d applies/s  ·  %dms  ·  queue:%d", appliedPerSecond, budgetMs, queueDepth)
+	local nextStatusLine2Text = string.format("apply %d/s  ·  %dms  ·  q%d", appliedPerSecond, budgetMs, queueDepth)
 	if lastStatusLine2Text ~= nextStatusLine2Text then
 		lastStatusLine2Text = nextStatusLine2Text
 		statusLine2.Text = nextStatusLine2Text
@@ -4828,7 +4835,7 @@ local function refreshStatusUI()
 
 	-- Status line 3: project bootstrap status + reconnects
 	local fetchDepth: number = math.max(#fetchQueue - fetchQueueHead + 1, 0)
-	local nextStatusLine3Text = string.format("project:%s  ·  fetch:%d  ·  r:%d", projectStatusLabel(), fetchDepth, reconnectCount)
+	local nextStatusLine3Text = string.format("%s  ·  fetch %d  ·  r%d", projectStatusLabel(), fetchDepth, reconnectCount)
 	if lastStatusLine3Text ~= nextStatusLine3Text then
 		lastStatusLine3Text = nextStatusLine3Text
 		statusLine3.Text = nextStatusLine3Text
