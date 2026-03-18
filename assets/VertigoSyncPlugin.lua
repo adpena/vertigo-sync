@@ -3369,6 +3369,263 @@ end
 
 -- ─── Initial Builder Execution ──────────────────────────────────────────────
 
+-- ─── DockWidget UI ──────────────────────────────────────────────────────────
+
+local WIDGET_ID = "VertigoSyncWidget"
+local widgetInfo = DockWidgetPluginGuiInfo.new(
+	Enum.InitialDockState.Right,
+	false, -- initially disabled
+	true, -- override previous enabled state (remembers user's last open/close)
+	340, -- default width
+	400, -- default height
+	300, -- min width
+	300 -- min height
+)
+local widget: DockWidgetPluginGui = plugin:CreateDockWidgetPluginGui(WIDGET_ID, widgetInfo)
+widget.Title = "Vertigo Sync"
+
+-- ─── Settings Persistence ────────────────────────────────────────────────────
+
+local function loadSettings()
+	local binaryModels: any = plugin:GetSetting("VertigoSyncBinaryModels")
+	if type(binaryModels) == "boolean" then
+		SETTINGS.binaryModels = binaryModels
+	end
+	local builders: any = plugin:GetSetting("VertigoSyncBuildersEnabled")
+	if type(builders) == "boolean" then
+		SETTINGS.buildersEnabled = builders
+	end
+	local timeTravelUI: any = plugin:GetSetting("VertigoSyncTimeTravelUI")
+	if type(timeTravelUI) == "boolean" then
+		SETTINGS.timeTravelUI = timeTravelUI
+	end
+	local histBuf: any = plugin:GetSetting("VertigoSyncHistoryBuffer")
+	if type(histBuf) == "number" and histBuf >= 16 and histBuf <= 1024 then
+		SETTINGS.historyBuffer = math.floor(histBuf)
+	end
+end
+
+local function saveSetting(key: string, value: any)
+	pcall(function()
+		plugin:SetSetting(key, value)
+	end)
+end
+
+loadSettings()
+
+-- ─── UI Design System ────────────────────────────────────────────────────────
+
+local THEME_BG = Color3.fromRGB(30, 30, 30)
+local THEME_SURFACE = Color3.fromRGB(38, 38, 38)
+local THEME_SURFACE_ELEVATED = Color3.fromRGB(46, 46, 46)
+local THEME_BORDER = Color3.fromRGB(60, 60, 60)
+local THEME_TEXT = Color3.fromRGB(220, 220, 220)
+local THEME_TEXT_DIM = Color3.fromRGB(140, 140, 140)
+local THEME_ACCENT = Color3.fromRGB(56, 132, 244)
+local THEME_GREEN = Color3.fromRGB(52, 199, 89)
+local THEME_YELLOW = Color3.fromRGB(255, 159, 10)
+local THEME_RED = Color3.fromRGB(255, 69, 58)
+
+local TWEEN_FAST = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local TWEEN_MEDIUM = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local TWEEN_SLOW = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local TWEEN_POP = TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local TWEEN_PULSE = TweenInfo.new(3.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
+
+local THEME_HOVER = Color3.fromRGB(
+	math.min(255, math.floor(46 * 1.22)),
+	math.min(255, math.floor(46 * 1.22)),
+	math.min(255, math.floor(46 * 1.22))
+)
+local THEME_PRESS = Color3.fromRGB(
+	math.max(0, math.floor(46 * 0.74)),
+	math.max(0, math.floor(46 * 0.74)),
+	math.max(0, math.floor(46 * 0.74))
+)
+
+local function createLabel(parent: Instance, name: string, text: string, props: {
+	position: UDim2?,
+	size: UDim2?,
+	color: Color3?,
+	fontSize: number?,
+	font: Enum.Font?,
+	xAlign: Enum.TextXAlignment?,
+	layoutOrder: number?,
+	wrap: boolean?,
+	richText: boolean?,
+}?): TextLabel
+	local p = props or {}
+	local label: TextLabel = Instance.new("TextLabel")
+	label.Name = name
+	label.Text = text
+	label.Position = p.position or UDim2.new(0, 0, 0, 0)
+	label.Size = p.size or UDim2.new(1, 0, 0, 16)
+	label.BackgroundTransparency = 1
+	label.TextColor3 = p.color or THEME_TEXT
+	label.TextSize = p.fontSize or 12
+	label.Font = p.font or Enum.Font.RobotoMono
+	label.TextXAlignment = p.xAlign or Enum.TextXAlignment.Left
+	if p.wrap then
+		label.TextWrapped = true
+		label.AutomaticSize = Enum.AutomaticSize.Y
+	else
+		label.TextTruncate = Enum.TextTruncate.AtEnd
+	end
+	if p.richText then
+		label.RichText = true
+	end
+	if p.layoutOrder then
+		label.LayoutOrder = p.layoutOrder
+	end
+	label.Parent = parent
+	return label
+end
+
+local function createPanel(parent: Instance, name: string, layoutOrder: number, height: number?): Frame
+	local panel: Frame = Instance.new("Frame")
+	panel.Name = name
+	panel.Size = UDim2.new(1, 0, 0, height or 0)
+	panel.AutomaticSize = if height then Enum.AutomaticSize.None else Enum.AutomaticSize.Y
+	panel.BackgroundColor3 = THEME_SURFACE
+	panel.BorderSizePixel = 0
+	panel.LayoutOrder = layoutOrder
+	local corner: UICorner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 6)
+	corner.Parent = panel
+	local stroke: UIStroke = Instance.new("UIStroke")
+	stroke.Color = THEME_BORDER
+	stroke.Transparency = 0.4
+	stroke.Thickness = 1
+	stroke.Parent = panel
+	local padding: UIPadding = Instance.new("UIPadding")
+	padding.PaddingLeft = UDim.new(0, 12)
+	padding.PaddingRight = UDim.new(0, 12)
+	padding.PaddingTop = UDim.new(0, 8)
+	padding.PaddingBottom = UDim.new(0, 8)
+	padding.Parent = panel
+	panel.Parent = parent
+	return panel
+end
+
+local function createToggleSwitch(parent: Instance, name: string, labelText: string, initialState: boolean, layoutOrder: number): (Frame, Frame, TextLabel)
+	local row: Frame = Instance.new("Frame")
+	row.Name = name
+	row.Size = UDim2.new(1, 0, 0, 24)
+	row.BackgroundTransparency = 1
+	row.LayoutOrder = layoutOrder
+	row.Parent = parent
+
+	local label: TextLabel = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.Text = labelText
+	label.Size = UDim2.new(1, -44, 1, 0)
+	label.Position = UDim2.new(0, 0, 0, 0)
+	label.BackgroundTransparency = 1
+	label.TextColor3 = THEME_TEXT
+	label.TextSize = 12
+	label.Font = Enum.Font.RobotoMono
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Center
+	label.Parent = row
+
+	local track: Frame = Instance.new("Frame")
+	track.Name = "Track"
+	track.Size = UDim2.new(0, 32, 0, 18)
+	track.Position = UDim2.new(1, -32, 0.5, -9)
+	track.BackgroundColor3 = if initialState then THEME_ACCENT else THEME_BG
+	track.BorderSizePixel = 0
+	local trackCorner: UICorner = Instance.new("UICorner")
+	trackCorner.CornerRadius = UDim.new(1, 0)
+	trackCorner.Parent = track
+	local trackStroke: UIStroke = Instance.new("UIStroke")
+	trackStroke.Color = THEME_BORDER
+	trackStroke.Transparency = 0.4
+	trackStroke.Thickness = 1
+	trackStroke.Parent = track
+	track.Parent = row
+
+	local thumbShadow: Frame = Instance.new("Frame")
+	thumbShadow.Name = "ThumbShadow"
+	thumbShadow.Size = UDim2.new(0, 14, 0, 14)
+	thumbShadow.Position = if initialState then UDim2.new(1, -15, 0.5, -6) else UDim2.new(0, 3, 0.5, -6)
+	thumbShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	thumbShadow.BackgroundTransparency = 0.7
+	thumbShadow.BorderSizePixel = 0
+	local shadowCorner: UICorner = Instance.new("UICorner")
+	shadowCorner.CornerRadius = UDim.new(1, 0)
+	shadowCorner.Parent = thumbShadow
+	thumbShadow.Parent = track
+
+	local thumb: Frame = Instance.new("Frame")
+	thumb.Name = "Thumb"
+	thumb.Size = UDim2.new(0, 14, 0, 14)
+	thumb.Position = if initialState then UDim2.new(1, -16, 0.5, -7) else UDim2.new(0, 2, 0.5, -7)
+	thumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	thumb.BorderSizePixel = 0
+	local thumbCorner: UICorner = Instance.new("UICorner")
+	thumbCorner.CornerRadius = UDim.new(1, 0)
+	thumbCorner.Parent = thumb
+	thumb.Parent = track
+
+	local clickBtn: TextButton = Instance.new("TextButton")
+	clickBtn.Name = "ClickRegion"
+	clickBtn.Size = UDim2.new(1, 0, 1, 0)
+	clickBtn.BackgroundTransparency = 1
+	clickBtn.Text = ""
+	clickBtn.Parent = track
+
+	return row, track, label
+end
+
+local function animateToggle(track: Frame, state: boolean)
+	local thumb: Frame? = track:FindFirstChild("Thumb") :: Frame?
+	local thumbShadow: Frame? = track:FindFirstChild("ThumbShadow") :: Frame?
+	if thumb == nil then
+		return
+	end
+	TweenService:Create(track, TWEEN_FAST, {
+		BackgroundColor3 = if state then THEME_ACCENT else THEME_BG,
+	}):Play()
+	TweenService:Create(thumb, TWEEN_FAST, {
+		Position = if state then UDim2.new(1, -16, 0.5, -7) else UDim2.new(0, 2, 0.5, -7),
+	}):Play()
+	if thumbShadow then
+		TweenService:Create(thumbShadow, TWEEN_FAST, {
+			Position = if state then UDim2.new(1, -15, 0.5, -6) else UDim2.new(0, 3, 0.5, -6),
+		}):Play()
+	end
+end
+
+local function createSmallButton(parent: Instance, name: string, text: string, width: number): TextButton
+	local btn: TextButton = Instance.new("TextButton")
+	btn.Name = name
+	btn.Text = text
+	btn.Size = UDim2.new(0, width, 0, 24)
+	btn.BackgroundColor3 = THEME_SURFACE_ELEVATED
+	btn.TextColor3 = THEME_TEXT
+	btn.TextSize = 12
+	btn.Font = Enum.Font.RobotoMono
+	btn.AutoButtonColor = false
+	btn.BorderSizePixel = 0
+	local corner: UICorner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 4)
+	corner.Parent = btn
+	btn.MouseEnter:Connect(function()
+		TweenService:Create(btn, TWEEN_FAST, { BackgroundColor3 = THEME_HOVER }):Play()
+	end)
+	btn.MouseLeave:Connect(function()
+		TweenService:Create(btn, TWEEN_FAST, { BackgroundColor3 = THEME_SURFACE_ELEVATED }):Play()
+	end)
+	btn.MouseButton1Down:Connect(function()
+		TweenService:Create(btn, TWEEN_FAST, { BackgroundColor3 = THEME_PRESS }):Play()
+	end)
+	btn.MouseButton1Up:Connect(function()
+		TweenService:Create(btn, TWEEN_FAST, { BackgroundColor3 = THEME_SURFACE_ELEVATED }):Play()
+	end)
+	btn.Parent = parent
+	return btn
+end
+
 -- Everything below runs inside a function to create a new register scope.
 -- Luau has a 200 local register limit per function; do/end does NOT help.
 local function _initPlugin()
@@ -3688,276 +3945,6 @@ local function tryConnectWebSocket()
 	return true
 end
 
--- ─── DockWidget UI ──────────────────────────────────────────────────────────
--- Wrapped in do...end to scope UI locals within Luau's 200 local register limit.
-
-
-local WIDGET_ID = "VertigoSyncWidget"
-local widgetInfo = DockWidgetPluginGuiInfo.new(
-	Enum.InitialDockState.Right,
-	false, -- initially disabled
-	true, -- override previous enabled state (remembers user's last open/close)
-	340, -- default width
-	400, -- default height
-	300, -- min width
-	300 -- min height
-)
-local widget: DockWidgetPluginGui = plugin:CreateDockWidgetPluginGui(WIDGET_ID, widgetInfo)
-widget.Title = "Vertigo Sync"
-
--- ─── Settings Persistence ────────────────────────────────────────────────────
-
-local function loadSettings()
-	local binaryModels: any = plugin:GetSetting("VertigoSyncBinaryModels")
-	if type(binaryModels) == "boolean" then
-		SETTINGS.binaryModels = binaryModels
-	end
-	local builders: any = plugin:GetSetting("VertigoSyncBuildersEnabled")
-	if type(builders) == "boolean" then
-		SETTINGS.buildersEnabled = builders
-	end
-	local timeTravelUI: any = plugin:GetSetting("VertigoSyncTimeTravelUI")
-	if type(timeTravelUI) == "boolean" then
-		SETTINGS.timeTravelUI = timeTravelUI
-	end
-	local histBuf: any = plugin:GetSetting("VertigoSyncHistoryBuffer")
-	if type(histBuf) == "number" and histBuf >= 16 and histBuf <= 1024 then
-		SETTINGS.historyBuffer = math.floor(histBuf)
-	end
-end
-
-local function saveSetting(key: string, value: any)
-	pcall(function()
-		plugin:SetSetting(key, value)
-	end)
-end
-
-loadSettings()
-
--- ─── UI Design System ────────────────────────────────────────────────────────
--- Trillion-dollar quality: 8px grid, Linear/Figma/Apple-grade polish
-
-local THEME_BG = Color3.fromRGB(30, 30, 30)
-local THEME_SURFACE = Color3.fromRGB(38, 38, 38)
-local THEME_SURFACE_ELEVATED = Color3.fromRGB(46, 46, 46)
-local THEME_BORDER = Color3.fromRGB(60, 60, 60)
-local THEME_TEXT = Color3.fromRGB(220, 220, 220)
-local THEME_TEXT_DIM = Color3.fromRGB(140, 140, 140)
-local THEME_ACCENT = Color3.fromRGB(56, 132, 244)
-local THEME_GREEN = Color3.fromRGB(52, 199, 89)
-local THEME_YELLOW = Color3.fromRGB(255, 159, 10)
-local THEME_RED = Color3.fromRGB(255, 69, 58)
-
--- Tween presets
-local TWEEN_FAST = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-local TWEEN_MEDIUM = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-local TWEEN_SLOW = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-local TWEEN_POP = TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
-local TWEEN_PULSE = TweenInfo.new(3.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
-
--- Theme-relative hover/press colors (computed once, not hardcoded)
-local THEME_HOVER = Color3.fromRGB(
-	math.min(255, math.floor(46 * 1.22)),
-	math.min(255, math.floor(46 * 1.22)),
-	math.min(255, math.floor(46 * 1.22))
-)
-local THEME_PRESS = Color3.fromRGB(
-	math.max(0, math.floor(46 * 0.74)),
-	math.max(0, math.floor(46 * 0.74)),
-	math.max(0, math.floor(46 * 0.74))
-)
-
--- Helper: create text label with design system styling
-local function createLabel(parent: Instance, name: string, text: string, props: {
-	position: UDim2?,
-	size: UDim2?,
-	color: Color3?,
-	fontSize: number?,
-	font: Enum.Font?,
-	xAlign: Enum.TextXAlignment?,
-	layoutOrder: number?,
-	wrap: boolean?,
-	richText: boolean?,
-}?): TextLabel
-	local p = props or {}
-	local label: TextLabel = Instance.new("TextLabel")
-	label.Name = name
-	label.Text = text
-	label.Position = p.position or UDim2.new(0, 0, 0, 0)
-	label.Size = p.size or UDim2.new(1, 0, 0, 16)
-	label.BackgroundTransparency = 1
-	label.TextColor3 = p.color or THEME_TEXT
-	label.TextSize = p.fontSize or 12
-	label.Font = p.font or Enum.Font.RobotoMono
-	label.TextXAlignment = p.xAlign or Enum.TextXAlignment.Left
-	if p.wrap then
-		label.TextWrapped = true
-		label.AutomaticSize = Enum.AutomaticSize.Y
-	else
-		label.TextTruncate = Enum.TextTruncate.AtEnd
-	end
-	if p.richText then
-		label.RichText = true
-	end
-	if p.layoutOrder then
-		label.LayoutOrder = p.layoutOrder
-	end
-	label.Parent = parent
-	return label
-end
-
--- Helper: create a panel (surface card)
-local function createPanel(parent: Instance, name: string, layoutOrder: number, height: number?): Frame
-	local panel: Frame = Instance.new("Frame")
-	panel.Name = name
-	panel.Size = UDim2.new(1, 0, 0, height or 0)
-	panel.AutomaticSize = if height then Enum.AutomaticSize.None else Enum.AutomaticSize.Y
-	panel.BackgroundColor3 = THEME_SURFACE
-	panel.BorderSizePixel = 0
-	panel.LayoutOrder = layoutOrder
-	local corner: UICorner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 6)
-	corner.Parent = panel
-	-- Bottom border shadow
-	local stroke: UIStroke = Instance.new("UIStroke")
-	stroke.Color = THEME_BORDER
-	stroke.Transparency = 0.4
-	stroke.Thickness = 1
-	stroke.Parent = panel
-	local padding: UIPadding = Instance.new("UIPadding")
-	padding.PaddingLeft = UDim.new(0, 12)
-	padding.PaddingRight = UDim.new(0, 12)
-	padding.PaddingTop = UDim.new(0, 8)
-	padding.PaddingBottom = UDim.new(0, 8)
-	padding.Parent = panel
-	panel.Parent = parent
-	return panel
-end
-
--- Helper: create a toggle switch (32x18 track, 14x14 thumb)
-local function createToggleSwitch(parent: Instance, name: string, labelText: string, initialState: boolean, layoutOrder: number): (Frame, Frame, TextLabel)
-	local row: Frame = Instance.new("Frame")
-	row.Name = name
-	row.Size = UDim2.new(1, 0, 0, 24)
-	row.BackgroundTransparency = 1
-	row.LayoutOrder = layoutOrder
-	row.Parent = parent
-
-	local label: TextLabel = Instance.new("TextLabel")
-	label.Name = "Label"
-	label.Text = labelText
-	label.Size = UDim2.new(1, -44, 1, 0)
-	label.Position = UDim2.new(0, 0, 0, 0)
-	label.BackgroundTransparency = 1
-	label.TextColor3 = THEME_TEXT
-	label.TextSize = 12
-	label.Font = Enum.Font.RobotoMono
-	label.TextXAlignment = Enum.TextXAlignment.Left
-	label.TextYAlignment = Enum.TextYAlignment.Center
-	label.Parent = row
-
-	local track: Frame = Instance.new("Frame")
-	track.Name = "Track"
-	track.Size = UDim2.new(0, 32, 0, 18)
-	track.Position = UDim2.new(1, -32, 0.5, -9)
-	track.BackgroundColor3 = if initialState then THEME_ACCENT else THEME_BG
-	track.BorderSizePixel = 0
-	local trackCorner: UICorner = Instance.new("UICorner")
-	trackCorner.CornerRadius = UDim.new(1, 0)
-	trackCorner.Parent = track
-	local trackStroke: UIStroke = Instance.new("UIStroke")
-	trackStroke.Color = THEME_BORDER
-	trackStroke.Transparency = 0.4
-	trackStroke.Thickness = 1
-	trackStroke.Parent = track
-	track.Parent = row
-
-	-- Thumb shadow (subtle depth)
-	local thumbShadow: Frame = Instance.new("Frame")
-	thumbShadow.Name = "ThumbShadow"
-	thumbShadow.Size = UDim2.new(0, 14, 0, 14)
-	thumbShadow.Position = if initialState then UDim2.new(1, -15, 0.5, -6) else UDim2.new(0, 3, 0.5, -6)
-	thumbShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-	thumbShadow.BackgroundTransparency = 0.7
-	thumbShadow.BorderSizePixel = 0
-	local shadowCorner: UICorner = Instance.new("UICorner")
-	shadowCorner.CornerRadius = UDim.new(1, 0)
-	shadowCorner.Parent = thumbShadow
-	thumbShadow.Parent = track
-
-	local thumb: Frame = Instance.new("Frame")
-	thumb.Name = "Thumb"
-	thumb.Size = UDim2.new(0, 14, 0, 14)
-	thumb.Position = if initialState then UDim2.new(1, -16, 0.5, -7) else UDim2.new(0, 2, 0.5, -7)
-	thumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-	thumb.BorderSizePixel = 0
-	local thumbCorner: UICorner = Instance.new("UICorner")
-	thumbCorner.CornerRadius = UDim.new(1, 0)
-	thumbCorner.Parent = thumb
-	thumb.Parent = track
-
-	-- Click region over the track
-	local clickBtn: TextButton = Instance.new("TextButton")
-	clickBtn.Name = "ClickRegion"
-	clickBtn.Size = UDim2.new(1, 0, 1, 0)
-	clickBtn.BackgroundTransparency = 1
-	clickBtn.Text = ""
-	clickBtn.Parent = track
-
-	return row, track, label
-end
-
--- Helper: animate toggle switch state
-local function animateToggle(track: Frame, state: boolean)
-	local thumb: Frame? = track:FindFirstChild("Thumb") :: Frame?
-	local thumbShadow: Frame? = track:FindFirstChild("ThumbShadow") :: Frame?
-	if thumb == nil then
-		return
-	end
-	TweenService:Create(track, TWEEN_FAST, {
-		BackgroundColor3 = if state then THEME_ACCENT else THEME_BG,
-	}):Play()
-	TweenService:Create(thumb, TWEEN_FAST, {
-		Position = if state then UDim2.new(1, -16, 0.5, -7) else UDim2.new(0, 2, 0.5, -7),
-	}):Play()
-	if thumbShadow then
-		TweenService:Create(thumbShadow, TWEEN_FAST, {
-			Position = if state then UDim2.new(1, -15, 0.5, -6) else UDim2.new(0, 3, 0.5, -6),
-		}):Play()
-	end
-end
-
--- Helper: create a small button
-local function createSmallButton(parent: Instance, name: string, text: string, width: number): TextButton
-	local btn: TextButton = Instance.new("TextButton")
-	btn.Name = name
-	btn.Text = text
-	btn.Size = UDim2.new(0, width, 0, 24)
-	btn.BackgroundColor3 = THEME_SURFACE_ELEVATED
-	btn.TextColor3 = THEME_TEXT
-	btn.TextSize = 12
-	btn.Font = Enum.Font.RobotoMono
-	btn.AutoButtonColor = false
-	btn.BorderSizePixel = 0
-	local corner: UICorner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 4)
-	corner.Parent = btn
-	-- Hover/press states
-	btn.MouseEnter:Connect(function()
-		TweenService:Create(btn, TWEEN_FAST, { BackgroundColor3 = THEME_HOVER }):Play()
-	end)
-	btn.MouseLeave:Connect(function()
-		TweenService:Create(btn, TWEEN_FAST, { BackgroundColor3 = THEME_SURFACE_ELEVATED }):Play()
-	end)
-	btn.MouseButton1Down:Connect(function()
-		TweenService:Create(btn, TWEEN_FAST, { BackgroundColor3 = THEME_PRESS }):Play()
-	end)
-	btn.MouseButton1Up:Connect(function()
-		TweenService:Create(btn, TWEEN_FAST, { BackgroundColor3 = THEME_SURFACE_ELEVATED }):Play()
-	end)
-	btn.Parent = parent
-	return btn
-end
 
 -- ─── Build Widget UI ─────────────────────────────────────────────────────────
 
