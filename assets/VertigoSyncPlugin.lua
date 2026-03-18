@@ -50,8 +50,6 @@ local PLUGIN_VERSION = "2026-03-16-v9-trillion-dollar"
 -- PLUGIN_SEMVER "0.1.0" used inline in status line 3 (no new local to stay under 194 register limit)
 
 local DEFAULT_SERVER_BASE_URL = "http://127.0.0.1:7575"
-local SERVER_URL_SETTING_KEY = "VertigoSyncServerUrl"
-local SERVER_URL_WORKSPACE_ATTR = "VertigoSyncServerUrl"
 local HEALTH_POLL_SECONDS = 15
 
 local POLL_INTERVAL_FAST = 0.10
@@ -494,7 +492,6 @@ local activeProjectMappingCount: number = 0
 local projectMappingsLoaded = false
 local projectSyncBlocked = false
 local projectEmitLegacyScripts = true
-local currentServerBaseUrl = DEFAULT_SERVER_BASE_URL
 local lastProjectStatusToastKey = ""
 local attachedRootGuards: { [Instance]: boolean } = {}
 local resolveMapping: (filePath: string) -> (PathMapping?, string?)
@@ -693,40 +690,27 @@ local function encodePathForRoute(path: string): string
 	return table.concat(encodedSegments, "/")
 end
 
-local function normalizeServerBaseUrl(rawValue: any): string?
-	if type(rawValue) ~= "string" then
-		return nil
+local function getServerBaseUrl(): string
+	local rawValue: any = Workspace:GetAttribute("VertigoSyncServerUrl")
+	if type(rawValue) ~= "string" or rawValue == "" then
+		rawValue = plugin:GetSetting("VertigoSyncServerUrl")
+	end
+	if type(rawValue) ~= "string" or rawValue == "" then
+		return DEFAULT_SERVER_BASE_URL
 	end
 	local trimmed = string.gsub(rawValue, "%s+", "")
 	trimmed = string.gsub(trimmed, "/+$", "")
 	if trimmed == "" then
-		return nil
+		return DEFAULT_SERVER_BASE_URL
 	end
 	if string.sub(trimmed, 1, 7) ~= "http://" and string.sub(trimmed, 1, 8) ~= "https://" then
-		return nil
+		return DEFAULT_SERVER_BASE_URL
 	end
 	return trimmed
 end
 
-local function resolveConfiguredServerBaseUrl(): string
-	local workspaceValue = normalizeServerBaseUrl(Workspace:GetAttribute(SERVER_URL_WORKSPACE_ATTR))
-	if workspaceValue ~= nil then
-		return workspaceValue
-	end
-	local pluginValue = normalizeServerBaseUrl(plugin:GetSetting(SERVER_URL_SETTING_KEY))
-	if pluginValue ~= nil then
-		return pluginValue
-	end
-	return DEFAULT_SERVER_BASE_URL
-end
-
-local function refreshServerBaseUrl()
-	currentServerBaseUrl = resolveConfiguredServerBaseUrl()
-	Workspace:SetAttribute(SERVER_URL_WORKSPACE_ATTR, currentServerBaseUrl)
-end
-
 local function requestRaw(endpoint: string): (boolean, any)
-	local url = currentServerBaseUrl .. endpoint
+	local url = getServerBaseUrl() .. endpoint
 	local ok, result = pcall(function()
 		return HttpService:RequestAsync({
 			Url = url,
@@ -980,7 +964,7 @@ local function ensureProjectBootstrap(force: boolean): boolean
 	if statusCode == 404 then
 		projectMappingsLoaded = false
 		projectSyncBlocked = true
-		setProjectStatus("mismatch", string.format("Server at %s does not expose /project", currentServerBaseUrl), activeProjectName, true)
+		setProjectStatus("mismatch", string.format("Server at %s does not expose /project", getServerBaseUrl()), activeProjectName, true)
 		return false
 	end
 
@@ -998,7 +982,6 @@ local function ensureProjectBootstrap(force: boolean): boolean
 end
 
 local function handleServerUrlChanged()
-	refreshServerBaseUrl()
 	projectMappingsLoaded = false
 	projectSyncBlocked = false
 	resyncRequested = true
@@ -1118,7 +1101,7 @@ local function ackPluginCommand(commandId: string, success: boolean, message: st
 			message = message,
 		})
 		HttpService:RequestAsync({
-			Url = currentServerBaseUrl .. "/plugin/command/ack",
+			Url = getServerBaseUrl() .. "/plugin/command/ack",
 			Method = "POST",
 			Headers = {
 				["Content-Type"] = "application/json",
@@ -1347,7 +1330,7 @@ local function reportPluginState()
 	pcall(function()
 		local jsonBody: string = HttpService:JSONEncode(payload)
 		local raw = HttpService:RequestAsync({
-			Url = currentServerBaseUrl .. "/plugin/state",
+			Url = getServerBaseUrl() .. "/plugin/state",
 			Method = "POST",
 			Headers = {
 				["Content-Type"] = "application/json",
@@ -1399,7 +1382,7 @@ local function reportPluginManaged()
 	pcall(function()
 		local jsonBody: string = HttpService:JSONEncode(payload)
 		HttpService:RequestAsync({
-			Url = currentServerBaseUrl .. "/plugin/managed",
+			Url = getServerBaseUrl() .. "/plugin/managed",
 			Method = "POST",
 			Headers = {
 				["Content-Type"] = "application/json",
@@ -3666,7 +3649,7 @@ local function tryConnectWebSocket()
 		return false
 	end
 
-	local wsUrl = wsUrlFromHttpBase(currentServerBaseUrl)
+	local wsUrl = wsUrlFromHttpBase(getServerBaseUrl())
 	local ok, socketOrErr = pcall(function()
 		return (WebSocketService :: any):ConnectAsync(wsUrl)
 	end)
@@ -3733,7 +3716,6 @@ local function loadSettings()
 	if type(histBuf) == "number" and histBuf >= 16 and histBuf <= 1024 then
 		settingHistoryBuffer = math.floor(histBuf)
 	end
-	refreshServerBaseUrl()
 end
 
 local function saveSetting(key: string, value: any)
@@ -4726,7 +4708,7 @@ welcomeCheckBtn.MouseButton1Click:Connect(function()
 		resyncRequested = true
 	else
 		connectionState = "error"
-		showToast(string.format("Server not reachable at %s", currentServerBaseUrl), TOAST_COLOR_ERROR)
+		showToast(string.format("Server not reachable at %s", getServerBaseUrl()), TOAST_COLOR_ERROR)
 	end
 end)
 
@@ -5194,4 +5176,4 @@ end)
 
 end -- _initPlugin
 _initPlugin()
-Workspace:GetAttributeChangedSignal(SERVER_URL_WORKSPACE_ATTR):Connect(handleServerUrlChanged)
+Workspace:GetAttributeChangedSignal("VertigoSyncServerUrl"):Connect(handleServerUrlChanged)
