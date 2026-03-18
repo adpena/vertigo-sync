@@ -6,17 +6,17 @@ Vertigo Sync reads the same `default.project.json` format that Rojo established.
 
 | Task | Rojo | Vertigo Sync |
 |------|------|--------------|
-| Start sync server | `rojo serve default.project.json` | `vertigo-sync --turbo serve` |
-| Build place file | `rojo build default.project.json -o place.rbxl` | `vertigo-sync build -o place.rbxl` |
+| Start sync server | `rojo serve default.project.json` | `vsync serve` |
+| Build place file | `rojo build default.project.json -o place.rbxl` | `vsync build -o place.rbxl` |
 | Default port | `34872` | `7575` |
-| Plugin install | Manual `.rbxm` install | `vertigo-sync plugin-install` |
+| Plugin install | Manual `.rbxm` install | `vsync plugin-install` |
 
 ## Step-by-Step Migration
 
 ### 1. Install Vertigo Sync
 
 ```bash
-cargo install --path services/vertigo-sync
+cargo install --path .
 ```
 
 ### 2. Stop Rojo
@@ -28,7 +28,7 @@ If Rojo is running, stop it. You can run both simultaneously on different ports,
 From the same project root where you ran `rojo serve`:
 
 ```bash
-vertigo-sync --turbo serve
+vsync serve
 ```
 
 That is it. Vertigo Sync reads the same `default.project.json` and maps the same source paths.
@@ -36,7 +36,7 @@ That is it. Vertigo Sync reads the same `default.project.json` and maps the same
 ### 4. Install the Studio Plugin
 
 ```bash
-vertigo-sync plugin-install
+vsync plugin-install
 ```
 
 If you had the Rojo plugin installed, disable it in Studio to avoid conflicts.
@@ -69,7 +69,7 @@ The Vertigo Sync plugin connects automatically. You should see a green "Connecte
 Rojo intentionally defers linting to dedicated tools like Selene, which is a reasonable design choice for a sync-focused tool. Vertigo Sync takes a different approach and bundles a built-in linter for convenience:
 
 ```bash
-vertigo-sync validate
+vsync validate
 ```
 
 Rules cover strict mode, NCG optimization, deprecated APIs, hot-path allocations, and cross-boundary requires.
@@ -117,7 +117,7 @@ You can run Rojo and Vertigo Sync side by side during evaluation:
 rojo serve default.project.json
 
 # Terminal 2: Vertigo Sync on its default port
-vertigo-sync --turbo serve
+vsync serve
 ```
 
 They use different ports (34872 vs 7575) and different Studio plugins, so there is no conflict. Enable only one plugin at a time in Studio.

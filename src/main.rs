@@ -17,19 +17,20 @@ use vertigo_sync::{
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "vertigo-sync",
+    name = "vsync",
     version,
     about = "Fast, deterministic source sync for Roblox Studio",
     long_about = "Vertigo Sync provides sub-millisecond source synchronization between your \
                   filesystem and Roblox Studio. It replaces Rojo with better performance, \
                   built-in validation, and agent-native MCP tools.",
     after_help = "Examples:\n  \
-                  vertigo-sync serve --turbo                                Start syncing in turbo mode\n  \
-                  vertigo-sync serve --project roblox/default.project.json  Serve a nested Roblox project\n  \
-                  vertigo-sync build -o game.rbxl                           Build a place file\n  \
-                  vertigo-sync doctor               Check project health\n  \
-                  vertigo-sync init                 Create a new project\n  \
-                  vertigo-sync plugin-install       Install Studio plugin\n\n\
+                  vsync serve                                               Start syncing using the discovered project\n  \
+                  vsync serve --turbo                                       Start syncing in turbo mode\n  \
+                  vsync serve --project roblox/default.project.json         Serve a nested Roblox project explicitly\n  \
+                  vsync build -o game.rbxl                                  Build a place file\n  \
+                  vsync doctor                                              Check project health\n  \
+                  vsync init                                                Create a new project\n  \
+                  vsync plugin-install                                      Install Studio plugin\n\n\
                   Learn more: https://github.com/pena/vertigo-sync",
     term_width = 100
 )]
@@ -126,6 +127,7 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Debug)]
 struct ProjectContext {
     project_path: PathBuf,
     project_root: PathBuf,
@@ -367,6 +369,7 @@ fn resolve_project_context(
     } else {
         root.join(project)
     };
+    let project_path = resolve_project_path(root, project, &project_path)?;
     let tree = parse_project(&project_path)?;
     let includes = resolve_effective_includes(&project_path, cli_includes);
     let project_root = project_path
@@ -380,6 +383,97 @@ fn resolve_project_context(
         includes,
         tree,
     })
+}
+
+fn resolve_project_path(root: &Path, requested: &Path, candidate: &Path) -> Result<PathBuf> {
+    if candidate.is_file() {
+        return Ok(candidate.to_path_buf());
+    }
+
+    if requested != Path::new("default.project.json") {
+        bail!("project file not found: {}", candidate.display());
+    }
+
+    if let Some(discovered) = discover_single_project_path(root)? {
+        return Ok(discovered);
+    }
+
+    bail!(
+        "project file not found: {} (and no unambiguous nested default.project.json was discovered under {})",
+        candidate.display(),
+        root.display()
+    );
+}
+
+fn discover_single_project_path(root: &Path) -> Result<Option<PathBuf>> {
+    let mut matches = Vec::new();
+    collect_project_files(root, root, 0, &mut matches)?;
+
+    if matches.is_empty() {
+        return Ok(None);
+    }
+
+    if matches.len() == 1 {
+        return Ok(matches.into_iter().next());
+    }
+
+    let rendered = matches
+        .iter()
+        .map(|path| path.strip_prefix(root).unwrap_or(path).display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "multiple nested project files found under {}: {}. Pass --project explicitly",
+        root.display(),
+        rendered
+    );
+}
+
+fn collect_project_files(
+    root: &Path,
+    current: &Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if depth > 4 {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(current)
+        .with_context(|| format!("failed to read {}", current.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if file_type.is_dir() {
+            if should_skip_project_search_dir(root, &path, &name) {
+                continue;
+            }
+            collect_project_files(root, &path, depth + 1, out)?;
+            continue;
+        }
+
+        if file_type.is_file() && name == "default.project.json" {
+            out.push(path);
+        }
+    }
+
+    out.sort();
+    Ok(())
+}
+
+fn should_skip_project_search_dir(root: &Path, path: &Path, name: &str) -> bool {
+    if name.starts_with('.') {
+        return true;
+    }
+
+    matches!(
+        name,
+        "target" | "node_modules" | "Packages" | "DevPackages" | "build" | "dist" | "out" | ".git"
+    ) || path == root.join("target")
 }
 
 /// Recursively collect `$path` values from a Rojo/Vertigo project tree.
@@ -1380,9 +1474,9 @@ fn command_init(root: &Path, name: Option<&str>) -> Result<()> {
     output::success(&format!("Project '{project_name}' initialized"));
     eprintln!();
     output::info("Next steps:");
-    output::info("  vertigo-sync serve --turbo     Start syncing");
-    output::info("  vertigo-sync plugin-install     Install Studio plugin");
-    output::info("  vertigo-sync doctor             Verify project health");
+    output::info("  vsync serve --turbo             Start syncing");
+    output::info("  vsync plugin-install            Install Studio plugin");
+    output::info("  vsync doctor                    Verify project health");
 
     Ok(())
 }
@@ -2071,6 +2165,49 @@ mod tests {
         assert_eq!(context.project_root, nested_dir);
         assert_eq!(context.tree.name, "NestedGame");
         assert_eq!(context.includes, vec!["nested-src".to_string()]);
+    }
+
+    #[test]
+    fn resolve_project_context_auto_discovers_unique_nested_project() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let nested_dir = root.join("roblox");
+        write_project(
+            &nested_dir.join("default.project.json"),
+            "NestedGame",
+            "src/Server",
+        );
+
+        let context = resolve_project_context(root, Path::new("default.project.json"), &[])
+            .expect("resolve discovered project context");
+
+        assert_eq!(context.project_path, nested_dir.join("default.project.json"));
+        assert_eq!(context.project_root, nested_dir);
+        assert_eq!(context.tree.name, "NestedGame");
+    }
+
+    #[test]
+    fn resolve_project_context_rejects_ambiguous_nested_projects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        write_project(
+            &root.join("roblox/default.project.json"),
+            "GameA",
+            "src/Server",
+        );
+        write_project(
+            &root.join("packages/test/default.project.json"),
+            "GameB",
+            "src/Server",
+        );
+
+        let err = resolve_project_context(root, Path::new("default.project.json"), &[])
+            .expect_err("expected ambiguous project discovery to fail");
+
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("multiple nested project files"));
+        assert!(rendered.contains("roblox/default.project.json"));
+        assert!(rendered.contains("packages/test/default.project.json"));
     }
 
     #[test]

@@ -5,7 +5,7 @@ Zero to syncing in 60 seconds.
 ## Step 1: Install
 
 ```bash
-cargo install --path services/vertigo-sync
+cargo install --path .
 ```
 
 You should see cargo compile the crate and install the `vertigo-sync` binary.
@@ -20,10 +20,10 @@ You should see cargo compile the crate and install the `vertigo-sync` binary.
 
 ## Step 2: Start the Server
 
-From your project root (the directory containing `default.project.json`):
+From your project root:
 
 ```bash
-vertigo-sync --turbo serve
+vsync serve
 ```
 
 You should see the server announce its listening address and selected project, for example:

@@ -5,10 +5,10 @@
 Global options are passed before the subcommand.
 
 ```bash
-vertigo-sync --turbo serve
-vertigo-sync --root /path/to/project --turbo serve --project roblox/default.project.json
-vertigo-sync --root /path/to/project snapshot
-vertigo-sync --root /path/to/project build -o place.rbxl --project default.project.json
+vsync serve
+vsync --root /path/to/project --turbo serve --project roblox/default.project.json
+vsync --root /path/to/project snapshot
+vsync --root /path/to/project build -o place.rbxl --project default.project.json
 ```
 
 ### Global Flags
@@ -36,7 +36,7 @@ vertigo-sync --root /path/to/project build -o place.rbxl --project default.proje
 Serve snapshot, diff, and event data over HTTP + SSE.
 
 ```bash
-vertigo-sync --turbo serve --project default.project.json
+vsync --turbo serve --project default.project.json
 ```
 
 | Flag | Default | Description |
@@ -54,7 +54,7 @@ These commands use the global flags above and do not add command-specific flags.
 Build a place file from source.
 
 ```bash
-vertigo-sync build -o <output>
+vsync build -o <output>
 ```
 
 | Flag | Default | Description |
@@ -68,7 +68,7 @@ vertigo-sync build -o <output>
 Extract scripts from a place file back to the filesystem.
 
 ```bash
-vertigo-sync syncback --input place.rbxl
+vsync syncback --input place.rbxl
 ```
 
 | Flag | Default | Description |
@@ -82,7 +82,7 @@ vertigo-sync syncback --input place.rbxl
 Generate a Rojo-compatible `sourcemap.json` for luau-lsp.
 
 ```bash
-vertigo-sync sourcemap
+vsync sourcemap
 ```
 
 | Flag | Default | Description |
@@ -97,7 +97,7 @@ vertigo-sync sourcemap
 Create a new Vertigo Sync project with a standard directory structure.
 
 ```bash
-vertigo-sync init --name MyProject
+vsync init --name MyProject
 ```
 
 | Flag | Default | Description |
@@ -109,7 +109,7 @@ vertigo-sync init --name MyProject
 Install the Studio plugin to the Roblox plugins directory.
 
 ```bash
-vertigo-sync plugin-install
+vsync plugin-install
 ```
 
 The command copies the plugin file to the Roblox user plugins directory for the current platform.

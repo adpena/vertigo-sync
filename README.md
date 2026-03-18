@@ -42,16 +42,16 @@ If you encounter a behavioral difference not listed here, please [file an issue]
 
 ```bash
 # Install from this checkout
-cargo install --path services/vertigo-sync
+cargo install --path .
 
 # Start syncing
-vertigo-sync --turbo serve
+vsync serve
 
 # Serve a nested Roblox project from a monorepo root
-vertigo-sync --root . --turbo serve --project roblox/default.project.json
+vsync --root . --turbo serve --project roblox/default.project.json
 
 # Install the Studio plugin
-vertigo-sync plugin-install
+vsync plugin-install
 ```
 
 Open Roblox Studio. The plugin connects automatically when the server is listening on `127.0.0.1:7575`.
@@ -73,13 +73,15 @@ Open Roblox Studio. The plugin connects automatically when the server is listeni
 ### From source
 
 ```bash
-cargo install --path services/vertigo-sync
+cargo install --path .
 ```
+
+This installs both `vsync` and the compatibility alias `vertigo-sync`.
 
 ## Studio Plugin
 
 ```bash
-vertigo-sync plugin-install
+vsync plugin-install
 ```
 
 The plugin provides:
@@ -107,14 +109,14 @@ The plugin runs a 4-stage pipeline on every Heartbeat:
 
 | Command | Description |
 |---------|-------------|
-| `vertigo-sync serve` | Start the sync server (default port 7575) |
-| `vertigo-sync --root path --turbo serve --project path/to/default.project.json` | Serve a project file that lives below the current workspace root |
-| `vertigo-sync --turbo serve` | Start with 10 ms FSEvents coalescing (faster sync) |
-| `vertigo-sync snapshot` | Print deterministic source tree snapshot |
-| `vertigo-sync doctor` | Run determinism and health validation |
-| `vertigo-sync validate` | Run Luau source validation |
-| `vertigo-sync build -o place.rbxl` | Build a place file from source |
-| `vertigo-sync plugin-install` | Install the Studio plugin |
+| `vsync serve` | Start the sync server and auto-discover a unique nested `default.project.json` when needed |
+| `vsync --root path --turbo serve --project path/to/default.project.json` | Serve a project file that lives below the current workspace root |
+| `vsync --turbo serve` | Start with 10 ms FSEvents coalescing (faster sync) |
+| `vsync snapshot` | Print deterministic source tree snapshot |
+| `vsync doctor` | Run determinism and health validation |
+| `vsync validate` | Run Luau source validation |
+| `vsync build -o place.rbxl` | Build a place file from source |
+| `vsync plugin-install` | Install the Studio plugin |
 
 ## Migrating from Rojo
 
@@ -125,7 +127,7 @@ Your existing `default.project.json` works as-is. Just change the command:
 rojo serve default.project.json
 
 # After (Vertigo Sync)
-vertigo-sync --turbo serve --project default.project.json
+vsync serve
 ```
 
 See [Migration Guide](docs/migration-from-rojo.md) for the full walkthrough.
@@ -209,7 +211,7 @@ filesystem ──► vertigo-sync server ──► Studio plugin
 
 **How it works:**
 
-1. `vertigo-sync` watches your source tree using native FSEvents (macOS) or inotify (Linux) with configurable coalescing
+1. `vsync` watches your source tree using native FSEvents (macOS) or inotify (Linux) with configurable coalescing
 2. On each change, it rebuilds a content-addressed snapshot using SHA-256 hashes and mtime/size caching
 3. The Studio plugin connects via WebSocket (primary), SSE (secondary), or HTTP polling (tertiary)
 4. File changes are delivered as diffs, fetched concurrently, and applied within a frame-budgeted loop
