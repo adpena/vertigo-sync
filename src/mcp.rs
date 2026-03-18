@@ -516,9 +516,24 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
             "sync_plugin_command",
             "Send a command to the Studio plugin (toggle sync, force resync, adjust frame budget, run builders, set log level, time travel)",
             vec![
-                param("command", "string", "Command: toggle_sync | force_resync | set_frame_budget | run_builders | set_log_level | time_travel", true),
-                param("params", "object", "Command parameters (e.g. {\"budget_ms\": 8} for set_frame_budget, {\"level\": \"verbose\"} for set_log_level, {\"action\": \"rewind\", \"fingerprint\": \"abc123\"} for time_travel — actions: rewind, step_back, step_forward, jump_oldest, resume_live)", false),
-                param("wait", "boolean", "Wait for plugin acknowledgment (default false, max 10s)", false),
+                param(
+                    "command",
+                    "string",
+                    "Command: toggle_sync | force_resync | set_frame_budget | run_builders | set_log_level | time_travel",
+                    true,
+                ),
+                param(
+                    "params",
+                    "object",
+                    "Command parameters (e.g. {\"budget_ms\": 8} for set_frame_budget, {\"level\": \"verbose\"} for set_log_level, {\"action\": \"rewind\", \"fingerprint\": \"abc123\"} for time_travel — actions: rewind, step_back, step_forward, jump_oldest, resume_live)",
+                    false,
+                ),
+                param(
+                    "wait",
+                    "boolean",
+                    "Wait for plugin acknowledgment (default false, max 10s)",
+                    false,
+                ),
             ],
         ),
         // ── Filesystem watcher health ───────────────────────────────
@@ -532,8 +547,18 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
             "sync_file_history",
             "Get change history for a specific file path across snapshots",
             vec![
-                param("path", "string", "File path to trace (e.g. src/Server/Services/DataService.luau)", true),
-                param("limit", "integer", "Max events to return (default 20)", false),
+                param(
+                    "path",
+                    "string",
+                    "File path to trace (e.g. src/Server/Services/DataService.luau)",
+                    true,
+                ),
+                param(
+                    "limit",
+                    "integer",
+                    "Max events to return (default 20)",
+                    false,
+                ),
             ],
         ),
         // ── Builder codegen tools ────────────────────────────────────
@@ -541,9 +566,24 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
             "sync_scaffold_builder",
             "Create a new builder module from template. The builder generates geometry procedurally in Edit mode.",
             vec![
-                param("name", "string", "Builder name (e.g. CoralCaveBuilder)", true),
-                param("zone", "string", "Zone name (e.g. Coral Cave, Hub, Abyss)", true),
-                param("y_range", "string", "Vertical range (e.g. '-50 to -20')", false),
+                param(
+                    "name",
+                    "string",
+                    "Builder name (e.g. CoralCaveBuilder)",
+                    true,
+                ),
+                param(
+                    "zone",
+                    "string",
+                    "Zone name (e.g. Coral Cave, Hub, Abyss)",
+                    true,
+                ),
+                param(
+                    "y_range",
+                    "string",
+                    "Vertical range (e.g. '-50 to -20')",
+                    false,
+                ),
                 param("description", "string", "What this builder creates", false),
             ],
         ),
@@ -551,9 +591,24 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
             "sync_convert_to_builder",
             "Convert a .model.json instance tree into a builder .luau module that generates the same geometry procedurally",
             vec![
-                param("input_path", "string", "Path to .model.json file to convert", true),
-                param("output_path", "string", "Path for the generated builder .luau (default: same directory, .luau extension)", false),
-                param("builder_name", "string", "Module name for the builder (default: derived from filename)", false),
+                param(
+                    "input_path",
+                    "string",
+                    "Path to .model.json file to convert",
+                    true,
+                ),
+                param(
+                    "output_path",
+                    "string",
+                    "Path for the generated builder .luau (default: same directory, .luau extension)",
+                    false,
+                ),
+                param(
+                    "builder_name",
+                    "string",
+                    "Module name for the builder (default: derived from filename)",
+                    false,
+                ),
             ],
         ),
     ])
@@ -897,9 +952,7 @@ fn bridge_error_response(
 
 fn exec_bridge_manifest(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
     let (source_hash, entry_count) = {
-        let lock = state
-            .current
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
         (lock.fingerprint.clone(), lock.entries.len())
     };
 
@@ -935,9 +988,7 @@ fn exec_bridge_method(
     match method {
         "bridge.hello" => {
             let (source_hash, entry_count) = {
-                let lock = state
-                    .current
-                    .lock().unwrap_or_else(|e| e.into_inner());
+                let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
                 (lock.fingerprint.clone(), lock.entries.len())
             };
             Ok(serde_json::json!({
@@ -1157,9 +1208,10 @@ fn exec_bridge_batch(
 
         if stop_on_error
             && let Some(last) = responses.last()
-                && last["ok"].as_bool() == Some(false) {
-                    break;
-                }
+            && last["ok"].as_bool() == Some(false)
+        {
+            break;
+        }
     }
 
     Ok(serde_json::json!({
@@ -1222,15 +1274,11 @@ fn rebuild_snapshot(state: &ServerState) -> Result<String, (StatusCode, String)>
     let new_arc = Arc::new(new_snapshot);
 
     {
-        let mut lock = state
-            .current
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
         *lock = Arc::clone(&new_arc);
     }
     {
-        let mut lock = state
-            .history
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
         lock.insert(new_hash.clone(), new_arc);
     }
 
@@ -1257,9 +1305,7 @@ fn exec_health() -> Result<serde_json::Value, (StatusCode, String)> {
 }
 
 fn exec_snapshot(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
-    let lock = state
-        .current
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
     serde_json::to_value(&**lock).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
@@ -1275,9 +1321,7 @@ fn exec_diff(
     })?;
 
     let old = {
-        let lock = state
-            .history
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
         lock.get(since_hash).cloned()
     };
 
@@ -1289,9 +1333,7 @@ fn exec_diff(
     })?;
 
     let current = {
-        let lock = state
-            .current
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(&lock)
     };
 
@@ -1300,9 +1342,7 @@ fn exec_diff(
 }
 
 fn exec_sources(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
-    let lock = state
-        .current
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
 
     let entries: Vec<serde_json::Value> = lock
         .entries
@@ -1520,9 +1560,7 @@ fn exec_search(
 }
 
 fn exec_stats(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
-    let lock = state
-        .current
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
 
     Ok(compute_stats(&lock))
 }
@@ -1842,9 +1880,10 @@ fn grep_dir(
             .unwrap_or_default();
 
         if let Some(glob) = glob_filter
-            && !matches_glob(file_name, glob) {
-                continue;
-            }
+            && !matches_glob(file_name, glob)
+        {
+            continue;
+        }
 
         let rel_path = match path.strip_prefix(root) {
             Ok(r) => r.to_string_lossy().replace('\\', "/"),
@@ -2110,9 +2149,7 @@ fn exec_check_conflict(
     let _target = validate_path(&source_root, raw_path)?;
 
     // Collect all existing paths from snapshot to check case-insensitive collisions.
-    let lock = state
-        .current
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
 
     let proposed_lower = raw_path.to_lowercase();
     let mut conflicts: Vec<serde_json::Value> = Vec::new();
@@ -2267,9 +2304,7 @@ fn exec_describe_changes(
 
     // Find the old snapshot — either the requested one, or the earliest in history.
     let old = {
-        let lock = state
-            .history
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(hash) = since_hash {
             lock.get(hash).cloned()
@@ -2277,7 +2312,8 @@ fn exec_describe_changes(
             // Use the history_order to get the earliest snapshot.
             let order = state
                 .history_order
-                .lock().unwrap_or_else(|e| e.into_inner());
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             order.front().and_then(|h| lock.get(h).cloned())
         }
     };
@@ -2293,9 +2329,7 @@ fn exec_describe_changes(
     };
 
     let current = {
-        let lock = state
-            .current
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(&lock)
     };
 
@@ -2348,9 +2382,7 @@ fn exec_tree(
     let raw_path = args["path"].as_str().unwrap_or("");
     let max_depth = args["depth"].as_u64().unwrap_or(3) as usize;
 
-    let lock = state
-        .current
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
 
     // Build a tree from the snapshot entries, filtered by prefix.
     let prefix = if raw_path.is_empty() {
@@ -2439,23 +2471,17 @@ fn exec_status(state: &ServerState) -> Result<serde_json::Value, (StatusCode, St
     };
 
     let current_hash = {
-        let lock = state
-            .current
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
         lock.fingerprint.clone()
     };
 
     let history_count = {
-        let lock = state
-            .history
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
         lock.len()
     };
 
     let sequence = {
-        let lock = state
-            .sequence
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.sequence.lock().unwrap_or_else(|e| e.into_inner());
         *lock
     };
 
@@ -2485,11 +2511,10 @@ fn exec_events(
     // History order gives us the chronological sequence of snapshot hashes.
     let order = state
         .history_order
-        .lock().unwrap_or_else(|e| e.into_inner());
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
-    let history = state
-        .history
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let history = state.history.lock().unwrap_or_else(|e| e.into_inner());
 
     // Take the last `limit + 1` entries so we can diff consecutive pairs.
     let total = order.len();
@@ -2511,9 +2536,12 @@ fn exec_events(
                 "deleted": diff.deleted.len(),
             });
             if detail {
-                event["added_paths"] = serde_json::json!(diff.added.iter().map(|e| &e.path).collect::<Vec<_>>());
-                event["modified_paths"] = serde_json::json!(diff.modified.iter().map(|e| &e.path).collect::<Vec<_>>());
-                event["deleted_paths"] = serde_json::json!(diff.deleted.iter().map(|e| &e.path).collect::<Vec<_>>());
+                event["added_paths"] =
+                    serde_json::json!(diff.added.iter().map(|e| &e.path).collect::<Vec<_>>());
+                event["modified_paths"] =
+                    serde_json::json!(diff.modified.iter().map(|e| &e.path).collect::<Vec<_>>());
+                event["deleted_paths"] =
+                    serde_json::json!(diff.deleted.iter().map(|e| &e.path).collect::<Vec<_>>());
             }
             events.push(event);
         }
@@ -2619,9 +2647,10 @@ fn search_dir(
 
         // Apply glob filter (simple suffix/extension matching).
         if let Some(glob) = glob_filter
-            && !matches_glob(file_name, glob) {
-                continue;
-            }
+            && !matches_glob(file_name, glob)
+        {
+            continue;
+        }
 
         let rel_path = match path.strip_prefix(root) {
             Ok(r) => r.to_string_lossy().replace('\\', "/"),
@@ -3486,7 +3515,11 @@ mod tests {
             .build()
             .unwrap();
         let tools = rt.block_on(async { handle_mcp_tools().await });
-        assert_eq!(tools.0.len(), 47, "expected 47 MCP tools (45 existing + 2 new: scaffold_builder, convert_to_builder)");
+        assert_eq!(
+            tools.0.len(),
+            47,
+            "expected 47 MCP tools (45 existing + 2 new: scaffold_builder, convert_to_builder)"
+        );
     }
 
     #[test]
@@ -3914,11 +3947,8 @@ mod tests {
             *state.current.lock().unwrap() = snap2;
         }
 
-        let result = exec_sync_file_history(
-            &state,
-            &serde_json::json!({"path": "src/test.luau"}),
-        )
-        .unwrap();
+        let result =
+            exec_sync_file_history(&state, &serde_json::json!({"path": "src/test.luau"})).unwrap();
         assert_eq!(result["history_events"], 1);
         assert_eq!(result["events"][0]["action"], "modified");
         assert_eq!(result["events"][0]["previous_sha256"], "aaa");
@@ -3964,7 +3994,8 @@ mod tests {
         assert!(first_event.get("added_paths").is_none());
 
         // With detail.
-        let result = exec_events(&state, &serde_json::json!({"limit": 10, "detail": true})).unwrap();
+        let result =
+            exec_events(&state, &serde_json::json!({"limit": 10, "detail": true})).unwrap();
         assert_eq!(result["detail"], true);
         let first_event = &result["events"][0];
         assert!(first_event["added_paths"].is_array());
@@ -4011,9 +4042,7 @@ fn exec_rbxl_load(
     let ref_map = crate::rbxl::build_ref_map(&dom);
     let instance_count = ref_map.len();
 
-    let mut lock = state
-        .rbxl
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let mut lock = state.rbxl.lock().unwrap_or_else(|e| e.into_inner());
     lock.dom = Some(dom);
     lock.ref_map = ref_map;
     lock.loaded_path = Some(resolved.clone());
@@ -4026,9 +4055,7 @@ fn exec_rbxl_load(
 }
 
 fn exec_rbxl_tree(state: &Arc<ServerState>) -> Result<serde_json::Value, (StatusCode, String)> {
-    let lock = state
-        .rbxl
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let lock = state.rbxl.lock().unwrap_or_else(|e| e.into_inner());
     let dom = lock.dom.as_ref().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_REQUIRED,
@@ -4044,9 +4071,7 @@ fn exec_rbxl_query(
     state: &Arc<ServerState>,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let lock = state
-        .rbxl
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let lock = state.rbxl.lock().unwrap_or_else(|e| e.into_inner());
     let dom = lock.dom.as_ref().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_REQUIRED,
@@ -4063,9 +4088,7 @@ fn exec_rbxl_query(
 }
 
 fn exec_rbxl_scripts(state: &Arc<ServerState>) -> Result<serde_json::Value, (StatusCode, String)> {
-    let lock = state
-        .rbxl
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let lock = state.rbxl.lock().unwrap_or_else(|e| e.into_inner());
     let dom = lock.dom.as_ref().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_REQUIRED,
@@ -4078,9 +4101,7 @@ fn exec_rbxl_scripts(state: &Arc<ServerState>) -> Result<serde_json::Value, (Sta
 }
 
 fn exec_rbxl_meshes(state: &Arc<ServerState>) -> Result<serde_json::Value, (StatusCode, String)> {
-    let lock = state
-        .rbxl
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let lock = state.rbxl.lock().unwrap_or_else(|e| e.into_inner());
     let dom = lock.dom.as_ref().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_REQUIRED,
@@ -4100,10 +4121,7 @@ fn exec_sync_history(
     state: &ServerState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(50) as usize;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
     let limit = limit.min(500);
 
     let event_log_path = state.root.join(".vertigo-sync-state").join("events.jsonl");
@@ -4128,46 +4146,41 @@ fn exec_sync_rewind(
         })?;
 
     let target = {
-        let lock = state
-            .history
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
         lock.get(fingerprint).cloned()
     };
 
     let target = target.ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            format!("fingerprint {} not found in history ring buffer", fingerprint),
+            format!(
+                "fingerprint {} not found in history ring buffer",
+                fingerprint
+            ),
         )
     })?;
 
     let current = {
-        let lock = state
-            .current
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
         std::sync::Arc::clone(&lock)
     };
 
     let forward = crate::diff_snapshots(&target, &current);
     let reversed = crate::reverse_diff(&forward);
 
-    serde_json::to_value(&reversed)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    serde_json::to_value(&reversed).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 fn exec_sync_model_manifest(
     state: &ServerState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let path = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "missing required parameter: path".to_string(),
-            )
-        })?;
+    let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing required parameter: path".to_string(),
+        )
+    })?;
 
     if !path.ends_with(".rbxm") && !path.ends_with(".rbxmx") {
         return Err((
@@ -4193,48 +4206,34 @@ fn exec_sync_model_manifest(
 
     // Look up content hash from snapshot for cache key.
     let content_hash = {
-        let lock = state
-            .current
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
         lock.entries
             .iter()
             .find(|e| e.path == path)
             .map(|e| e.sha256.clone())
     };
 
-    let mut cache_lock = state
-        .model_cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut cache_lock = state.model_cache.lock().unwrap_or_else(|e| e.into_inner());
 
     let manifest = if let Some(hash) = content_hash {
         cache_lock.get_or_load(&hash, &canonical)
     } else {
         // File not in snapshot — deserialize directly without caching.
         drop(cache_lock);
-        let m = crate::deserialize_model_manifest(&canonical).map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        let m = crate::deserialize_model_manifest(&canonical)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         return serde_json::to_value(&m)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
     };
 
-    let manifest = manifest.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
+    let manifest = manifest.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    serde_json::to_value(manifest)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    serde_json::to_value(manifest).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-fn exec_sync_config(
-    state: &ServerState,
-) -> Result<serde_json::Value, (StatusCode, String)> {
+fn exec_sync_config(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
     let history_size = {
-        let lock = state
-            .history
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
         lock.len()
     };
     Ok(serde_json::json!({
@@ -4247,9 +4246,7 @@ fn exec_sync_config(
     }))
 }
 
-fn exec_sync_plugin_state(
-    state: &ServerState,
-) -> Result<serde_json::Value, (StatusCode, String)> {
+fn exec_sync_plugin_state(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
     let data = state
         .plugin_state
         .lock()
@@ -4321,7 +4318,7 @@ async fn exec_sync_plugin_command(
     state: &Arc<ServerState>,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    use crate::{PluginCommand, PLUGIN_COMMAND_QUEUE_CAPACITY};
+    use crate::{PLUGIN_COMMAND_QUEUE_CAPACITY, PluginCommand};
 
     let command = args["command"]
         .as_str()
@@ -4442,9 +4439,7 @@ async fn exec_sync_plugin_command(
 // Filesystem watcher health
 // ---------------------------------------------------------------------------
 
-fn exec_sync_watch_status(
-    state: &ServerState,
-) -> Result<serde_json::Value, (StatusCode, String)> {
+fn exec_sync_watch_status(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
     let coalescer_info = {
         let lock = state.coalescer.lock().unwrap_or_else(|e| e.into_inner());
         lock.as_ref().map(|c| c.status())
@@ -4458,9 +4453,7 @@ fn exec_sync_watch_status(
 
     match coalescer_info {
         Some(status) => {
-            let last_event_ms = status
-                .last_event_elapsed
-                .map(|d| d.as_millis() as u64);
+            let last_event_ms = status.last_event_elapsed.map(|d| d.as_millis() as u64);
             Ok(serde_json::json!({
                 "watcher_type": watcher_type,
                 "coalesce_window_ms": status.window.as_millis() as u64,
@@ -4503,10 +4496,7 @@ fn exec_sync_file_history(
         .history_order
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let history = state
-        .history
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let history = state.history.lock().unwrap_or_else(|e| e.into_inner());
 
     // Walk consecutive snapshot pairs looking for changes to this file.
     let mut events: Vec<serde_json::Value> = Vec::new();
@@ -4562,10 +4552,7 @@ fn exec_sync_file_history(
 
     // Current state of the file.
     let current_state = {
-        let current = state
-            .current
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let current = state.current.lock().unwrap_or_else(|e| e.into_inner());
         current
             .entries
             .iter()

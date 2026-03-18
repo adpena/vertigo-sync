@@ -327,7 +327,8 @@ impl SnapshotCache {
 
     /// Remove entries for paths no longer present — borrows path refs to avoid cloning.
     pub fn retain_paths_ref(&mut self, live_paths: &HashSet<&str>) {
-        self.entries.retain(|key, _| live_paths.contains(key.as_str()));
+        self.entries
+            .retain(|key, _| live_paths.contains(key.as_str()));
     }
 
     /// Number of cached entries (for diagnostics).
@@ -637,7 +638,13 @@ pub fn build_snapshot_cached_with_metrics(
     cache: &mut SnapshotCache,
     metrics: &Metrics,
 ) -> Result<Snapshot> {
-    build_snapshot_cached_inner(root, includes, cache, Some(metrics), &GlobIgnoreSet::empty())
+    build_snapshot_cached_inner(
+        root,
+        includes,
+        cache,
+        Some(metrics),
+        &GlobIgnoreSet::empty(),
+    )
 }
 
 /// Cached snapshot build with glob ignore patterns.
@@ -1117,10 +1124,14 @@ pub fn run_watch(
             added_paths: diff.added.iter().map(|f| f.path.clone()).collect(),
             modified_paths: diff.modified.iter().map(|f| f.path.clone()).collect(),
             deleted_paths: diff.deleted.iter().map(|f| f.path.clone()).collect(),
-            renamed_paths: diff.renamed.iter().map(|r| RenamedPathEvent {
-                old_path: r.old_path.clone(),
-                new_path: r.new_path.clone(),
-            }).collect(),
+            renamed_paths: diff
+                .renamed
+                .iter()
+                .map(|r| RenamedPathEvent {
+                    old_path: r.old_path.clone(),
+                    new_path: r.new_path.clone(),
+                })
+                .collect(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -1232,10 +1243,14 @@ pub fn run_watch_native(
             added_paths: diff.added.iter().map(|f| f.path.clone()).collect(),
             modified_paths: diff.modified.iter().map(|f| f.path.clone()).collect(),
             deleted_paths: diff.deleted.iter().map(|f| f.path.clone()).collect(),
-            renamed_paths: diff.renamed.iter().map(|r| RenamedPathEvent {
-                old_path: r.old_path.clone(),
-                new_path: r.new_path.clone(),
-            }).collect(),
+            renamed_paths: diff
+                .renamed
+                .iter()
+                .map(|r| RenamedPathEvent {
+                    old_path: r.old_path.clone(),
+                    new_path: r.new_path.clone(),
+                })
+                .collect(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -1286,6 +1301,7 @@ impl RbxlDomCache {
 pub struct ServerState {
     pub root: PathBuf,
     pub canonical_root: PathBuf,
+    pub project_path: PathBuf,
     pub includes: Vec<String>,
     pub current: Mutex<Arc<Snapshot>>,
     pub history: Mutex<BTreeMap<String, Arc<Snapshot>>>,
@@ -1353,6 +1369,7 @@ impl ServerState {
             coalesce_ms,
             binary_models,
             GlobIgnoreSet::empty(),
+            None,
         )
     }
 
@@ -1365,6 +1382,7 @@ impl ServerState {
         coalesce_ms: u64,
         binary_models: bool,
         glob_ignores: GlobIgnoreSet,
+        project_path: Option<PathBuf>,
     ) -> Arc<Self> {
         let capacity = channel_capacity.clamp(32, 16_384);
         let (tx, _rx) = tokio::sync::broadcast::channel::<SyncDiffEvent>(capacity);
@@ -1378,10 +1396,12 @@ impl ServerState {
         history.insert(arc.fingerprint.clone(), Arc::clone(&arc));
         history_order.push_back(arc.fingerprint.clone());
         let canonical_root = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let project_path = project_path.unwrap_or_else(|| root.join("default.project.json"));
 
         Arc::new(Self {
             root,
             canonical_root,
+            project_path,
             includes,
             current: Mutex::new(arc),
             history: Mutex::new(history),
@@ -1410,7 +1430,10 @@ impl ServerState {
 
     /// Garbage-collect expired plugin commands (older than TTL).
     pub fn gc_plugin_commands(&self) {
-        let mut queue = self.plugin_commands.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queue = self
+            .plugin_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         queue.retain(|cmd| {
             cmd.created_at
                 .map(|t| t.elapsed() < PLUGIN_COMMAND_TTL)
@@ -1438,7 +1461,10 @@ impl ServerState {
     /// Also runs GC first.
     pub fn drain_plugin_commands(&self) -> Vec<PluginCommand> {
         self.gc_plugin_commands();
-        let mut queue = self.plugin_commands.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queue = self
+            .plugin_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         queue.drain(..).collect()
     }
 
@@ -1447,9 +1473,7 @@ impl ServerState {
     pub fn poll_and_broadcast(&self) -> Result<()> {
         let start = Instant::now();
         let new_snapshot = {
-            let mut cache_lock = self
-                .cache
-                .lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache_lock = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             build_snapshot_cached_with_ignores(
                 &self.root,
                 &self.includes,
@@ -1480,9 +1504,7 @@ impl ServerState {
     /// event when the fingerprint changes.
     pub fn install_snapshot_and_broadcast(&self, new_snapshot: Snapshot) -> Result<()> {
         let current = {
-            let lock = self
-                .current
-                .lock().unwrap_or_else(|e| e.into_inner());
+            let lock = self.current.lock().unwrap_or_else(|e| e.into_inner());
             Arc::clone(&lock)
         };
 
@@ -1497,9 +1519,7 @@ impl ServerState {
         let new_arc = Arc::new(new_snapshot);
 
         let seq = {
-            let mut lock = self
-                .sequence
-                .lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = self.sequence.lock().unwrap_or_else(|e| e.into_inner());
             *lock += 1;
             *lock
         };
@@ -1510,26 +1530,24 @@ impl ServerState {
             added_paths: diff.added.iter().map(|f| f.path.clone()).collect(),
             modified_paths: diff.modified.iter().map(|f| f.path.clone()).collect(),
             deleted_paths: diff.deleted.iter().map(|f| f.path.clone()).collect(),
-            renamed_paths: diff.renamed.iter().map(|r| RenamedPathEvent {
-                old_path: r.old_path.clone(),
-                new_path: r.new_path.clone(),
-            }).collect(),
+            renamed_paths: diff
+                .renamed
+                .iter()
+                .map(|r| RenamedPathEvent {
+                    old_path: r.old_path.clone(),
+                    new_path: r.new_path.clone(),
+                })
+                .collect(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
         {
-            let mut lock = self
-                .current
-                .lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = self.current.lock().unwrap_or_else(|e| e.into_inner());
             *lock = Arc::clone(&new_arc);
         }
         {
-            let mut hist_lock = self
-                .history
-                .lock().unwrap_or_else(|e| e.into_inner());
-            let mut order_lock = self
-                .history_order
-                .lock().unwrap_or_else(|e| e.into_inner());
+            let mut hist_lock = self.history.lock().unwrap_or_else(|e| e.into_inner());
+            let mut order_lock = self.history_order.lock().unwrap_or_else(|e| e.into_inner());
 
             let fp = new_arc.fingerprint.clone();
             if !hist_lock.contains_key(&fp) {
@@ -1912,9 +1930,7 @@ pub fn parse_meta_json(content: &str) -> Result<InstanceMeta> {
         serde_json::from_str(content).context("failed to parse .meta.json")?;
     let properties = match raw.get("properties") {
         Some(serde_json::Value::Object(map)) => {
-            map.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         }
         _ => BTreeMap::new(),
     };
@@ -1955,13 +1971,15 @@ pub fn attach_meta_json(root: &Path, entries: &mut [SnapshotEntry]) {
         // Derive the expected .meta.json path: foo.luau -> foo.meta.json
         let meta_path = derive_meta_json_path(&entry.path);
         if let Some(meta_path) = meta_path
-            && meta_paths.contains(&meta_path) {
-                let abs = root.join(&meta_path);
-                if let Ok(content) = fs::read_to_string(&abs)
-                    && let Ok(meta) = parse_meta_json(&content) {
-                        entry.meta = Some(meta);
-                    }
+            && meta_paths.contains(&meta_path)
+        {
+            let abs = root.join(&meta_path);
+            if let Ok(content) = fs::read_to_string(&abs)
+                && let Ok(meta) = parse_meta_json(&content)
+            {
+                entry.meta = Some(meta);
             }
+        }
     }
 }
 
@@ -1981,7 +1999,11 @@ fn derive_meta_json_path(source_path: &str) -> Option<String> {
         Some(format!("{stem}.client.luau.meta.json"))
     } else if let Some(stem) = source_path.strip_suffix(".luau") {
         Some(format!("{stem}.meta.json"))
-    } else { source_path.strip_suffix(".lua").map(|stem| format!("{stem}.meta.json")) }
+    } else {
+        source_path
+            .strip_suffix(".lua")
+            .map(|stem| format!("{stem}.meta.json"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2069,7 +2091,13 @@ pub fn deserialize_model_manifest(path: &Path) -> Result<ModelManifest> {
 
     let mut instances = Vec::new();
     let mut ref_to_index: HashMap<rbx_dom_weak::types::Ref, usize> = HashMap::new();
-    collect_model_instances(&dom, dom.root_ref(), None, &mut instances, &mut ref_to_index);
+    collect_model_instances(
+        &dom,
+        dom.root_ref(),
+        None,
+        &mut instances,
+        &mut ref_to_index,
+    );
 
     let root_count = dom.root().children().len();
 

@@ -114,10 +114,21 @@ pub fn banner(version: &str, lines: &[(&str, &str)]) {
     if color_enabled() {
         use owo_colors::OwoColorize;
         let border_h = "\u{2500}".repeat(box_inner);
-        let _ = writeln!(w, "{}{border_h}{}", "\u{250C}".dimmed(), "\u{2510}".dimmed());
+        let _ = writeln!(
+            w,
+            "{}{border_h}{}",
+            "\u{250C}".dimmed(),
+            "\u{2510}".dimmed()
+        );
 
         // Empty line.
-        let _ = writeln!(w, "{}{:box_inner$}{}", "\u{2502}".dimmed(), "", "\u{2502}".dimmed());
+        let _ = writeln!(
+            w,
+            "{}{:box_inner$}{}",
+            "\u{2502}".dimmed(),
+            "",
+            "\u{2502}".dimmed()
+        );
 
         // Header line.
         let header_pad = box_inner - header_text.len();
@@ -134,7 +145,13 @@ pub fn banner(version: &str, lines: &[(&str, &str)]) {
         );
 
         // Empty line.
-        let _ = writeln!(w, "{}{:box_inner$}{}", "\u{2502}".dimmed(), "", "\u{2502}".dimmed());
+        let _ = writeln!(
+            w,
+            "{}{:box_inner$}{}",
+            "\u{2502}".dimmed(),
+            "",
+            "\u{2502}".dimmed()
+        );
 
         // Content lines.
         for (label, value) in lines {
@@ -153,9 +170,20 @@ pub fn banner(version: &str, lines: &[(&str, &str)]) {
         }
 
         // Empty line.
-        let _ = writeln!(w, "{}{:box_inner$}{}", "\u{2502}".dimmed(), "", "\u{2502}".dimmed());
+        let _ = writeln!(
+            w,
+            "{}{:box_inner$}{}",
+            "\u{2502}".dimmed(),
+            "",
+            "\u{2502}".dimmed()
+        );
 
-        let _ = writeln!(w, "{}{border_h}{}", "\u{2514}".dimmed(), "\u{2518}".dimmed());
+        let _ = writeln!(
+            w,
+            "{}{border_h}{}",
+            "\u{2514}".dimmed(),
+            "\u{2518}".dimmed()
+        );
     } else {
         // Plain-text fallback.
         let _ = writeln!(w, "Vertigo Sync v{version}");

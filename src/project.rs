@@ -502,7 +502,10 @@ mod tests {
 
     #[test]
     fn resolve_instance_class_csv_files() {
-        assert_eq!(resolve_instance_class("src/locale.csv"), "LocalizationTable");
+        assert_eq!(
+            resolve_instance_class("src/locale.csv"),
+            "LocalizationTable"
+        );
     }
 
     #[test]
@@ -553,26 +556,44 @@ mod tests {
             }
         }"#;
         let tree = parse_project_str(json, &PathBuf::from("test.project.json")).unwrap();
-        let lighting = tree.mappings.iter().find(|m| m.instance_path == "Lighting").expect("lighting mapping");
-        let props = lighting.properties.as_ref().expect("should have properties");
+        let lighting = tree
+            .mappings
+            .iter()
+            .find(|m| m.instance_path == "Lighting")
+            .expect("lighting mapping");
+        let props = lighting
+            .properties
+            .as_ref()
+            .expect("should have properties");
         assert!(props.contains_key("Brightness"));
         assert_eq!(props["Brightness"], serde_json::json!(2.0));
-        let attrs = lighting.attributes.as_ref().expect("should have attributes");
+        let attrs = lighting
+            .attributes
+            .as_ref()
+            .expect("should have attributes");
         assert!(attrs.contains_key("ZoneName"));
         assert_eq!(attrs["ZoneName"], serde_json::json!("overworld"));
     }
 
     #[test]
     fn parse_project_no_properties_returns_none() {
-        let tree = parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
-        let server = tree.mappings.iter().find(|m| m.fs_path == "src/Server").expect("server mapping");
+        let tree =
+            parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
+        let server = tree
+            .mappings
+            .iter()
+            .find(|m| m.fs_path == "src/Server")
+            .expect("server mapping");
         assert!(server.properties.is_none());
         assert!(server.attributes.is_none());
     }
 
     #[test]
     fn resolve_instance_class_model_json() {
-        assert_eq!(resolve_instance_class("src/Net/Remotes.model.json"), "ModuleScript");
+        assert_eq!(
+            resolve_instance_class("src/Net/Remotes.model.json"),
+            "ModuleScript"
+        );
     }
 
     // P1-A: globIgnorePaths
@@ -590,19 +611,24 @@ mod tests {
             }
         }"#;
         let tree = parse_project_str(json, &PathBuf::from("test.project.json")).unwrap();
-        assert_eq!(tree.glob_ignore_paths, vec!["**/*.spec.luau", "src/vendor/**"]);
+        assert_eq!(
+            tree.glob_ignore_paths,
+            vec!["**/*.spec.luau", "src/vendor/**"]
+        );
     }
 
     #[test]
     fn glob_ignore_paths_defaults_empty() {
-        let tree = parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
+        let tree =
+            parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
         assert!(tree.glob_ignore_paths.is_empty());
     }
 
     // P1-A: emitLegacyScripts
     #[test]
     fn emit_legacy_scripts_defaults_true() {
-        let tree = parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
+        let tree =
+            parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
         assert!(tree.emit_legacy_scripts);
     }
 
@@ -699,7 +725,8 @@ mod tests {
 
     #[test]
     fn serve_port_absent_returns_none() {
-        let tree = parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
+        let tree =
+            parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
         assert_eq!(tree.serve_port, None);
         assert_eq!(tree.serve_address, None);
     }
@@ -713,7 +740,8 @@ mod tests {
         std::fs::write(
             sub.join("default.project.json"),
             r#"{"name":"Signal","tree":{"$className":"ModuleScript","$path":"src"}}"#,
-        ).expect("write");
+        )
+        .expect("write");
         std::fs::create_dir_all(sub.join("src")).expect("mkdir src");
         std::fs::write(sub.join("src/init.luau"), "return {}").expect("write init");
 
@@ -734,7 +762,8 @@ mod tests {
         std::fs::write(
             sub.join("default.project.json"),
             r#"{"name":"loop","tree":{"$className":"Folder"}}"#,
-        ).expect("write");
+        )
+        .expect("write");
 
         let mut visited = std::collections::HashSet::new();
         let _ = discover_nested_projects(&sub, false, &mut visited).unwrap();

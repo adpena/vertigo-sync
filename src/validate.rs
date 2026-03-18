@@ -435,10 +435,10 @@ fn check_ncg_closure_in_loop(path: &str, lines: &[&str], issues: &mut Vec<Valida
         }
 
         // Detect loop openers.
-        if (trimmed.starts_with("for ") || trimmed.starts_with("while "))
-            && trimmed.ends_with("do") {
-                loop_depth += 1;
-            }
+        if (trimmed.starts_with("for ") || trimmed.starts_with("while ")) && trimmed.ends_with("do")
+        {
+            loop_depth += 1;
+        }
 
         // Detect closures inside loops.
         if loop_depth > 0 && trimmed.contains("function(") {
@@ -460,9 +460,10 @@ fn check_ncg_closure_in_loop(path: &str, lines: &[&str], issues: &mut Vec<Valida
             || trimmed == "end)"
             || trimmed.starts_with("end,")
             || trimmed.starts_with("end)"))
-            && loop_depth > 0 {
-                loop_depth -= 1;
-            }
+            && loop_depth > 0
+        {
+            loop_depth -= 1;
+        }
     }
 }
 
@@ -509,13 +510,14 @@ fn check_perf_dynamic_array(path: &str, lines: &[&str], issues: &mut Vec<Validat
 
         // Detect `local NAME = {}`.
         if let Some(rest) = trimmed.strip_prefix("local ")
-            && let Some(eq_pos) = rest.find('=') {
-                let name = rest[..eq_pos].trim();
-                let value = rest[eq_pos + 1..].trim();
-                if value == "{}" && !name.contains(',') && !name.contains(':') {
-                    empty_table_vars.push((name.to_string(), idx));
-                }
+            && let Some(eq_pos) = rest.find('=')
+        {
+            let name = rest[..eq_pos].trim();
+            let value = rest[eq_pos + 1..].trim();
+            if value == "{}" && !name.contains(',') && !name.contains(':') {
+                empty_table_vars.push((name.to_string(), idx));
             }
+        }
     }
 
     // Now look for table.insert(NAME, ...) inside loops.
@@ -536,9 +538,10 @@ fn check_perf_dynamic_array(path: &str, lines: &[&str], issues: &mut Vec<Validat
             || trimmed == "end)"
             || trimmed.starts_with("end,")
             || trimmed.starts_with("end)"))
-            && loop_depth > 0 {
-                loop_depth -= 1;
-            }
+            && loop_depth > 0
+        {
+            loop_depth -= 1;
+        }
 
         if loop_depth > 0 && trimmed.contains("table.insert(") {
             // Check if the first arg to table.insert matches an empty-table var declared before.
@@ -584,9 +587,10 @@ fn check_perf_unfrozen_constant(path: &str, lines: &[&str], issues: &mut Vec<Val
             || trimmed == "end)"
             || trimmed.starts_with("end,")
             || trimmed.starts_with("end)"))
-            && fn_depth > 0 {
-                fn_depth -= 1;
-            }
+            && fn_depth > 0
+        {
+            fn_depth -= 1;
+        }
 
         if fn_depth > 0 {
             continue;
@@ -594,23 +598,21 @@ fn check_perf_unfrozen_constant(path: &str, lines: &[&str], issues: &mut Vec<Val
 
         // Look for `local UPPER_NAME = {` at module level.
         if let Some(rest) = trimmed.strip_prefix("local ")
-            && let Some(eq_pos) = rest.find('=') {
-                let name = rest[..eq_pos].trim();
-                let value = rest[eq_pos + 1..].trim();
-                // Check name is UPPER_CASE (at least 2 chars, all uppercase/underscore/digit).
-                if name.len() >= 2
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
-                    && name
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_uppercase())
-                    && value.starts_with('{')
-                {
-                    constant_tables.push((name.to_string(), idx));
-                }
+            && let Some(eq_pos) = rest.find('=')
+        {
+            let name = rest[..eq_pos].trim();
+            let value = rest[eq_pos + 1..].trim();
+            // Check name is UPPER_CASE (at least 2 chars, all uppercase/underscore/digit).
+            if name.len() >= 2
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+                && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && value.starts_with('{')
+            {
+                constant_tables.push((name.to_string(), idx));
             }
+        }
     }
 
     if constant_tables.is_empty() {
@@ -709,9 +711,10 @@ fn check_perf_missing_native(path: &str, lines: &[&str], issues: &mut Vec<Valida
         if !fn_stack.is_empty() {
             for op in MATH_VECTOR_OPS {
                 if trimmed.contains(op)
-                    && let Some(info) = fn_stack.last_mut() {
-                        info.math_ops += 1;
-                    }
+                    && let Some(info) = fn_stack.last_mut()
+                {
+                    info.math_ops += 1;
+                }
             }
         }
 
@@ -723,18 +726,20 @@ fn check_perf_missing_native(path: &str, lines: &[&str], issues: &mut Vec<Valida
         {
             depth -= 1;
             if let Some(info) = fn_stack.pop()
-                && info.math_ops >= NATIVE_SUGGESTION_THRESHOLD && !info.has_native_attr {
-                    issues.push(ValidationIssue {
-                        path: path.to_string(),
-                        line: info.name_line + 1,
-                        severity: "info".to_string(),
-                        message: format!(
-                            "consider adding @native for NCG optimization ({} math/vector ops)",
-                            info.math_ops
-                        ),
-                        rule: RULE_PERF_MISSING_NATIVE.to_string(),
-                    });
-                }
+                && info.math_ops >= NATIVE_SUGGESTION_THRESHOLD
+                && !info.has_native_attr
+            {
+                issues.push(ValidationIssue {
+                    path: path.to_string(),
+                    line: info.name_line + 1,
+                    severity: "info".to_string(),
+                    message: format!(
+                        "consider adding @native for NCG optimization ({} math/vector ops)",
+                        info.math_ops
+                    ),
+                    rule: RULE_PERF_MISSING_NATIVE.to_string(),
+                });
+            }
         }
     }
 
@@ -785,8 +790,9 @@ fn check_perf_pcall_in_native(path: &str, lines: &[&str], issues: &mut Vec<Valid
 
         // Flag pcall/xpcall in native context.
         if in_native_fn
-            && (contains_word_call(trimmed, "pcall") || contains_word_call(trimmed, "xpcall")) {
-                issues.push(ValidationIssue {
+            && (contains_word_call(trimmed, "pcall") || contains_word_call(trimmed, "xpcall"))
+        {
+            issues.push(ValidationIssue {
                     path: path.to_string(),
                     line: idx + 1,
                     severity: "warning".to_string(),
@@ -795,7 +801,7 @@ fn check_perf_pcall_in_native(path: &str, lines: &[&str], issues: &mut Vec<Valid
                             .to_string(),
                     rule: RULE_PERF_PCALL_IN_NATIVE.to_string(),
                 });
-            }
+        }
     }
 }
 

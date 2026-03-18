@@ -21,8 +21,7 @@ pub fn scaffold_builder(
     if name.is_empty() {
         return Err("builder name must not be empty".into());
     }
-    if !name.chars().next().unwrap_or('_').is_ascii_alphabetic()
-        && name.chars().next() != Some('_')
+    if !name.chars().next().unwrap_or('_').is_ascii_alphabetic() && name.chars().next() != Some('_')
     {
         return Err("builder name must start with a letter or underscore".into());
     }
@@ -68,33 +67,13 @@ pub fn scaffold_builder(
     writeln!(code).unwrap();
     writeln!(code, "\t-- TODO: Add geometry here").unwrap();
     writeln!(code, "\t-- Example:").unwrap();
-    writeln!(
-        code,
-        "\t-- local part = Instance.new(\"Part\")"
-    )
-    .unwrap();
-    writeln!(
-        code,
-        "\t-- part.Size = Vector3.new(100, 2, 100)"
-    )
-    .unwrap();
-    writeln!(
-        code,
-        "\t-- part.Position = Vector3.new(0, {y_mid}, 0)"
-    )
-    .unwrap();
+    writeln!(code, "\t-- local part = Instance.new(\"Part\")").unwrap();
+    writeln!(code, "\t-- part.Size = Vector3.new(100, 2, 100)").unwrap();
+    writeln!(code, "\t-- part.Position = Vector3.new(0, {y_mid}, 0)").unwrap();
     writeln!(code, "\t-- part.Anchored = true").unwrap();
     writeln!(code, "\t-- part.Material = Enum.Material.Rock").unwrap();
-    writeln!(
-        code,
-        "\t-- part.Color = Color3.fromRGB(80, 70, 60)"
-    )
-    .unwrap();
-    writeln!(
-        code,
-        "\t-- CollectionService:AddTag(part, \"Terrain\")"
-    )
-    .unwrap();
+    writeln!(code, "\t-- part.Color = Color3.fromRGB(80, 70, 60)").unwrap();
+    writeln!(code, "\t-- CollectionService:AddTag(part, \"Terrain\")").unwrap();
     writeln!(code, "\t-- part.Parent = root").unwrap();
     writeln!(code).unwrap();
     writeln!(code, "\troot.Parent = Workspace").unwrap();
@@ -126,9 +105,9 @@ fn parse_y_mid(y_range: &str) -> String {
 
 /// Reserved Luau keywords that cannot be used as variable names.
 const LUAU_KEYWORDS: &[&str] = &[
-    "and", "break", "continue", "do", "else", "elseif", "end", "false", "for", "function",
-    "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until",
-    "while", "type", "export",
+    "and", "break", "continue", "do", "else", "elseif", "end", "false", "for", "function", "if",
+    "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+    "type", "export",
 ];
 
 /// Generate Luau builder code from a model.json instance tree.
@@ -145,11 +124,7 @@ pub fn generate_builder_luau(
 
     // Header
     writeln!(code, "--!strict").unwrap();
-    writeln!(
-        code,
-        "-- Auto-generated builder from model.json capture"
-    )
-    .unwrap();
+    writeln!(code, "-- Auto-generated builder from model.json capture").unwrap();
     writeln!(code).unwrap();
     writeln!(
         code,
@@ -170,10 +145,7 @@ pub fn generate_builder_luau(
         .get("ClassName")
         .and_then(|v| v.as_str())
         .unwrap_or("Model");
-    let root_name = model
-        .get("Name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Root");
+    let root_name = model.get("Name").and_then(|v| v.as_str()).unwrap_or("Root");
 
     writeln!(code, "\tlocal root = Instance.new(\"{root_class}\")").unwrap();
     writeln!(code, "\troot.Name = \"{root_name}\"").unwrap();
@@ -240,16 +212,17 @@ pub fn sanitize_var_name(name: &str) -> String {
     // Replace non-alphanumeric chars with underscore.
     let sanitized: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
 
     // Ensure it starts with a letter or underscore.
-    let sanitized = if sanitized
-        .chars()
-        .next()
-        .unwrap_or('_')
-        .is_ascii_digit()
-    {
+    let sanitized = if sanitized.chars().next().unwrap_or('_').is_ascii_digit() {
         format!("_{sanitized}")
     } else {
         sanitized
@@ -283,7 +256,11 @@ fn generate_instance_code(
 
     let var_name = counter.make_var(name);
 
-    writeln!(code, "{indent}local {var_name} = Instance.new(\"{class_name}\")").unwrap();
+    writeln!(
+        code,
+        "{indent}local {var_name} = Instance.new(\"{class_name}\")"
+    )
+    .unwrap();
     writeln!(code, "{indent}{var_name}.Name = \"{name}\"").unwrap();
 
     // Properties
@@ -398,15 +375,17 @@ pub fn json_value_to_lua(value: &serde_json::Value) -> String {
             }
             format!(
                 "{{{}}}",
-                arr.iter().map(json_value_to_lua).collect::<Vec<_>>().join(", ")
+                arr.iter()
+                    .map(json_value_to_lua)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         }
         serde_json::Value::Object(obj) => {
             // Handle typed property objects like {"Type": "Vector3", "Value": [x, y, z]}
-            if let (Some(typ), Some(val)) = (
-                obj.get("Type").and_then(|v| v.as_str()),
-                obj.get("Value"),
-            ) {
+            if let (Some(typ), Some(val)) =
+                (obj.get("Type").and_then(|v| v.as_str()), obj.get("Value"))
+            {
                 return typed_property_to_lua(typ, val);
             }
             // Generic table
@@ -446,8 +425,10 @@ fn typed_property_to_lua(typ: &str, value: &serde_json::Value) -> String {
         "CFrame" => {
             if let Some(arr) = value.as_array() {
                 if arr.len() == 12 {
-                    let nums: Vec<String> =
-                        arr.iter().map(|v| format!("{}", v.as_f64().unwrap_or(0.0))).collect();
+                    let nums: Vec<String> = arr
+                        .iter()
+                        .map(|v| format!("{}", v.as_f64().unwrap_or(0.0)))
+                        .collect();
                     return format!("CFrame.new({})", nums.join(", "));
                 }
                 if arr.len() == 3 {
@@ -469,10 +450,7 @@ fn typed_property_to_lua(typ: &str, value: &serde_json::Value) -> String {
                     if r <= 1.0 && g <= 1.0 && b <= 1.0 {
                         return format!("Color3.new({r}, {g}, {b})");
                     } else {
-                        return format!(
-                            "Color3.fromRGB({}, {}, {})",
-                            r as u8, g as u8, b as u8
-                        );
+                        return format!("Color3.fromRGB({}, {}, {})", r as u8, g as u8, b as u8);
                     }
                 }
             }
@@ -541,10 +519,7 @@ fn typed_property_to_lua(typ: &str, value: &serde_json::Value) -> String {
         }
         "String" | "Content" | "BinaryString" => {
             if let Some(s) = value.as_str() {
-                return format!(
-                    "\"{}\"",
-                    s.replace('\\', "\\\\").replace('"', "\\\"")
-                );
+                return format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
             }
             json_value_to_lua(value)
         }
@@ -620,8 +595,7 @@ mod tests {
 
     #[test]
     fn scaffold_with_y_range() {
-        let code =
-            scaffold_builder("DeepBuilder", "Deep Zone", Some("-50 to -20"), None).unwrap();
+        let code = scaffold_builder("DeepBuilder", "Deep Zone", Some("-50 to -20"), None).unwrap();
         assert!(code.contains("Y Range: -50 to -20"));
         assert!(code.contains("Vector3.new(0, -35, 0)"));
     }
@@ -753,10 +727,7 @@ mod tests {
         assert_eq!(json_value_to_lua(&serde_json::json!(false)), "false");
         assert_eq!(json_value_to_lua(&serde_json::json!(42)), "42");
         assert_eq!(json_value_to_lua(&serde_json::json!(1.5)), "1.5");
-        assert_eq!(
-            json_value_to_lua(&serde_json::json!("hello")),
-            "\"hello\""
-        );
+        assert_eq!(json_value_to_lua(&serde_json::json!("hello")), "\"hello\"");
     }
 
     #[test]

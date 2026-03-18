@@ -343,11 +343,7 @@ fn bench_snapshot_with_meta_json(c: &mut Criterion) {
         ];
         let subdir = subdirs[i % subdirs.len()];
         let meta_path = src.join(subdir).join(format!("Module{i}.meta.json"));
-        fs::write(
-            &meta_path,
-            r#"{"properties":{"Disabled":false}}"#,
-        )
-        .unwrap();
+        fs::write(&meta_path, r#"{"properties":{"Disabled":false}}"#).unwrap();
     }
 
     let includes = vec!["src".to_string()];

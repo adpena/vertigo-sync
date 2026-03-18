@@ -24,8 +24,8 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Json, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use base64::Engine;
 use serde::Deserialize;
@@ -136,10 +136,7 @@ const MAX_BATCH_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// If `VERTIGO_SYNC_API_TOKEN` is set, requires `Authorization: Bearer <token>`
 /// on protected (mutating) routes. Returns 401 if missing or wrong.
-async fn bearer_auth_layer(
-    req: Request,
-    next: Next,
-) -> Response {
+async fn bearer_auth_layer(req: Request, next: Next) -> Response {
     // Token is stashed in a request extension by the outer layer closure.
     let expected = req.extensions().get::<ExpectedToken>().cloned();
     if let Some(ExpectedToken(ref token)) = expected {
@@ -173,7 +170,9 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
     let rbxl_state = new_shared_rbxl_state();
 
     // Optional bearer token auth for mutating endpoints.
-    let api_token: Option<String> = std::env::var("VERTIGO_SYNC_API_TOKEN").ok().filter(|t| !t.is_empty());
+    let api_token: Option<String> = std::env::var("VERTIGO_SYNC_API_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
 
     // CORS: allow browser clients on any localhost port (Vite dev, Strata, etc.)
     // and the deployed showcase site. Strata WASM needs GET + POST + WebSocket upgrade.
@@ -250,6 +249,7 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
 /// Start the HTTP server. This blocks until the server exits.
 pub async fn run_serve(
     root: std::path::PathBuf,
+    project_path: std::path::PathBuf,
     includes: Vec<String>,
     port: u16,
     interval: Duration,
@@ -259,7 +259,6 @@ pub async fn run_serve(
     address: String,
 ) -> anyhow::Result<()> {
     // Load glob ignore patterns from project file if available.
-    let project_path = root.join("default.project.json");
     let glob_ignores = if project_path.is_file() {
         if let Ok(tree) = crate::project::parse_project(&project_path) {
             GlobIgnoreSet::new(&tree.glob_ignore_paths)
@@ -272,7 +271,15 @@ pub async fn run_serve(
 
     let snapshot = build_snapshot_with_ignores(&root, &includes, &glob_ignores)?;
     let state = ServerState::with_full_config(
-        root, includes, snapshot, channel_capacity, turbo, coalesce_ms, false, glob_ignores,
+        root,
+        includes,
+        snapshot,
+        channel_capacity,
+        turbo,
+        coalesce_ms,
+        false,
+        glob_ignores,
+        Some(project_path.clone()),
     );
 
     let coalescer = Arc::new(EventCoalescer::new(Duration::from_millis(coalesce_ms)));
@@ -343,9 +350,7 @@ pub async fn run_serve(
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_health(
-    State(state): State<Arc<ServerState>>,
-) -> Json<serde_json::Value> {
+async fn handle_health(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {
     let boot_elapsed = state.boot_time.elapsed().as_secs();
     Json(serde_json::json!({
         "status": "ok",
@@ -365,14 +370,23 @@ async fn handle_post_plugin_state(
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, axum::response::Response) {
     *state.plugin_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(body);
-    *state.plugin_state_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    *state
+        .plugin_state_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
 
     let commands = state.drain_plugin_commands();
     if commands.is_empty() {
-        (StatusCode::NO_CONTENT, axum::response::IntoResponse::into_response(StatusCode::NO_CONTENT))
+        (
+            StatusCode::NO_CONTENT,
+            axum::response::IntoResponse::into_response(StatusCode::NO_CONTENT),
+        )
     } else {
         let json_body = serde_json::json!({ "commands": commands });
-        (StatusCode::OK, axum::response::IntoResponse::into_response(Json(json_body)))
+        (
+            StatusCode::OK,
+            axum::response::IntoResponse::into_response(Json(json_body)),
+        )
     }
 }
 
@@ -393,8 +407,15 @@ async fn handle_plugin_command_ack(
 async fn handle_get_plugin_state(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let data = state.plugin_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let at = *state.plugin_state_at.lock().unwrap_or_else(|e| e.into_inner());
+    let data = state
+        .plugin_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let at = *state
+        .plugin_state_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     match (data, at) {
         (Some(mut value), Some(instant)) => {
@@ -402,7 +423,10 @@ async fn handle_get_plugin_state(
             let stale = age_secs > 10.0;
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("_stale".to_string(), serde_json::json!(stale));
-                obj.insert("_age_seconds".to_string(), serde_json::json!(age_secs.round() as u64));
+                obj.insert(
+                    "_age_seconds".to_string(),
+                    serde_json::json!(age_secs.round() as u64),
+                );
             }
             Ok(Json(value))
         }
@@ -415,8 +439,14 @@ async fn handle_post_plugin_managed(
     State(state): State<Arc<ServerState>>,
     Json(body): Json<serde_json::Value>,
 ) -> StatusCode {
-    *state.plugin_managed.lock().unwrap_or_else(|e| e.into_inner()) = Some(body);
-    *state.plugin_managed_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    *state
+        .plugin_managed
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(body);
+    *state
+        .plugin_managed_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     StatusCode::NO_CONTENT
 }
 
@@ -424,8 +454,15 @@ async fn handle_post_plugin_managed(
 async fn handle_get_plugin_managed(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let data = state.plugin_managed.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let at = *state.plugin_managed_at.lock().unwrap_or_else(|e| e.into_inner());
+    let data = state
+        .plugin_managed
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let at = *state
+        .plugin_managed_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     match (data, at) {
         (Some(mut value), Some(instant)) => {
@@ -433,7 +470,10 @@ async fn handle_get_plugin_managed(
             let stale = age_secs > 60.0;
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("_stale".to_string(), serde_json::json!(stale));
-                obj.insert("_age_seconds".to_string(), serde_json::json!(age_secs.round() as u64));
+                obj.insert(
+                    "_age_seconds".to_string(),
+                    serde_json::json!(age_secs.round() as u64),
+                );
             }
             Ok(Json(value))
         }
@@ -446,9 +486,7 @@ async fn handle_get_plugin_managed(
 async fn handle_snapshot(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<Snapshot>, StatusCode> {
-    let lock = state
-        .current
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
     Ok(Json((**lock).clone()))
 }
 
@@ -462,9 +500,7 @@ async fn handle_diff(
     Query(query): Query<DiffQuery>,
 ) -> Result<Json<SnapshotDiff>, (StatusCode, String)> {
     let old = {
-        let lock = state
-            .history
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
         lock.get(&query.since).cloned()
     };
 
@@ -476,9 +512,7 @@ async fn handle_diff(
     })?;
 
     let current = {
-        let lock = state
-            .current
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(&lock)
     };
 
@@ -714,9 +748,7 @@ async fn handle_patch(
     let _patch_guard = state.patch_lock.lock().await;
 
     let current_hash = {
-        let lock = state
-            .current
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
         lock.fingerprint.clone()
     };
 
@@ -784,9 +816,7 @@ async fn handle_patch(
         .install_snapshot_and_broadcast(new_snapshot)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let new_hash = {
-        let lock = state
-            .current
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
         lock.fingerprint.clone()
     };
     let validation_issues = collect_patch_validation_issues(&planned);
@@ -1088,9 +1118,7 @@ struct SourceEntry {
 async fn handle_sources(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<Vec<SourceEntry>>, StatusCode> {
-    let lock = state
-        .current
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
     let entries: Vec<SourceEntry> = lock
         .entries
         .iter()
@@ -1226,9 +1254,7 @@ fn snapshot_metadata_for_paths(
     requested: &[String],
 ) -> Result<HashMap<String, (String, u64)>, (StatusCode, String)> {
     let requested_set: HashSet<&str> = requested.iter().map(|path| path.as_str()).collect();
-    let current = state
-        .current
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let current = state.current.lock().unwrap_or_else(|e| e.into_inner());
     let mut metadata = HashMap::with_capacity(requested.len());
     for entry in &current.entries {
         if requested_set.contains(entry.path.as_str()) {
@@ -1242,9 +1268,7 @@ fn snapshot_metadata_for_path(
     state: &Arc<ServerState>,
     path: &str,
 ) -> Result<Option<(String, u64)>, (StatusCode, String)> {
-    let current = state
-        .current
-        .lock().unwrap_or_else(|e| e.into_inner());
+    let current = state.current.lock().unwrap_or_else(|e| e.into_inner());
     Ok(current
         .entries
         .iter()
@@ -1368,10 +1392,7 @@ async fn handle_rewind(
     let target = target.ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            format!(
-                "fingerprint {} not found in history ring buffer",
-                query.to
-            ),
+            format!("fingerprint {} not found in history ring buffer", query.to),
         )
     })?;
 
@@ -1426,16 +1447,13 @@ async fn handle_model(
                 return Err((
                     StatusCode::NOT_FOUND,
                     format!("model path not found: {path}"),
-                ))
+                ));
             }
         }
     };
 
     // Use the ModelManifestCache for content-addressed caching.
-    let mut cache_lock = state
-        .model_cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut cache_lock = state.model_cache.lock().unwrap_or_else(|e| e.into_inner());
     let manifest = cache_lock
         .get_or_load(&content_hash, &canonical)
         .map_err(|e| {
@@ -1452,9 +1470,7 @@ async fn handle_model(
 // GET /config — current server configuration
 // ---------------------------------------------------------------------------
 
-async fn handle_config(
-    State(state): State<Arc<ServerState>>,
-) -> Json<serde_json::Value> {
+async fn handle_config(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {
     let history_size = {
         let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
         lock.len()
@@ -1479,8 +1495,7 @@ async fn handle_sourcemap(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(true);
 
-    let project_path = state.root.join("default.project.json");
-    let tree = match crate::project::parse_project(&project_path) {
+    let tree = match crate::project::parse_project(&state.project_path) {
         Ok(t) => t,
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };
@@ -1501,8 +1516,7 @@ async fn handle_sourcemap(
 async fn handle_project(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let project_path = state.root.join("default.project.json");
-    let tree = match crate::project::parse_project(&project_path) {
+    let tree = match crate::project::parse_project(&state.project_path) {
         Ok(t) => t,
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };

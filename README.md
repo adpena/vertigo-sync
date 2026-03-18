@@ -47,6 +47,9 @@ cargo install vertigo-sync
 # Start syncing
 vertigo-sync serve --turbo
 
+# Serve a nested Roblox project from a monorepo root
+vertigo-sync serve --project roblox/default.project.json --turbo
+
 # Install the Studio plugin
 vertigo-sync plugin-install
 ```
@@ -126,6 +129,7 @@ The plugin runs a 4-stage pipeline on every Heartbeat:
 | Command | Description |
 |---------|-------------|
 | `vertigo-sync serve` | Start the sync server (default port 7575) |
+| `vertigo-sync serve --project path/to/default.project.json` | Serve a project file that lives below the current workspace root |
 | `vertigo-sync serve --turbo` | Start with 10 ms FSEvents coalescing (faster sync) |
 | `vertigo-sync snapshot` | Print deterministic source tree snapshot |
 | `vertigo-sync doctor` | Run determinism and health validation |
@@ -142,7 +146,7 @@ Your existing `default.project.json` works as-is. Just change the command:
 rojo serve default.project.json
 
 # After (Vertigo Sync)
-vertigo-sync serve --turbo
+vertigo-sync serve --project default.project.json --turbo
 ```
 
 See [Migration Guide](docs/migration-from-rojo.md) for the full walkthrough.

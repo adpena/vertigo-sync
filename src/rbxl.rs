@@ -222,17 +222,20 @@ impl RbxlLoader {
         all.into_iter()
             .filter(|node| {
                 if let Some(c) = class
-                    && node.class_name != c {
-                        return false;
-                    }
+                    && node.class_name != c
+                {
+                    return false;
+                }
                 if let Some(t) = tag
-                    && !node.tags.contains(&t.to_string()) {
-                        return false;
-                    }
+                    && !node.tags.contains(&t.to_string())
+                {
+                    return false;
+                }
                 if let Some(n) = name
-                    && !node.name.contains(n) {
-                        return false;
-                    }
+                    && !node.name.contains(n)
+                {
+                    return false;
+                }
                 true
             })
             .collect()
@@ -484,9 +487,10 @@ fn extract_tags(inst: &rbx_dom_weak::Instance) -> Vec<String> {
     // Properties in rbx_dom_weak use Ustr keys; find Tags by iterating.
     for (key, value) in &inst.properties {
         if key.as_str() == "Tags"
-            && let rbx_types::Variant::Tags(tags) = value {
-                return tags.iter().map(|t| t.to_string()).collect();
-            }
+            && let rbx_types::Variant::Tags(tags) = value
+        {
+            return tags.iter().map(|t| t.to_string()).collect();
+        }
     }
     Vec::new()
 }

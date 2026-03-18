@@ -13,10 +13,7 @@ pub enum SyncError {
     /// Failed to read a snapshot file.
     SnapshotReadFailed { path: PathBuf },
     /// Two successive snapshots produced different hashes.
-    NonDeterministic {
-        hash1: String,
-        hash2: String,
-    },
+    NonDeterministic { hash1: String, hash2: String },
     /// Source validation found blocking errors.
     ValidationFailed { errors: usize, warnings: usize },
     /// Plugin directory could not be located.
@@ -69,9 +66,7 @@ impl SyncError {
                 )
             }
             Self::ValidationFailed { errors, warnings } => {
-                format!(
-                    "Source validation found {errors} error(s) and {warnings} warning(s)."
-                )
+                format!("Source validation found {errors} error(s) and {warnings} warning(s).")
             }
             Self::PluginDirNotFound => {
                 "Could not locate the Roblox Studio plugins directory for this OS.".to_string()
@@ -88,11 +83,9 @@ impl SyncError {
     /// Actionable suggestion for the user.
     pub fn suggestion(&self) -> String {
         match self {
-            Self::ProjectNotFound { .. } => {
-                "Run 'vertigo-sync init' to create a new project, \
+            Self::ProjectNotFound { .. } => "Run 'vertigo-sync init' to create a new project, \
                  or use --root to point to your project directory."
-                    .to_string()
-            }
+                .to_string(),
             Self::PortInUse { port } => {
                 format!(
                     "Stop the process using port {port}, or use --port to choose a different port."

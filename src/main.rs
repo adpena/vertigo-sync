@@ -24,13 +24,14 @@ use vertigo_sync::{
                   filesystem and Roblox Studio. It replaces Rojo with better performance, \
                   built-in validation, and agent-native MCP tools.",
     after_help = "Examples:\n  \
-                  vertigo-sync serve --turbo        Start syncing in turbo mode\n  \
-                  vertigo-sync build -o game.rbxl   Build a place file\n  \
+                  vertigo-sync serve --turbo                                Start syncing in turbo mode\n  \
+                  vertigo-sync serve --project roblox/default.project.json  Serve a nested Roblox project\n  \
+                  vertigo-sync build -o game.rbxl                           Build a place file\n  \
                   vertigo-sync doctor               Check project health\n  \
                   vertigo-sync init                 Create a new project\n  \
                   vertigo-sync plugin-install       Install Studio plugin\n\n\
                   Learn more: https://github.com/pena/vertigo-sync",
-    term_width = 100,
+    term_width = 100
 )]
 struct Cli {
     #[arg(
@@ -84,10 +85,16 @@ struct Cli {
     )]
     interval_seconds: u64,
 
-    #[arg(long, help = "HTTP port used by serve mode (default: 7575, or servePort from project)")]
+    #[arg(
+        long,
+        help = "HTTP port used by serve mode (default: 7575, or servePort from project)"
+    )]
     port: Option<u16>,
 
-    #[arg(long, help = "HTTP bind address used by serve mode (default: 127.0.0.1, or serveAddress from project)")]
+    #[arg(
+        long,
+        help = "HTTP bind address used by serve mode (default: 127.0.0.1, or serveAddress from project)"
+    )]
     address: Option<String>,
 
     #[arg(
@@ -119,6 +126,12 @@ struct Cli {
     command: Command,
 }
 
+struct ProjectContext {
+    project_path: PathBuf,
+    project_root: PathBuf,
+    tree: vertigo_sync::project::ProjectTree,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Walk include roots and write deterministic snapshot JSON.
@@ -141,7 +154,11 @@ enum Command {
     Validate,
     /// Serve snapshot/diff/events over HTTP + SSE.
     #[command(display_order = 20)]
-    Serve,
+    Serve {
+        /// Project file path (default: default.project.json).
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
+    },
     /// Blocking watch loop that emits NDJSON diff events to stdout.
     #[command(display_order = 21)]
     Watch,
@@ -236,13 +253,12 @@ async fn main() -> Result<()> {
             project,
             include_non_scripts,
             watch,
-        } => {
-            command_sourcemap(&root, output, project, *include_non_scripts, *watch, &cli).await
-        }
+        } => command_sourcemap(&root, output, project, *include_non_scripts, *watch, &cli).await,
         Command::Init { name } => command_init(&root, name.as_deref()),
         Command::PluginInstall => command_plugin_install(),
-        Command::Serve => {
-            let includes = resolve_effective_includes(&root, &cli.include);
+        Command::Serve { project } => {
+            let project_context = resolve_project_context(&root, project)?;
+            let includes = resolve_effective_includes(&project_context.project_path, &cli.include);
             let (interval, coalesce_ms) = if cli.turbo {
                 (Duration::from_millis(100), 10u64)
             } else {
@@ -253,41 +269,38 @@ async fn main() -> Result<()> {
             };
 
             // Resolve port and address: CLI flags > project file > defaults.
-            let project_path = root.join("default.project.json");
-            let project_tree = if project_path.is_file() {
-                parse_project(&project_path).ok()
-            } else {
-                None
-            };
-            let port = cli
-                .port
-                .or_else(|| project_tree.as_ref().and_then(|t| t.serve_port))
-                .unwrap_or(7575);
+            let port = cli.port.or(project_context.tree.serve_port).unwrap_or(7575);
             let address = cli
                 .address
                 .clone()
-                .or_else(|| {
-                    project_tree
-                        .as_ref()
-                        .and_then(|t| t.serve_address.clone())
-                })
+                .or_else(|| project_context.tree.serve_address.clone())
                 .unwrap_or_else(|| "127.0.0.1".to_string());
 
-            let mode = if cli.turbo { "turbo (10ms coalesce)" } else { "standard" };
+            let mode = if cli.turbo {
+                "turbo (10ms coalesce)"
+            } else {
+                "standard"
+            };
             let version = env!("CARGO_PKG_VERSION");
             let http_addr = format!("http://{address}:{port}");
             let ws_addr = format!("ws://{address}:{port}/ws");
             let watching = includes.join(", ");
+            let project_display = project_context.project_path.display().to_string();
 
-            output::banner(version, &[
-                ("Server", &http_addr),
-                ("WebSocket", &ws_addr),
-                ("Mode", mode),
-                ("Watching", &watching),
-            ]);
+            output::banner(
+                version,
+                &[
+                    ("Server", &http_addr),
+                    ("WebSocket", &ws_addr),
+                    ("Mode", mode),
+                    ("Project", &project_display),
+                    ("Watching", &watching),
+                ],
+            );
 
             run_serve(
-                root,
+                project_context.project_root,
+                project_context.project_path,
                 includes,
                 port,
                 interval,
@@ -336,11 +349,27 @@ fn resolve_effective_includes(root: &Path, cli_includes: &[String]) -> Vec<Strin
     vec!["src".to_string()]
 }
 
+fn resolve_project_context(root: &Path, project: &Path) -> Result<ProjectContext> {
+    let project_path = if project.is_absolute() {
+        project.to_path_buf()
+    } else {
+        root.join(project)
+    };
+    let tree = parse_project(&project_path)?;
+    let project_root = project_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.to_path_buf());
+
+    Ok(ProjectContext {
+        project_path,
+        project_root,
+        tree,
+    })
+}
+
 /// Recursively collect `$path` values from a Rojo/Vertigo project tree.
-fn collect_dollar_paths(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    out: &mut Vec<String>,
-) {
+fn collect_dollar_paths(obj: &serde_json::Map<String, serde_json::Value>, out: &mut Vec<String>) {
     if let Some(serde_json::Value::String(p)) = obj.get("$path") {
         // Extract the top-level directory (e.g. "src/Server" -> "src").
         let top = p.split('/').next().unwrap_or(p);
@@ -774,13 +803,10 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
     use rbx_dom_weak::{InstanceBuilder, WeakDom};
     use vertigo_sync::project::resolve_instance_class;
 
-    let project_path = if project.is_absolute() {
-        project.to_path_buf()
-    } else {
-        root.join(project)
-    };
-
-    let tree = parse_project(&project_path)?;
+    let project_context = resolve_project_context(root, project)?;
+    let project_path = project_context.project_path;
+    let project_root = project_context.project_root;
+    let tree = project_context.tree;
 
     output::header("Build");
     output::kv("Project", &project_path.display().to_string());
@@ -801,18 +827,16 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
 
         let mut parent_ref = data_model_ref;
         for (i, segment) in segments.iter().enumerate() {
-            let existing = dom
-                .get_by_ref(parent_ref)
-                .and_then(|inst| {
-                    inst.children()
-                        .iter()
-                        .find(|&&child_ref| {
-                            dom.get_by_ref(child_ref)
-                                .map(|c| c.name == *segment)
-                                .unwrap_or(false)
-                        })
-                        .copied()
-                });
+            let existing = dom.get_by_ref(parent_ref).and_then(|inst| {
+                inst.children()
+                    .iter()
+                    .find(|&&child_ref| {
+                        dom.get_by_ref(child_ref)
+                            .map(|c| c.name == *segment)
+                            .unwrap_or(false)
+                    })
+                    .copied()
+            });
 
             parent_ref = if let Some(existing_ref) = existing {
                 existing_ref
@@ -820,7 +844,7 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
                 let class = if i == 0 {
                     mapping.class_name.as_str()
                 } else if i == segments.len() - 1 {
-                    let fs_full = root.join(&mapping.fs_path);
+                    let fs_full = project_root.join(&mapping.fs_path);
                     if fs_full.is_dir() {
                         resolve_container_class(&fs_full)
                     } else {
@@ -839,9 +863,9 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
                 .or_insert(parent_ref);
         }
 
-        let fs_full = root.join(&mapping.fs_path);
+        let fs_full = project_root.join(&mapping.fs_path);
         if fs_full.is_dir() {
-            populate_from_dir(&mut dom, parent_ref, &fs_full, root)?;
+            populate_from_dir(&mut dom, parent_ref, &fs_full, &project_root)?;
         } else if fs_full.is_file() {
             populate_file(&mut dom, parent_ref, &fs_full)?;
         }
@@ -897,12 +921,7 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
 // Syncback command
 // ---------------------------------------------------------------------------
 
-fn command_syncback(
-    root: &Path,
-    input: &Path,
-    project: &Path,
-    dry_run: bool,
-) -> Result<()> {
+fn command_syncback(root: &Path, input: &Path, project: &Path, dry_run: bool) -> Result<()> {
     use rbx_dom_weak::WeakDom;
 
     let input_path = if input.is_absolute() {
@@ -1007,11 +1026,15 @@ fn syncback_walk(
     };
 
     // Check if this instance is a script with source.
-    let is_script = matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript");
+    let is_script = matches!(
+        inst.class.as_str(),
+        "Script" | "LocalScript" | "ModuleScript"
+    );
 
     if is_script {
         let source_key: rbx_dom_weak::Ustr = "Source".into();
-        if let Some(rbx_dom_weak::types::Variant::String(source)) = inst.properties.get(&source_key) {
+        if let Some(rbx_dom_weak::types::Variant::String(source)) = inst.properties.get(&source_key)
+        {
             // Try to find the best filesystem mapping for this instance.
             if let Some(fs_path) = resolve_syncback_path(&dm_path, instance_to_fs, inst, dom) {
                 let full_path = root.join(&fs_path);
@@ -1023,9 +1046,8 @@ fn syncback_walk(
                             format!("failed to create directory {}", parent.display())
                         })?;
                     }
-                    std::fs::write(&full_path, source).with_context(|| {
-                        format!("failed to write {}", full_path.display())
-                    })?;
+                    std::fs::write(&full_path, source)
+                        .with_context(|| format!("failed to write {}", full_path.display()))?;
                     output::kv("  wrote", &fs_path);
                 }
                 *written += 1;
@@ -1162,8 +1184,8 @@ async fn command_sourcemap(
 
     let write_sourcemap = |tree: &vertigo_sync::project::ProjectTree| -> Result<()> {
         let sourcemap = generate_sourcemap(root, tree, include_non_scripts)?;
-        let json = serde_json::to_string_pretty(&sourcemap)
-            .context("failed to serialize sourcemap")?;
+        let json =
+            serde_json::to_string_pretty(&sourcemap).context("failed to serialize sourcemap")?;
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1190,7 +1212,7 @@ async fn command_sourcemap(
 
         let includes = resolve_effective_includes(root, &cli.include);
 
-        use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event};
+        use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
         use std::sync::mpsc;
 
         let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
@@ -1223,9 +1245,8 @@ async fn command_sourcemap(
 
             let deadline = std::time::Instant::now() + coalesce_window;
             while std::time::Instant::now() < deadline {
-                match rx.recv_timeout(
-                    deadline.saturating_duration_since(std::time::Instant::now()),
-                ) {
+                match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                {
                     Ok(_) => {}
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1315,11 +1336,7 @@ fn command_init(root: &Path, name: Option<&str>) -> Result<()> {
             "init.client.luau",
             "--!strict\nprint(\"[Client] Hello from Vertigo Sync!\")\n",
         ),
-        (
-            "src/Shared",
-            "init.luau",
-            "--!strict\nreturn {}\n",
-        ),
+        ("src/Shared", "init.luau", "--!strict\nreturn {}\n"),
     ];
 
     for (i, (dir, file, content)) in dirs_and_files.iter().enumerate() {
@@ -1519,10 +1536,8 @@ fn populate_from_dir(
                         rbx_dom_weak::InstanceBuilder::new(class).with_name(instance_name);
 
                     if let Ok(source) = std::fs::read_to_string(&path) {
-                        builder = builder.with_property(
-                            "Source",
-                            rbx_dom_weak::types::Variant::String(source),
-                        );
+                        builder = builder
+                            .with_property("Source", rbx_dom_weak::types::Variant::String(source));
                     }
 
                     // Apply .meta.json sidecar if present.
@@ -1548,25 +1563,19 @@ fn populate_from_dir(
                     let mut builder =
                         rbx_dom_weak::InstanceBuilder::new("ModuleScript").with_name(instance_name);
                     if let Ok(content) = std::fs::read_to_string(&path) {
-                        builder = builder.with_property(
-                            "Source",
-                            rbx_dom_weak::types::Variant::String(content),
-                        );
+                        builder = builder
+                            .with_property("Source", rbx_dom_weak::types::Variant::String(content));
                     }
                     dom.insert(parent_ref, builder);
                 }
                 "jsonc" => {
-                    let instance_name = name_str
-                        .strip_suffix(".jsonc")
-                        .unwrap_or(&name_str);
+                    let instance_name = name_str.strip_suffix(".jsonc").unwrap_or(&name_str);
                     let mut builder =
                         rbx_dom_weak::InstanceBuilder::new("ModuleScript").with_name(instance_name);
                     if let Ok(raw) = std::fs::read_to_string(&path) {
                         let clean = vertigo_sync::strip_json_comments(&raw);
-                        builder = builder.with_property(
-                            "Source",
-                            rbx_dom_weak::types::Variant::String(clean),
-                        );
+                        builder = builder
+                            .with_property("Source", rbx_dom_weak::types::Variant::String(clean));
                     }
                     dom.insert(parent_ref, builder);
                 }
@@ -1575,10 +1584,8 @@ fn populate_from_dir(
                     let mut builder =
                         rbx_dom_weak::InstanceBuilder::new("StringValue").with_name(instance_name);
                     if let Ok(content) = std::fs::read_to_string(&path) {
-                        builder = builder.with_property(
-                            "Value",
-                            rbx_dom_weak::types::Variant::String(content),
-                        );
+                        builder = builder
+                            .with_property("Value", rbx_dom_weak::types::Variant::String(content));
                     }
                     dom.insert(parent_ref, builder);
                 }
@@ -1624,8 +1631,10 @@ fn apply_meta_to_builder(
                     builder.with_property(key.as_str(), rbx_dom_weak::types::Variant::Bool(*b));
             }
             serde_json::Value::String(s) => {
-                builder = builder
-                    .with_property(key.as_str(), rbx_dom_weak::types::Variant::String(s.clone()));
+                builder = builder.with_property(
+                    key.as_str(),
+                    rbx_dom_weak::types::Variant::String(s.clone()),
+                );
             }
             serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
@@ -1795,7 +1804,9 @@ fn default_event_output_path(state_dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{populate_from_dir, resolve_container_class, resolve_instance_name, resolve_syncback_path};
+    use super::{
+        populate_from_dir, resolve_container_class, resolve_instance_name, resolve_syncback_path,
+    };
     use std::fs;
 
     #[test]
@@ -1847,15 +1858,28 @@ mod tests {
             .filter_map(|&r| dom.get_by_ref(r).map(|i| i.name.clone()))
             .collect();
 
-        assert!(child_names.contains(&"config".to_string()), "yaml file not found: {child_names:?}");
-        assert!(child_names.contains(&"data".to_string()), "yml file not found: {child_names:?}");
-        assert!(child_names.contains(&"settings".to_string()), "toml file not found: {child_names:?}");
+        assert!(
+            child_names.contains(&"config".to_string()),
+            "yaml file not found: {child_names:?}"
+        );
+        assert!(
+            child_names.contains(&"data".to_string()),
+            "yml file not found: {child_names:?}"
+        );
+        assert!(
+            child_names.contains(&"settings".to_string()),
+            "toml file not found: {child_names:?}"
+        );
 
         // Verify they are all ModuleScripts with Source property.
         let source_key: rbx_dom_weak::Ustr = "Source".into();
         for &child_ref in parent.children() {
             let child = dom.get_by_ref(child_ref).unwrap();
-            assert_eq!(child.class, "ModuleScript", "wrong class for {}", child.name);
+            assert_eq!(
+                child.class, "ModuleScript",
+                "wrong class for {}",
+                child.name
+            );
             assert!(
                 child.properties.contains_key(&source_key),
                 "missing Source for {}",
@@ -1906,7 +1930,10 @@ mod tests {
                     !s.contains("// This is a comment"),
                     "JSONC comment should be stripped"
                 );
-                assert!(s.contains("\"key\": \"value\""), "JSON content should remain");
+                assert!(
+                    s.contains("\"key\": \"value\""),
+                    "JSON content should remain"
+                );
             } else {
                 panic!("Source should be a String variant");
             }

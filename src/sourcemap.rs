@@ -141,11 +141,7 @@ fn file_class(name: &str) -> &'static str {
 
 /// Recursively build a sourcemap tree from a filesystem directory.
 /// `fs_prefix` is the path prefix relative to the project root (e.g. "src/Server").
-fn walk_dir(
-    dir: &Path,
-    fs_prefix: &str,
-    include_non_scripts: bool,
-) -> Result<Vec<SourcemapNode>> {
+fn walk_dir(dir: &Path, fs_prefix: &str, include_non_scripts: bool) -> Result<Vec<SourcemapNode>> {
     let mut children = Vec::new();
 
     let mut entries: Vec<_> = std::fs::read_dir(dir)
@@ -467,9 +463,11 @@ mod tests {
         let server = sss.children.iter().find(|c| c.name == "Server").unwrap();
         assert_eq!(server.class_name, "Script");
         assert!(server.file_paths.contains(&"src/Server".to_string()));
-        assert!(server
-            .file_paths
-            .contains(&"src/Server/init.server.luau".to_string()));
+        assert!(
+            server
+                .file_paths
+                .contains(&"src/Server/init.server.luau".to_string())
+        );
     }
 
     #[test]
@@ -494,9 +492,11 @@ mod tests {
             .find(|c| c.name == "DataService")
             .unwrap();
         assert_eq!(data_svc.class_name, "ModuleScript");
-        assert!(data_svc
-            .file_paths
-            .contains(&"src/Server/Services/DataService.luau".to_string()));
+        assert!(
+            data_svc
+                .file_paths
+                .contains(&"src/Server/Services/DataService.luau".to_string())
+        );
     }
 
     #[test]
