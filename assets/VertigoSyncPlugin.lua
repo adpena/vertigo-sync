@@ -4745,6 +4745,16 @@ Workspace:GetAttributeChangedSignal("VertigoSyncBuildersEnabled"):Connect(functi
 	end
 end)
 
+Workspace:GetAttributeChangedSignal(SERVER_URL_WORKSPACE_ATTR):Connect(function()
+	refreshServerBaseUrl()
+	projectMappingsLoaded = false
+	projectSyncBlocked = false
+	resyncRequested = true
+	closeWebSocket("server_url_changed")
+	setProjectStatus("bootstrapping", "Waiting for /project", nil, false)
+	setStatusAttributes("disconnected", lastHash)
+end)
+
 -- ─── UI Status Refresh ──────────────────────────────────────────────────────
 
 local lastStatusForPulse: SyncStatus = "disconnected"
@@ -5184,12 +5194,3 @@ end)
 
 end -- _initPlugin
 _initPlugin()
-Workspace:GetAttributeChangedSignal(SERVER_URL_WORKSPACE_ATTR):Connect(function()
-	refreshServerBaseUrl()
-	projectMappingsLoaded = false
-	projectSyncBlocked = false
-	resyncRequested = true
-	closeWebSocket("server_url_changed")
-	setProjectStatus("bootstrapping", "Waiting for /project", nil, false)
-	setStatusAttributes("disconnected", lastHash)
-end)
