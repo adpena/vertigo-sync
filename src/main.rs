@@ -7,7 +7,7 @@ use std::time::Duration;
 use vertigo_sync::errors::SyncError;
 use vertigo_sync::output;
 use vertigo_sync::project::parse_project;
-use vertigo_sync::server::run_serve;
+use vertigo_sync::server::{ServeOptions, run_serve};
 use vertigo_sync::validate;
 use vertigo_sync::{
     DiffEvent, EventDiffCounts, EventPaths, append_event, build_snapshot, diff_snapshots,
@@ -309,17 +309,17 @@ async fn main() -> Result<()> {
                 ],
             );
 
-            run_serve(
-                project_context.project_root,
-                project_context.project_path,
+            run_serve(ServeOptions {
+                root: project_context.project_root,
+                project_path: project_context.project_path,
                 includes,
                 port,
                 interval,
-                cli.channel_capacity,
+                channel_capacity: cli.channel_capacity,
                 coalesce_ms,
-                cli.turbo,
+                turbo: cli.turbo,
                 address,
-            )
+            })
             .await
         }
     }
@@ -339,7 +339,7 @@ fn resolve_effective_includes(project_path: &Path, cli_includes: &[String]) -> V
 
     // Try auto-detect from the selected project file only.
     if project_path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&project_path) {
+        if let Ok(content) = std::fs::read_to_string(project_path) {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
                 let mut paths: Vec<String> = Vec::new();
                 if let Some(tree) = value.get("tree").and_then(|t| t.as_object()) {
@@ -419,7 +419,12 @@ fn discover_single_project_path(root: &Path) -> Result<Option<PathBuf>> {
 
     let rendered = matches
         .iter()
-        .map(|path| path.strip_prefix(root).unwrap_or(path).display().to_string())
+        .map(|path| {
+            path.strip_prefix(root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
         .collect::<Vec<_>>()
         .join(", ");
     bail!(
@@ -1091,17 +1096,15 @@ fn command_syncback(root: &Path, input: &Path, project: &Path, dry_run: bool) ->
     // Walk the DOM and extract scripts.
     let mut written = 0usize;
     let mut skipped = 0usize;
-
-    syncback_walk(
-        &dom,
-        dom.root_ref(),
-        "",
-        &instance_to_fs,
-        &project_root,
+    let mut ctx = SyncbackContext {
+        instance_to_fs: &instance_to_fs,
+        root: &project_root,
         dry_run,
-        &mut written,
-        &mut skipped,
-    )?;
+        written: &mut written,
+        skipped: &mut skipped,
+    };
+
+    syncback_walk(&dom, dom.root_ref(), "", &mut ctx)?;
 
     eprintln!();
     if dry_run {
@@ -1118,15 +1121,19 @@ fn command_syncback(root: &Path, input: &Path, project: &Path, dry_run: bool) ->
 }
 
 /// Recursively walk DOM instances and extract script sources to the filesystem.
+struct SyncbackContext<'a> {
+    instance_to_fs: &'a std::collections::HashMap<String, String>,
+    root: &'a Path,
+    dry_run: bool,
+    written: &'a mut usize,
+    skipped: &'a mut usize,
+}
+
 fn syncback_walk(
     dom: &rbx_dom_weak::WeakDom,
     inst_ref: rbx_dom_weak::types::Ref,
     parent_dm_path: &str,
-    instance_to_fs: &std::collections::HashMap<String, String>,
-    root: &Path,
-    dry_run: bool,
-    written: &mut usize,
-    skipped: &mut usize,
+    ctx: &mut SyncbackContext<'_>,
 ) -> Result<()> {
     let Some(inst) = dom.get_by_ref(inst_ref) else {
         return Ok(());
@@ -1151,9 +1158,9 @@ fn syncback_walk(
         if let Some(rbx_dom_weak::types::Variant::String(source)) = inst.properties.get(&source_key)
         {
             // Try to find the best filesystem mapping for this instance.
-            if let Some(fs_path) = resolve_syncback_path(&dm_path, instance_to_fs, inst, dom) {
-                let full_path = root.join(&fs_path);
-                if dry_run {
+            if let Some(fs_path) = resolve_syncback_path(&dm_path, ctx.instance_to_fs, inst, dom) {
+                let full_path = ctx.root.join(&fs_path);
+                if ctx.dry_run {
                     output::kv("  [dry-run]", &fs_path);
                 } else {
                     if let Some(parent) = full_path.parent() {
@@ -1165,25 +1172,16 @@ fn syncback_walk(
                         .with_context(|| format!("failed to write {}", full_path.display()))?;
                     output::kv("  wrote", &fs_path);
                 }
-                *written += 1;
+                *ctx.written += 1;
             } else {
-                *skipped += 1;
+                *ctx.skipped += 1;
             }
         }
     }
 
     // Recurse into children.
     for &child_ref in inst.children() {
-        syncback_walk(
-            dom,
-            child_ref,
-            &dm_path,
-            instance_to_fs,
-            root,
-            dry_run,
-            written,
-            skipped,
-        )?;
+        syncback_walk(dom, child_ref, &dm_path, ctx)?;
     }
 
     Ok(())
@@ -1918,8 +1916,9 @@ fn default_event_output_path(state_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, populate_from_dir, resolve_container_class, resolve_effective_includes,
-        resolve_instance_name, resolve_project_context, resolve_syncback_path, syncback_walk,
+        Cli, Command, SyncbackContext, populate_from_dir, resolve_container_class,
+        resolve_effective_includes, resolve_instance_name, resolve_project_context,
+        resolve_syncback_path, syncback_walk,
     };
     use clap::Parser;
     use serde_json::json;
@@ -2181,7 +2180,10 @@ mod tests {
         let context = resolve_project_context(root, Path::new("default.project.json"), &[])
             .expect("resolve discovered project context");
 
-        assert_eq!(context.project_path, nested_dir.join("default.project.json"));
+        assert_eq!(
+            context.project_path,
+            nested_dir.join("default.project.json")
+        );
         assert_eq!(context.project_root, nested_dir);
         assert_eq!(context.tree.name, "NestedGame");
     }
@@ -2227,7 +2229,7 @@ mod tests {
     #[test]
     fn watch_commands_accept_project_flag() {
         let cli = Cli::try_parse_from([
-            "vertigo-sync",
+            "vsync",
             "watch",
             "--project",
             "apps/game/default.project.json",
@@ -2241,7 +2243,7 @@ mod tests {
         }
 
         let cli = Cli::try_parse_from([
-            "vertigo-sync",
+            "vsync",
             "watch-native",
             "--project",
             "apps/game/default.project.json",
@@ -2289,17 +2291,14 @@ mod tests {
 
         let mut written = 0usize;
         let mut skipped = 0usize;
-        syncback_walk(
-            &dom,
-            root_ref,
-            "",
-            &instance_to_fs,
-            &nested_dir,
-            false,
-            &mut written,
-            &mut skipped,
-        )
-        .expect("syncback walk");
+        let mut ctx = SyncbackContext {
+            instance_to_fs: &instance_to_fs,
+            root: &nested_dir,
+            dry_run: false,
+            written: &mut written,
+            skipped: &mut skipped,
+        };
+        syncback_walk(&dom, root_ref, "", &mut ctx).expect("syncback walk");
 
         assert_eq!(written, 1);
         assert_eq!(skipped, 0);

@@ -1095,7 +1095,7 @@ mod tests {
     #[test]
     fn small_file_no_warning() {
         let content = "--!strict\nlocal x = 1\nreturn x\n";
-        let issues = validate_file_content("src/Server/Small.luau", &content);
+        let issues = validate_file_content("src/Server/Small.luau", content);
         assert!(
             !issues.iter().any(|i| i.rule == RULE_LARGE_FILE),
             "should not warn on small file"

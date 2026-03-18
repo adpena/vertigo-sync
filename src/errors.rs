@@ -83,7 +83,7 @@ impl SyncError {
     /// Actionable suggestion for the user.
     pub fn suggestion(&self) -> String {
         match self {
-            Self::ProjectNotFound { .. } => "Run 'vertigo-sync init' to create a new project, \
+            Self::ProjectNotFound { .. } => "Run 'vsync init' to create a new project, \
                  or use --root to point to your project directory."
                 .to_string(),
             Self::PortInUse { port } => {
@@ -92,15 +92,15 @@ impl SyncError {
                 )
             }
             Self::SnapshotReadFailed { .. } => {
-                "Run 'vertigo-sync snapshot' first to generate a fresh snapshot.".to_string()
+                "Run 'vsync snapshot' first to generate a fresh snapshot.".to_string()
             }
             Self::NonDeterministic { .. } => {
                 "Check for timestamp-dependent or random content in your source files. \
-                 Run 'vertigo-sync doctor' for details."
+                 Run 'vsync doctor' for details."
                     .to_string()
             }
             Self::ValidationFailed { .. } => {
-                "Fix the reported errors and run 'vertigo-sync validate' again.".to_string()
+                "Fix the reported errors and run 'vsync validate' again.".to_string()
             }
             Self::PluginDirNotFound => {
                 "Ensure Roblox Studio is installed. On macOS the plugins directory is \

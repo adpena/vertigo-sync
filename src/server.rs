@@ -38,10 +38,23 @@ use sha2::{Digest, Sha256};
 use crate::mcp::{handle_mcp_execute, handle_mcp_tools};
 use crate::serve_rbxl::{new_shared_rbxl_state, rbxl_router};
 use crate::{
-    EventCoalescer, GlobIgnoreSet, ServerState, Snapshot, SnapshotDiff, build_snapshot,
-    build_snapshot_with_ignores, diff_snapshots,
+    EventCoalescer, GlobIgnoreSet, ServerState, ServerStateOptions, Snapshot, SnapshotDiff,
+    build_snapshot, build_snapshot_with_ignores, diff_snapshots,
 };
 use std::sync::atomic::Ordering;
+
+#[derive(Debug, Clone)]
+pub struct ServeOptions {
+    pub root: PathBuf,
+    pub project_path: PathBuf,
+    pub includes: Vec<String>,
+    pub port: u16,
+    pub interval: Duration,
+    pub channel_capacity: usize,
+    pub coalesce_ms: u64,
+    pub turbo: bool,
+    pub address: String,
+}
 
 /// Patch request accepted by POST /sync/patch.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -145,7 +158,7 @@ async fn bearer_auth_layer(req: Request, next: Next) -> Response {
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
         match auth_header {
-            Some(value) if value.strip_prefix("Bearer ").map_or(false, |t| t == token) => {}
+            Some(value) if value.strip_prefix("Bearer ").is_some_and(|t| t == token) => {}
             _ => {
                 return (
                     StatusCode::UNAUTHORIZED,
@@ -247,17 +260,18 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
 }
 
 /// Start the HTTP server. This blocks until the server exits.
-pub async fn run_serve(
-    root: std::path::PathBuf,
-    project_path: std::path::PathBuf,
-    includes: Vec<String>,
-    port: u16,
-    interval: Duration,
-    channel_capacity: usize,
-    coalesce_ms: u64,
-    turbo: bool,
-    address: String,
-) -> anyhow::Result<()> {
+pub async fn run_serve(options: ServeOptions) -> anyhow::Result<()> {
+    let ServeOptions {
+        root,
+        project_path,
+        includes,
+        port,
+        interval,
+        channel_capacity,
+        coalesce_ms,
+        turbo,
+        address,
+    } = options;
     // Load glob ignore patterns from project file if available.
     let glob_ignores = if project_path.is_file() {
         if let Ok(tree) = crate::project::parse_project(&project_path) {
@@ -274,12 +288,14 @@ pub async fn run_serve(
         root,
         includes,
         snapshot,
-        channel_capacity,
-        turbo,
-        coalesce_ms,
-        false,
-        glob_ignores,
-        Some(project_path.clone()),
+        ServerStateOptions {
+            channel_capacity,
+            turbo,
+            coalesce_ms,
+            binary_models: false,
+            glob_ignores,
+            project_path: Some(project_path.clone()),
+        },
     );
 
     let coalescer = Arc::new(EventCoalescer::new(Duration::from_millis(coalesce_ms)));
@@ -1755,12 +1771,14 @@ mod tests {
             nested_root.clone(),
             vec!["nested-src".to_string()],
             empty_snapshot(vec!["nested-src".to_string()]),
-            32,
-            false,
-            50,
-            false,
-            crate::GlobIgnoreSet::empty(),
-            Some(nested_root.join("default.project.json")),
+            crate::ServerStateOptions {
+                channel_capacity: 32,
+                turbo: false,
+                coalesce_ms: 50,
+                binary_models: false,
+                glob_ignores: crate::GlobIgnoreSet::empty(),
+                project_path: Some(nested_root.join("default.project.json")),
+            },
         );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1806,12 +1824,14 @@ mod tests {
             nested_root.clone(),
             vec!["nested-src".to_string()],
             empty_snapshot(vec!["nested-src".to_string()]),
-            32,
-            false,
-            50,
-            false,
-            crate::GlobIgnoreSet::empty(),
-            Some(nested_root.join("default.project.json")),
+            crate::ServerStateOptions {
+                channel_capacity: 32,
+                turbo: false,
+                coalesce_ms: 50,
+                binary_models: false,
+                glob_ignores: crate::GlobIgnoreSet::empty(),
+                project_path: Some(nested_root.join("default.project.json")),
+            },
         );
 
         let runtime = tokio::runtime::Builder::new_current_thread()

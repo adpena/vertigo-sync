@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::project::{PathMapping, ProjectTree};
+use crate::project::ProjectTree;
 
 // ---------------------------------------------------------------------------
 // Sourcemap types — exact Rojo schema that luau-lsp expects
@@ -283,7 +283,6 @@ pub fn generate_sourcemap(
             &mut service_children,
             &segments,
             0,
-            mapping,
             leaf_class,
             leaf_file_paths,
             mapping_children,
@@ -304,7 +303,6 @@ fn insert_into_tree(
     siblings: &mut BTreeMap<String, SourcemapNode>,
     segments: &[&str],
     depth: usize,
-    mapping: &PathMapping,
     leaf_class: &str,
     leaf_file_paths: Vec<String>,
     leaf_children: Vec<SourcemapNode>,
@@ -353,7 +351,6 @@ fn insert_into_tree(
             &mut child_map,
             segments,
             depth + 1,
-            mapping,
             leaf_class,
             leaf_file_paths,
             leaf_children,
@@ -370,6 +367,7 @@ fn insert_into_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::PathMapping;
     use std::fs;
     use tempfile::tempdir;
 

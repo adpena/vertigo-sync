@@ -200,6 +200,7 @@ impl Default for Metrics {
 /// Pre-compiled set of glob patterns used to exclude paths during directory
 /// traversal. Compiles once, matches O(1) per path via `globset`-style
 /// sequential matching (using the `glob` crate's `Pattern`).
+#[derive(Debug, Clone)]
 pub struct GlobIgnoreSet {
     patterns: Vec<glob::Pattern>,
 }
@@ -1198,13 +1199,7 @@ pub fn run_watch_native(
     );
 
     // Coalesce: collect events for the configured window then rebuild once.
-    loop {
-        // Block until first event.
-        match rx.recv() {
-            Ok(_) => {}
-            Err(_) => break,
-        }
-
+    while rx.recv().is_ok() {
         // Drain any buffered events within the coalesce window.
         // Use a sliding-window approach: keep draining while events arrive.
         let mut last_event = Instant::now();
@@ -1341,6 +1336,16 @@ pub struct ServerState {
     pub coalescer: Mutex<Option<Arc<EventCoalescer>>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ServerStateOptions {
+    pub channel_capacity: usize,
+    pub turbo: bool,
+    pub coalesce_ms: u64,
+    pub binary_models: bool,
+    pub glob_ignores: GlobIgnoreSet,
+    pub project_path: Option<PathBuf>,
+}
+
 impl ServerState {
     pub fn new(
         root: PathBuf,
@@ -1364,12 +1369,14 @@ impl ServerState {
             root,
             includes,
             initial,
-            channel_capacity,
-            turbo,
-            coalesce_ms,
-            binary_models,
-            GlobIgnoreSet::empty(),
-            None,
+            ServerStateOptions {
+                channel_capacity,
+                turbo,
+                coalesce_ms,
+                binary_models,
+                glob_ignores: GlobIgnoreSet::empty(),
+                project_path: None,
+            },
         )
     }
 
@@ -1377,14 +1384,9 @@ impl ServerState {
         root: PathBuf,
         includes: Vec<String>,
         initial: Snapshot,
-        channel_capacity: usize,
-        turbo: bool,
-        coalesce_ms: u64,
-        binary_models: bool,
-        glob_ignores: GlobIgnoreSet,
-        project_path: Option<PathBuf>,
+        options: ServerStateOptions,
     ) -> Arc<Self> {
-        let capacity = channel_capacity.clamp(32, 16_384);
+        let capacity = options.channel_capacity.clamp(32, 16_384);
         let (tx, _rx) = tokio::sync::broadcast::channel::<SyncDiffEvent>(capacity);
         let metrics = Arc::new(Metrics::new());
         metrics
@@ -1396,7 +1398,9 @@ impl ServerState {
         history.insert(arc.fingerprint.clone(), Arc::clone(&arc));
         history_order.push_back(arc.fingerprint.clone());
         let canonical_root = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-        let project_path = project_path.unwrap_or_else(|| root.join("default.project.json"));
+        let project_path = options
+            .project_path
+            .unwrap_or_else(|| root.join("default.project.json"));
 
         Arc::new(Self {
             root,
@@ -1412,16 +1416,16 @@ impl ServerState {
             cache: Mutex::new(SnapshotCache::new()),
             metrics,
             rbxl: Mutex::new(RbxlDomCache::new()),
-            turbo,
-            coalesce_ms,
-            binary_models,
+            turbo: options.turbo,
+            coalesce_ms: options.coalesce_ms,
+            binary_models: options.binary_models,
             model_cache: Mutex::new(ModelManifestCache::new()),
             boot_time: Instant::now(),
             plugin_state: Mutex::new(None),
             plugin_state_at: Mutex::new(None),
             plugin_managed: Mutex::new(None),
             plugin_managed_at: Mutex::new(None),
-            glob_ignores,
+            glob_ignores: options.glob_ignores,
             plugin_commands: Mutex::new(VecDeque::new()),
             plugin_command_acks: Mutex::new(HashMap::new()),
             coalescer: Mutex::new(None),
@@ -1851,9 +1855,9 @@ fn classify_file_type(path: &str) -> &'static str {
         "txt"
     } else if len >= 4 && ends_with_ci(bytes, b".csv") {
         "csv"
-    } else if len >= 5 && ends_with_ci(bytes, b".yaml") {
-        "yaml"
-    } else if len >= 4 && ends_with_ci(bytes, b".yml") {
+    } else if (len >= 5 && ends_with_ci(bytes, b".yaml"))
+        || (len >= 4 && ends_with_ci(bytes, b".yml"))
+    {
         "yaml"
     } else if len >= 5 && ends_with_ci(bytes, b".toml") {
         "toml"
@@ -2484,7 +2488,7 @@ mod tests {
         let root = tempdir().expect("tempdir");
         let dir = root.path().join("src");
         fs::create_dir_all(&dir).expect("mkdir");
-        fs::write(dir.join("bad.luau"), &[0xFF, 0xFE, 0x00, 0x01]).expect("write");
+        fs::write(dir.join("bad.luau"), [0xFF, 0xFE, 0x00, 0x01]).expect("write");
 
         let includes = vec!["src".to_string()];
         let report = run_health_doctor(root.path(), &includes).expect("doctor");
@@ -2946,7 +2950,7 @@ mod tests {
         fs::write(src.join("tests/bar.luau"), "-- bar").expect("write bar");
         fs::write(src.join("game.luau"), "-- game").expect("write game");
 
-        let ignores = GlobIgnoreSet::new(&vec!["**/*.spec.luau".to_string()]);
+        let ignores = GlobIgnoreSet::new(&["**/*.spec.luau".to_string()]);
         let includes = vec!["src".to_string()];
         let snapshot =
             build_snapshot_with_ignores(root.path(), &includes, &ignores).expect("snapshot");
@@ -2972,10 +2976,8 @@ mod tests {
         fs::write(src.join("test.spec.luau"), "-- test").expect("write");
         fs::write(vendor.join("lib.luau"), "-- vendor lib").expect("write");
 
-        let ignores = GlobIgnoreSet::new(&vec![
-            "**/*.spec.luau".to_string(),
-            "src/vendor/**".to_string(),
-        ]);
+        let ignores =
+            GlobIgnoreSet::new(&["**/*.spec.luau".to_string(), "src/vendor/**".to_string()]);
         let includes = vec!["src".to_string()];
         let snapshot =
             build_snapshot_with_ignores(root.path(), &includes, &ignores).expect("snapshot");

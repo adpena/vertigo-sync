@@ -1,43 +1,21 @@
-SPDX-License-Identifier: LicenseRef-VERTIGO-CSL-1.0
+MIT License
 
-VERTIGO Community Source License (VCSL) v1.0
 Copyright (c) 2026 Adrian Pena
 
-This repository is source-available. It is NOT open-source under an OSI-approved license.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-1) Grant of Rights (Non-Commercial)
-You are allowed to:
-- use, study, and modify this software for personal, educational, and non-commercial community purposes;
-- share unmodified or modified copies for non-commercial purposes, if this license and attribution are preserved.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-2) Commercial Rights Reserved
-All commercial rights are reserved by the copyright holder.
-Without a separate written commercial license from the copyright holder, you may NOT:
-- sell, sublicense, rent, or otherwise monetize this software or derivative works;
-- use this software (or derivative works) in any paid product, paid access model, ad-monetized product, or revenue-generating service;
-- publish, list, sell, or otherwise commercialize this software, derivative works, or substantial portions in any marketplace,
-  including but not limited to the Roblox Marketplace / Creator Marketplace;
-- sell extracted logic, systems, scripts, assets, templates, or tool bundles derived from this repository.
-
-3) Commercial Licensing
-If you want commercial usage rights, contact the copyright holder for a commercial license.
-Commercial terms may include paid licensing, revenue-share, or custom contractual terms.
-
-4) Ownership and Branding
-- All ownership, title, and intellectual property rights remain with the copyright holder.
-- No trademark, trade dress, brand, or logo rights are granted.
-
-5) Contributions
-By submitting a contribution, you grant the repository owner a perpetual, worldwide, non-exclusive,
-royalty-free license to use, modify, sublicense, and commercially exploit that contribution.
-
-6) Third-Party and Subdirectory Licenses
-Some files or subdirectories may include different license files.
-Those explicit per-file or per-directory licenses take precedence for those specific materials.
-
-7) Warranty and Liability Disclaimer
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
-INCLUDING BUT NOT LIMITED TO MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES,
-OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

@@ -8,13 +8,13 @@ Zero to syncing in 60 seconds.
 cargo install --path .
 ```
 
-You should see cargo compile the crate and install the `vertigo-sync` binary.
+You should see cargo compile the crate and install the `vsync` binary.
 
 ```
   Installing vertigo-sync v0.1.0
    Compiling vertigo-sync v0.1.0
     Finished release [optimized] target(s) in 25.74s
-  Installing /Users/you/.cargo/bin/vertigo-sync
+  Installing /Users/you/.cargo/bin/vsync
    Installed package `vertigo-sync v0.1.0`
 ```
 
@@ -45,7 +45,6 @@ You will see:
 
 1. A green status dot in the Vertigo Sync panel
 2. "Connected  ·  ws  ·  #a3f8c2" in the status line
-3. A toast notification: "Synced 529 files"
 
 If the server is not running, the plugin shows a welcome screen with setup instructions and a "Check Connection" button.
 
@@ -54,7 +53,6 @@ If the server is not running, the plugin shows a welcome screen with setup instr
 Edit any `.luau` file in your project. Within milliseconds, you will see:
 
 - The file update in Studio
-- A toast: "Synced 1 files"
 - The fingerprint hash updating in the status line
 
 ## Next Steps

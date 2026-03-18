@@ -1603,7 +1603,7 @@ fn exec_ls(
     }
 
     let mut entries = Vec::new();
-    ls_dir(&resolved, &source_root, recursive, &mut entries, 0, 5000);
+    ls_dir(&resolved, &source_root, recursive, &mut entries, 5000);
 
     Ok(serde_json::json!({
         "path": raw_path,
@@ -1619,7 +1619,6 @@ fn ls_dir(
     root: &Path,
     recursive: bool,
     output: &mut Vec<serde_json::Value>,
-    current_depth: usize,
     max_entries: usize,
 ) {
     let read = match std::fs::read_dir(dir) {
@@ -1670,7 +1669,7 @@ fn ls_dir(
             ) {
                 continue;
             }
-            ls_dir(&path, root, true, output, current_depth + 1, max_entries);
+            ls_dir(&path, root, true, output, max_entries);
         }
     }
 }
@@ -2956,8 +2955,8 @@ fn topological_levels(steps: &[PipelineStep]) -> Result<Vec<Vec<usize>>, String>
     let mut levels: Vec<Vec<usize>> = Vec::new();
     let mut queue: VecDeque<usize> = VecDeque::new();
 
-    for i in 0..n {
-        if in_degree[i] == 0 {
+    for (i, degree) in in_degree.iter().enumerate().take(n) {
+        if *degree == 0 {
             queue.push_back(i);
         }
     }
@@ -3256,7 +3255,8 @@ async fn exec_pipeline(
     let result = match mode {
         "sequential" => execute_sequential(steps, stop_on_error, state).await?,
         "parallel" => execute_parallel(steps, stop_on_error, state).await?,
-        "auto" | _ => execute_auto(steps, stop_on_error, state).await?,
+        "auto" => execute_auto(steps, stop_on_error, state).await?,
+        _ => execute_auto(steps, stop_on_error, state).await?,
     };
 
     serde_json::to_value(&result).map_err(|e| {
@@ -3420,6 +3420,7 @@ fn exec_convert_to_builder(
     Ok(result)
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3460,7 +3461,7 @@ mod tests {
 
     #[test]
     fn tool_definitions_valid_json() {
-        let tools = vec![
+        let tools = [
             tool_def("test_tool", "A test tool", vec![]),
             tool_def(
                 "test_with_params",
@@ -3628,12 +3629,14 @@ mod tests {
             nested_root.clone(),
             vec!["nested-src".to_string()],
             empty_snapshot(vec!["nested-src".to_string()]),
-            32,
-            false,
-            50,
-            false,
-            crate::GlobIgnoreSet::empty(),
-            Some(nested_root.join("default.project.json")),
+            crate::ServerStateOptions {
+                channel_capacity: 32,
+                turbo: false,
+                coalesce_ms: 50,
+                binary_models: false,
+                glob_ignores: crate::GlobIgnoreSet::empty(),
+                project_path: Some(nested_root.join("default.project.json")),
+            },
         );
 
         let value = exec_project(&state).expect("project payload");
@@ -3916,7 +3919,7 @@ mod tests {
         }
         let acks = state.plugin_command_acks.lock().unwrap();
         assert!(acks.contains_key("cmd-42"));
-        assert_eq!(acks["cmd-42"].success, true);
+        assert!(acks["cmd-42"].success);
     }
 
     #[test]

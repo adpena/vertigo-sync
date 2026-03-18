@@ -76,8 +76,6 @@ Open Roblox Studio. The plugin connects automatically when the server is listeni
 cargo install --path .
 ```
 
-This installs both `vsync` and the compatibility alias `vertigo-sync`.
-
 ## Studio Plugin
 
 ```bash
@@ -191,7 +189,7 @@ Vertigo Sync reads `default.project.json` in Rojo-compatible format:
 ## Architecture
 
 ```
-filesystem ──► vertigo-sync server ──► Studio plugin
+filesystem ──► vsync server ──► Studio plugin
                    │
                    ├── GET /health
                    ├── GET /snapshot
@@ -323,11 +321,11 @@ Good bug reports help us fix issues quickly. Please include:
 
 1. **What you expected to happen** and **what actually happened**
 2. **Steps to reproduce** -- the exact commands you ran, the project structure, and the Studio version
-3. **Your environment** -- OS, `vertigo-sync --version`, Roblox Studio version
-4. **Logs** -- Studio Output window (filter by `[VertigoSync]`) and terminal output from `vertigo-sync serve`
+3. **Your environment** -- OS, `vsync --version`, Roblox Studio version
+4. **Logs** -- Studio Output window (filter by `[VertigoSync]`) and terminal output from `vsync serve`
 5. **Your `default.project.json`** (or a minimal version that reproduces the issue)
 
-If the issue involves sync behavior, running `vertigo-sync doctor` and including the output is very helpful.
+If the issue involves sync behavior, running `vsync doctor` and including the output is very helpful.
 
 ### Requesting Features
 

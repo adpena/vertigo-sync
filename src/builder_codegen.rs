@@ -21,8 +21,8 @@ pub fn scaffold_builder(
     if name.is_empty() {
         return Err("builder name must not be empty".into());
     }
-    if !name.chars().next().unwrap_or('_').is_ascii_alphabetic() && name.chars().next() != Some('_')
-    {
+    let first = name.chars().next().unwrap_or('_');
+    if !first.is_ascii_alphabetic() && !name.starts_with('_') {
         return Err("builder name must start with a letter or underscore".into());
     }
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -553,7 +553,7 @@ fn try_parse_color3(s: &str) -> Option<String> {
     let r = parts[0].trim().parse::<f64>().ok()?;
     let g = parts[1].trim().parse::<f64>().ok()?;
     let b = parts[2].trim().parse::<f64>().ok()?;
-    if r >= 0.0 && r <= 1.0 && g >= 0.0 && g <= 1.0 && b >= 0.0 && b <= 1.0 {
+    if (0.0..=1.0).contains(&r) && (0.0..=1.0).contains(&g) && (0.0..=1.0).contains(&b) {
         // Ambiguous with Vector3, so don't auto-detect from string
         return None;
     }

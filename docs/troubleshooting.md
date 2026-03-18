@@ -12,7 +12,7 @@ Common issues with symptoms, causes, and fixes.
 
 ```bash
 # Start the server
-vertigo-sync --turbo serve
+vsync --turbo serve
 
 # Or check if something else is using port 7575
 lsof -i :7575
@@ -21,7 +21,7 @@ lsof -i :7575
 If you need a different port:
 
 ```bash
-vertigo-sync --port 8080 serve
+vsync --port 8080 serve
 ```
 
 Note: the Studio plugin currently expects port 7575. Custom port support in the plugin is planned.
@@ -81,7 +81,7 @@ curl http://127.0.0.1:7575/health
 curl http://127.0.0.1:7575/health
 
 # If not running, restart it
-vertigo-sync --turbo serve
+vsync --turbo serve
 
 # Check server logs for crash information
 ```
@@ -133,7 +133,7 @@ vertigo-sync --turbo serve
 
 ## 10. Validation errors on startup
 
-**Symptom:** `vertigo-sync validate` reports errors.
+**Symptom:** `vsync validate` reports errors.
 
 **Cause:** Source files have issues detected by the built-in linter. Common issues:
 - Missing `--!strict` directive
@@ -144,7 +144,7 @@ vertigo-sync --turbo serve
 **Fix:** Address the reported issues. The validation output includes file paths, line numbers, and rule names:
 
 ```bash
-vertigo-sync validate
+vsync validate
 ```
 
 Example output:
@@ -173,7 +173,7 @@ curl http://127.0.0.1:7575/metrics
 curl http://127.0.0.1:7575/config
 
 # Full determinism check
-vertigo-sync doctor
+vsync doctor
 ```
 
 ## Studio Output Filtering
@@ -189,7 +189,7 @@ To see only Vertigo Sync messages in Studio output, filter for the `[VertigoSync
 
 If none of the above resolves your issue:
 
-1. Run `vertigo-sync doctor` and include the output
+1. Run `vsync doctor` and include the output
 2. Check Studio output for `[VertigoSync]` messages
 3. Include the output of `curl http://127.0.0.1:7575/health`
 4. File an issue with the above diagnostics

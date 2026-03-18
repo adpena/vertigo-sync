@@ -245,13 +245,14 @@ pub fn resolve_instance_class(file_path: &str) -> &'static str {
                 "Script"
             } else if file_name.ends_with(".client.luau") || file_name.ends_with(".client.lua") {
                 "LocalScript"
-            } else if file_name.ends_with(".luau") || file_name.ends_with(".lua") {
-                "ModuleScript"
-            } else if file_name.ends_with(".json") || file_name.ends_with(".jsonc") {
-                "ModuleScript"
-            } else if file_name.ends_with(".yaml") || file_name.ends_with(".yml") {
-                "ModuleScript"
-            } else if file_name.ends_with(".toml") {
+            } else if file_name.ends_with(".luau")
+                || file_name.ends_with(".lua")
+                || file_name.ends_with(".json")
+                || file_name.ends_with(".jsonc")
+                || file_name.ends_with(".yaml")
+                || file_name.ends_with(".yml")
+                || file_name.ends_with(".toml")
+            {
                 "ModuleScript"
             } else if file_name.ends_with(".txt") {
                 "StringValue"
