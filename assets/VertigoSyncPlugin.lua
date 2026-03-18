@@ -49,7 +49,9 @@ local LOG_PREFIX = "[VertigoSync]"
 local PLUGIN_VERSION = "2026-03-16-v9-trillion-dollar"
 -- PLUGIN_SEMVER "0.1.0" used inline in status line 3 (no new local to stay under 194 register limit)
 
-local SERVER_BASE_URL = "http://127.0.0.1:7575"
+local DEFAULT_SERVER_BASE_URL = "http://127.0.0.1:7575"
+local SERVER_URL_SETTING_KEY = "VertigoSyncServerUrl"
+local SERVER_URL_WORKSPACE_ATTR = "VertigoSyncServerUrl"
 local HEALTH_POLL_SECONDS = 15
 
 local POLL_INTERVAL_FAST = 0.10
@@ -483,15 +485,16 @@ local serverBootTimeCache: number? = nil -- cached server_boot_time from /health
 
 -- ─── Project Bootstrap State ────────────────────────────────────────────────
 
-local activePathMappings: { PathMapping } = LEGACY_PATH_MAPPINGS
-local activePathPrefixLens: { number } = LEGACY_PATH_PREFIX_LENS
+local activePathMappings: { PathMapping } = {}
+local activePathPrefixLens: { number } = {}
 local projectBootstrapMode: ProjectBootstrapMode = "bootstrapping"
 local projectBootstrapMessage: string = "Waiting for /project"
 local activeProjectName: string? = nil
-local activeProjectMappingCount: number = #LEGACY_PATH_MAPPINGS
+local activeProjectMappingCount: number = 0
 local projectMappingsLoaded = false
 local projectSyncBlocked = false
 local projectEmitLegacyScripts = true
+local currentServerBaseUrl = DEFAULT_SERVER_BASE_URL
 local lastProjectStatusToastKey = ""
 local attachedRootGuards: { [Instance]: boolean } = {}
 local resolveMapping: (filePath: string) -> (PathMapping?, string?)
@@ -690,8 +693,40 @@ local function encodePathForRoute(path: string): string
 	return table.concat(encodedSegments, "/")
 end
 
+local function normalizeServerBaseUrl(rawValue: any): string?
+	if type(rawValue) ~= "string" then
+		return nil
+	end
+	local trimmed = string.gsub(rawValue, "%s+", "")
+	trimmed = string.gsub(trimmed, "/+$", "")
+	if trimmed == "" then
+		return nil
+	end
+	if string.sub(trimmed, 1, 7) ~= "http://" and string.sub(trimmed, 1, 8) ~= "https://" then
+		return nil
+	end
+	return trimmed
+end
+
+local function resolveConfiguredServerBaseUrl(): string
+	local workspaceValue = normalizeServerBaseUrl(Workspace:GetAttribute(SERVER_URL_WORKSPACE_ATTR))
+	if workspaceValue ~= nil then
+		return workspaceValue
+	end
+	local pluginValue = normalizeServerBaseUrl(plugin:GetSetting(SERVER_URL_SETTING_KEY))
+	if pluginValue ~= nil then
+		return pluginValue
+	end
+	return DEFAULT_SERVER_BASE_URL
+end
+
+local function refreshServerBaseUrl()
+	currentServerBaseUrl = resolveConfiguredServerBaseUrl()
+	Workspace:SetAttribute(SERVER_URL_WORKSPACE_ATTR, currentServerBaseUrl)
+end
+
 local function requestRaw(endpoint: string): (boolean, any)
-	local url = SERVER_BASE_URL .. endpoint
+	local url = currentServerBaseUrl .. endpoint
 	local ok, result = pcall(function()
 		return HttpService:RequestAsync({
 			Url = url,
@@ -826,12 +861,6 @@ local function activateDynamicPathMappings(mappings: { PathMapping })
 	activeProjectMappingCount = #mappings
 end
 
-local function activateLegacyPathMappings()
-	activePathMappings = LEGACY_PATH_MAPPINGS
-	activePathPrefixLens = LEGACY_PATH_PREFIX_LENS
-	activeProjectMappingCount = #LEGACY_PATH_MAPPINGS
-end
-
 local function projectStatusLabel(): string
 	if projectBootstrapMode == "legacy" then
 		return "legacy"
@@ -938,17 +967,6 @@ local function applyProjectPayload(payload: any): boolean
 	return true
 end
 
-local function useLegacyProjectMappings(reason: string): boolean
-	projectEmitLegacyScripts = true
-	activateLegacyPathMappings()
-	projectMappingsLoaded = true
-	projectSyncBlocked = false
-	bootstrapManagedIndex()
-	attachActivePathGuards()
-	setProjectStatus("legacy", reason, nil, false)
-	return true
-end
-
 local function ensureProjectBootstrap(force: boolean): boolean
 	if projectMappingsLoaded and not force then
 		return not projectSyncBlocked
@@ -960,7 +978,10 @@ local function ensureProjectBootstrap(force: boolean): boolean
 	end
 
 	if statusCode == 404 then
-		return useLegacyProjectMappings("Legacy mode: server does not expose /project")
+		projectMappingsLoaded = false
+		projectSyncBlocked = true
+		setProjectStatus("mismatch", string.format("Server at %s does not expose /project", currentServerBaseUrl), activeProjectName, true)
+		return false
 	end
 
 	if statusCode == 0 then
@@ -1087,7 +1108,7 @@ local function ackPluginCommand(commandId: string, success: boolean, message: st
 			message = message,
 		})
 		HttpService:RequestAsync({
-			Url = SERVER_BASE_URL .. "/plugin/command/ack",
+			Url = currentServerBaseUrl .. "/plugin/command/ack",
 			Method = "POST",
 			Headers = {
 				["Content-Type"] = "application/json",
@@ -1316,7 +1337,7 @@ local function reportPluginState()
 	pcall(function()
 		local jsonBody: string = HttpService:JSONEncode(payload)
 		local raw = HttpService:RequestAsync({
-			Url = SERVER_BASE_URL .. "/plugin/state",
+			Url = currentServerBaseUrl .. "/plugin/state",
 			Method = "POST",
 			Headers = {
 				["Content-Type"] = "application/json",
@@ -1368,7 +1389,7 @@ local function reportPluginManaged()
 	pcall(function()
 		local jsonBody: string = HttpService:JSONEncode(payload)
 		HttpService:RequestAsync({
-			Url = SERVER_BASE_URL .. "/plugin/managed",
+			Url = currentServerBaseUrl .. "/plugin/managed",
 			Method = "POST",
 			Headers = {
 				["Content-Type"] = "application/json",
@@ -3635,7 +3656,7 @@ local function tryConnectWebSocket()
 		return false
 	end
 
-	local wsUrl = wsUrlFromHttpBase(SERVER_BASE_URL)
+	local wsUrl = wsUrlFromHttpBase(currentServerBaseUrl)
 	local ok, socketOrErr = pcall(function()
 		return (WebSocketService :: any):ConnectAsync(wsUrl)
 	end)
@@ -3702,6 +3723,7 @@ local function loadSettings()
 	if type(histBuf) == "number" and histBuf >= 16 and histBuf <= 1024 then
 		settingHistoryBuffer = math.floor(histBuf)
 	end
+	refreshServerBaseUrl()
 end
 
 local function saveSetting(key: string, value: any)
@@ -4694,7 +4716,7 @@ welcomeCheckBtn.MouseButton1Click:Connect(function()
 		resyncRequested = true
 	else
 		connectionState = "error"
-		showToast("Server not found on :7575", TOAST_COLOR_ERROR)
+		showToast(string.format("Server not reachable at %s", currentServerBaseUrl), TOAST_COLOR_ERROR)
 	end
 end)
 
@@ -5054,7 +5076,7 @@ end
 
 buildersEnabled = settingBuildersEnabled and isEditMode()
 initInstancePool()
-activateLegacyPathMappings()
+refreshServerBaseUrl()
 
 Workspace:SetAttribute("VertigoSyncPluginVersion", PLUGIN_VERSION)
 Workspace:SetAttribute("VertigoSyncRealtimeDefault", true)
@@ -5162,3 +5184,12 @@ end)
 
 end -- _initPlugin
 _initPlugin()
+Workspace:GetAttributeChangedSignal(SERVER_URL_WORKSPACE_ATTR):Connect(function()
+	refreshServerBaseUrl()
+	projectMappingsLoaded = false
+	projectSyncBlocked = false
+	resyncRequested = true
+	closeWebSocket("server_url_changed")
+	setProjectStatus("bootstrapping", "Waiting for /project", nil, false)
+	setStatusAttributes("disconnected", lastHash)
+end)
