@@ -5068,7 +5068,7 @@ end
 
 buildersEnabled = settingBuildersEnabled and isEditMode()
 initInstancePool()
-refreshServerBaseUrl()
+Workspace:SetAttribute("VertigoSyncServerUrl", getServerBaseUrl())
 
 Workspace:SetAttribute("VertigoSyncPluginVersion", PLUGIN_VERSION)
 Workspace:SetAttribute("VertigoSyncRealtimeDefault", true)
