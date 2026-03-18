@@ -129,6 +129,7 @@ struct Cli {
 struct ProjectContext {
     project_path: PathBuf,
     project_root: PathBuf,
+    includes: Vec<String>,
     tree: vertigo_sync::project::ProjectTree,
 }
 
@@ -161,10 +162,18 @@ enum Command {
     },
     /// Blocking watch loop that emits NDJSON diff events to stdout.
     #[command(display_order = 21)]
-    Watch,
+    Watch {
+        /// Project file path (default: default.project.json).
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
+    },
     /// Native filesystem watch using FSEvents/inotify (replaces polling).
     #[command(display_order = 22)]
-    WatchNative,
+    WatchNative {
+        /// Project file path (default: default.project.json).
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
+    },
     /// Build a .rbxl place file from source (replaces `rojo build`).
     #[command(display_order = 30)]
     Build {
@@ -235,8 +244,8 @@ async fn main() -> Result<()> {
         Command::Event => command_event(&root, &state_dir, &cli),
         Command::Doctor => command_doctor(&root, &state_dir, &cli),
         Command::Health => command_health(&root, &state_dir, &cli),
-        Command::Watch => command_watch(&root, &state_dir, &cli),
-        Command::WatchNative => command_watch_native(&root, &state_dir, &cli),
+        Command::Watch { project } => command_watch(&root, &state_dir, project, &cli),
+        Command::WatchNative { project } => command_watch_native(&root, &state_dir, project, &cli),
         Command::Validate => command_validate(&root, &cli),
         Command::Build {
             output,
@@ -257,8 +266,8 @@ async fn main() -> Result<()> {
         Command::Init { name } => command_init(&root, name.as_deref()),
         Command::PluginInstall => command_plugin_install(),
         Command::Serve { project } => {
-            let project_context = resolve_project_context(&root, project)?;
-            let includes = resolve_effective_includes(&project_context.project_path, &cli.include);
+            let project_context = resolve_project_context(&root, project, &cli.include)?;
+            let includes = project_context.includes.clone();
             let (interval, coalesce_ms) = if cli.turbo {
                 (Duration::from_millis(100), 10u64)
             } else {
@@ -319,15 +328,14 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Resolve effective include paths: use CLI values if provided, else try to
-/// auto-detect from `default.project.json` `$path` entries, else fall back
+/// auto-detect from the selected project file `$path` entries, else fall back
 /// to `["src"]`.
-fn resolve_effective_includes(root: &Path, cli_includes: &[String]) -> Vec<String> {
+fn resolve_effective_includes(project_path: &Path, cli_includes: &[String]) -> Vec<String> {
     if !cli_includes.is_empty() {
         return cli_includes.to_vec();
     }
 
-    // Try auto-detect from project file.
-    let project_path = root.join("default.project.json");
+    // Try auto-detect from the selected project file only.
     if project_path.is_file() {
         if let Ok(content) = std::fs::read_to_string(&project_path) {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -349,13 +357,18 @@ fn resolve_effective_includes(root: &Path, cli_includes: &[String]) -> Vec<Strin
     vec!["src".to_string()]
 }
 
-fn resolve_project_context(root: &Path, project: &Path) -> Result<ProjectContext> {
+fn resolve_project_context(
+    root: &Path,
+    project: &Path,
+    cli_includes: &[String],
+) -> Result<ProjectContext> {
     let project_path = if project.is_absolute() {
         project.to_path_buf()
     } else {
         root.join(project)
     };
     let tree = parse_project(&project_path)?;
+    let includes = resolve_effective_includes(&project_path, cli_includes);
     let project_root = project_path
         .parent()
         .map(Path::to_path_buf)
@@ -364,6 +377,7 @@ fn resolve_project_context(root: &Path, project: &Path) -> Result<ProjectContext
     Ok(ProjectContext {
         project_path,
         project_root,
+        includes,
         tree,
     })
 }
@@ -390,7 +404,7 @@ fn collect_dollar_paths(obj: &serde_json::Map<String, serde_json::Value>, out: &
 // ---------------------------------------------------------------------------
 
 fn command_snapshot(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
-    let includes = resolve_effective_includes(root, &cli.include);
+    let includes = resolve_effective_includes(&root.join("default.project.json"), &cli.include);
     let snapshot = build_snapshot(root, &includes)?;
     let snapshot_path = cli
         .snapshot
@@ -414,7 +428,7 @@ fn command_snapshot(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
 }
 
 fn command_diff(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
-    let includes = resolve_effective_includes(root, &cli.include);
+    let includes = resolve_effective_includes(&root.join("default.project.json"), &cli.include);
     let previous_path = resolve_previous_path(root, state_dir, cli);
     let previous = read_snapshot(&previous_path).with_context(|| {
         format!(
@@ -466,7 +480,7 @@ fn command_diff(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
 }
 
 fn command_event(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
-    let includes = resolve_effective_includes(root, &cli.include);
+    let includes = resolve_effective_includes(&root.join("default.project.json"), &cli.include);
     let previous_path = resolve_previous_path(root, state_dir, cli);
     let previous = read_snapshot(&previous_path).with_context(|| {
         format!(
@@ -547,7 +561,7 @@ fn command_event(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
 }
 
 fn command_doctor(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
-    let includes = resolve_effective_includes(root, &cli.include);
+    let includes = resolve_effective_includes(&root.join("default.project.json"), &cli.include);
     let determinism = run_doctor(root, &includes)?;
     let health = run_health_doctor(root, &includes)?;
 
@@ -635,7 +649,7 @@ fn command_doctor(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
 }
 
 fn command_health(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
-    let includes = resolve_effective_includes(root, &cli.include);
+    let includes = resolve_effective_includes(&root.join("default.project.json"), &cli.include);
     let report = run_health_doctor(root, &includes)?;
 
     if cli.json {
@@ -677,7 +691,7 @@ fn command_health(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
 }
 
 fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
-    let includes = resolve_effective_includes(root, &cli.include);
+    let includes = resolve_effective_includes(&root.join("default.project.json"), &cli.include);
     let report = validate::validate_source(root, &includes)?;
 
     if cli.json {
@@ -761,29 +775,39 @@ fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn command_watch(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
-    let includes = resolve_effective_includes(root, &cli.include);
+fn command_watch(root: &Path, state_dir: &Path, project: &Path, cli: &Cli) -> Result<()> {
+    let project_context = resolve_project_context(root, project, &cli.include)?;
+    let default_output_dir = if cli.state_dir.is_absolute() {
+        state_dir.to_path_buf()
+    } else {
+        project_context.project_root.join(&cli.state_dir)
+    };
     let output_dir = cli
         .output
         .as_ref()
-        .map(|value| resolve_relative_to_root(root, value))
-        .unwrap_or_else(|| state_dir.to_path_buf());
+        .map(|value| resolve_relative_to_root(&project_context.project_root, value))
+        .unwrap_or(default_output_dir);
 
     run_watch(
-        root,
-        &includes,
+        &project_context.project_root,
+        &project_context.includes,
         Duration::from_secs(cli.interval_seconds.max(1)),
         Some(&output_dir),
     )
 }
 
-fn command_watch_native(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
-    let includes = resolve_effective_includes(root, &cli.include);
+fn command_watch_native(root: &Path, state_dir: &Path, project: &Path, cli: &Cli) -> Result<()> {
+    let project_context = resolve_project_context(root, project, &cli.include)?;
+    let default_output_dir = if cli.state_dir.is_absolute() {
+        state_dir.to_path_buf()
+    } else {
+        project_context.project_root.join(&cli.state_dir)
+    };
     let output_dir = cli
         .output
         .as_ref()
-        .map(|value| resolve_relative_to_root(root, value))
-        .unwrap_or_else(|| state_dir.to_path_buf());
+        .map(|value| resolve_relative_to_root(&project_context.project_root, value))
+        .unwrap_or(default_output_dir);
 
     let coalesce_ms = if cli.turbo {
         output::info("turbo mode: 10ms coalesce, native fsevents");
@@ -792,8 +816,8 @@ fn command_watch_native(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> 
         cli.coalesce_ms
     };
     run_watch_native(
-        root,
-        &includes,
+        &project_context.project_root,
+        &project_context.includes,
         Some(&output_dir),
         Duration::from_millis(coalesce_ms),
     )
@@ -803,7 +827,7 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
     use rbx_dom_weak::{InstanceBuilder, WeakDom};
     use vertigo_sync::project::resolve_instance_class;
 
-    let project_context = resolve_project_context(root, project)?;
+    let project_context = resolve_project_context(root, project, &[])?;
     let project_path = project_context.project_path;
     let project_root = project_context.project_root;
     let tree = project_context.tree;
@@ -877,7 +901,7 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
     let output_path = if output.is_absolute() {
         output.to_path_buf()
     } else {
-        root.join(output)
+        project_root.join(output)
     };
 
     if let Some(parent) = output_path.parent() {
@@ -929,18 +953,15 @@ fn command_syncback(root: &Path, input: &Path, project: &Path, dry_run: bool) ->
     } else {
         root.join(input)
     };
-
-    let project_path = if project.is_absolute() {
-        project.to_path_buf()
-    } else {
-        root.join(project)
-    };
+    let project_context = resolve_project_context(root, project, &[])?;
+    let project_path = project_context.project_path;
+    let project_root = project_context.project_root;
 
     if !input_path.exists() {
         bail!("input file does not exist: {}", input_path.display());
     }
 
-    let tree = parse_project(&project_path)?;
+    let tree = project_context.tree;
 
     output::header("Syncback");
     output::kv("Input", &input_path.display().to_string());
@@ -982,7 +1003,7 @@ fn command_syncback(root: &Path, input: &Path, project: &Path, dry_run: bool) ->
         dom.root_ref(),
         "",
         &instance_to_fs,
-        root,
+        &project_root,
         dry_run,
         &mut written,
         &mut skipped,
@@ -1084,14 +1105,16 @@ fn resolve_syncback_path(
     inst: &rbx_dom_weak::Instance,
     _dom: &rbx_dom_weak::WeakDom,
 ) -> Option<String> {
+    let normalized_dm_path = dm_path.strip_prefix("DataModel.").unwrap_or(dm_path);
+
     // Find the longest matching prefix.
     let mut best_prefix = "";
     let mut best_fs = "";
     for (inst_path, fs_path) in instance_to_fs {
-        if dm_path.starts_with(inst_path.as_str())
+        if normalized_dm_path.starts_with(inst_path.as_str())
             && inst_path.len() > best_prefix.len()
-            && (dm_path.len() == inst_path.len()
-                || dm_path.as_bytes().get(inst_path.len()) == Some(&b'.'))
+            && (normalized_dm_path.len() == inst_path.len()
+                || normalized_dm_path.as_bytes().get(inst_path.len()) == Some(&b'.'))
         {
             best_prefix = inst_path;
             best_fs = fs_path;
@@ -1102,8 +1125,8 @@ fn resolve_syncback_path(
         return None;
     }
 
-    let suffix = if dm_path.len() > best_prefix.len() {
-        &dm_path[best_prefix.len() + 1..] // skip the '.'
+    let suffix = if normalized_dm_path.len() > best_prefix.len() {
+        &normalized_dm_path[best_prefix.len() + 1..] // skip the '.'
     } else {
         ""
     };
@@ -1168,22 +1191,20 @@ async fn command_sourcemap(
 ) -> Result<()> {
     use vertigo_sync::sourcemap::generate_sourcemap;
 
-    let project_path = if project.is_absolute() {
-        project.to_path_buf()
-    } else {
-        root.join(project)
-    };
+    let project_context = resolve_project_context(root, project, &cli.include)?;
+    let project_path = project_context.project_path;
+    let project_root = project_context.project_root;
+    let includes = project_context.includes;
+    let tree = project_context.tree;
 
     let output_path = if output.is_absolute() {
         output.to_path_buf()
     } else {
-        root.join(output)
+        project_root.join(output)
     };
 
-    let tree = parse_project(&project_path)?;
-
     let write_sourcemap = |tree: &vertigo_sync::project::ProjectTree| -> Result<()> {
-        let sourcemap = generate_sourcemap(root, tree, include_non_scripts)?;
+        let sourcemap = generate_sourcemap(&project_root, tree, include_non_scripts)?;
         let json =
             serde_json::to_string_pretty(&sourcemap).context("failed to serialize sourcemap")?;
         if let Some(parent) = output_path.parent() {
@@ -1197,7 +1218,7 @@ async fn command_sourcemap(
     write_sourcemap(&tree)?;
 
     if cli.json {
-        let sourcemap = generate_sourcemap(root, &tree, include_non_scripts)?;
+        let sourcemap = generate_sourcemap(&project_root, &tree, include_non_scripts)?;
         println!("{}", serde_json::to_string(&sourcemap)?);
     } else {
         output::success("Sourcemap generated");
@@ -1210,8 +1231,6 @@ async fn command_sourcemap(
             output::info("Watching for changes (Ctrl+C to stop)...");
         }
 
-        let includes = resolve_effective_includes(root, &cli.include);
-
         use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
         use std::sync::mpsc;
 
@@ -1220,7 +1239,7 @@ async fn command_sourcemap(
             .context("failed to create filesystem watcher")?;
 
         for inc in &includes {
-            let watch_path = root.join(inc);
+            let watch_path = project_root.join(inc);
             if watch_path.exists() {
                 watcher
                     .watch(&watch_path, RecursiveMode::Recursive)
@@ -1373,7 +1392,7 @@ fn command_init(root: &Path, name: Option<&str>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Embedded Studio plugin source, compiled into the binary.
-const PLUGIN_SOURCE: &str = include_str!("../../../studio-plugin/VertigoSyncPlugin.lua");
+const PLUGIN_SOURCE: &str = include_str!("../assets/VertigoSyncPlugin.lua");
 
 fn command_plugin_install() -> Result<()> {
     let plugins_dir = detect_plugins_dir()?;
@@ -1805,9 +1824,35 @@ fn default_event_output_path(state_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        populate_from_dir, resolve_container_class, resolve_instance_name, resolve_syncback_path,
+        Cli, Command, populate_from_dir, resolve_container_class, resolve_effective_includes,
+        resolve_instance_name, resolve_project_context, resolve_syncback_path, syncback_walk,
     };
+    use clap::Parser;
+    use serde_json::json;
     use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn write_project(path: &Path, name: &str, source_root: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create project parent");
+        }
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&json!({
+                "name": name,
+                "tree": {
+                    "$className": "DataModel",
+                    "ServerScriptService": {
+                        "Server": {
+                            "$path": source_root
+                        }
+                    }
+                }
+            }))
+            .expect("serialize project"),
+        )
+        .expect("write project");
+    }
 
     #[test]
     fn resolve_instance_name_strips_script_suffixes() {
@@ -1966,6 +2011,168 @@ mod tests {
         assert_eq!(
             result,
             Some("src/Server/Services/DataService.luau".to_string())
+        );
+    }
+
+    #[test]
+    fn syncback_resolve_path_ignores_datamodel_prefix() {
+        let mut instance_to_fs = std::collections::HashMap::new();
+        instance_to_fs.insert(
+            "ServerScriptService.Server".to_string(),
+            "src/Server".to_string(),
+        );
+
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root_ref = dom.root_ref();
+        let script_ref = dom.insert(
+            root_ref,
+            InstanceBuilder::new("ModuleScript").with_name("DataService"),
+        );
+
+        let inst = dom.get_by_ref(script_ref).unwrap();
+        let result = resolve_syncback_path(
+            "DataModel.ServerScriptService.Server.Services.DataService",
+            &instance_to_fs,
+            inst,
+            &dom,
+        );
+        assert_eq!(
+            result,
+            Some("src/Server/Services/DataService.luau".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_project_context_uses_selected_nested_project() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        write_project(
+            &root.join("default.project.json"),
+            "RootGame",
+            "root-src/Server",
+        );
+
+        let nested_dir = root.join("apps/game");
+        write_project(
+            &nested_dir.join("default.project.json"),
+            "NestedGame",
+            "nested-src/Server",
+        );
+
+        let context =
+            resolve_project_context(root, Path::new("apps/game/default.project.json"), &[])
+                .expect("resolve project context");
+
+        assert_eq!(
+            context.project_path,
+            nested_dir.join("default.project.json")
+        );
+        assert_eq!(context.project_root, nested_dir);
+        assert_eq!(context.tree.name, "NestedGame");
+        assert_eq!(context.includes, vec!["nested-src".to_string()]);
+    }
+
+    #[test]
+    fn resolve_effective_includes_does_not_auto_discover_descendants() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_project(
+            &temp.path().join("apps/game/default.project.json"),
+            "NestedGame",
+            "nested-src/Server",
+        );
+
+        let includes = resolve_effective_includes(&temp.path().join("default.project.json"), &[]);
+
+        assert_eq!(includes, vec!["src".to_string()]);
+    }
+
+    #[test]
+    fn watch_commands_accept_project_flag() {
+        let cli = Cli::try_parse_from([
+            "vertigo-sync",
+            "watch",
+            "--project",
+            "apps/game/default.project.json",
+        ])
+        .expect("parse watch args");
+        match cli.command {
+            Command::Watch { project } => {
+                assert_eq!(project, PathBuf::from("apps/game/default.project.json"));
+            }
+            other => panic!("expected watch command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vertigo-sync",
+            "watch-native",
+            "--project",
+            "apps/game/default.project.json",
+        ])
+        .expect("parse watch-native args");
+        match cli.command {
+            Command::WatchNative { project } => {
+                assert_eq!(project, PathBuf::from("apps/game/default.project.json"));
+            }
+            other => panic!("expected watch-native command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syncback_walk_writes_into_selected_project_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let nested_dir = root.join("apps/game");
+        let mut instance_to_fs = std::collections::HashMap::new();
+        instance_to_fs.insert(
+            "ServerScriptService.Server".to_string(),
+            "nested-src/Server".to_string(),
+        );
+
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root_ref = dom.root_ref();
+        let service_ref = dom.insert(
+            root_ref,
+            InstanceBuilder::new("ServerScriptService").with_name("ServerScriptService"),
+        );
+        let folder_ref = dom.insert(
+            service_ref,
+            InstanceBuilder::new("Folder").with_name("Server"),
+        );
+        dom.insert(
+            folder_ref,
+            InstanceBuilder::new("ModuleScript")
+                .with_name("DataService")
+                .with_property(
+                    "Source",
+                    rbx_dom_weak::types::Variant::String("return 'nested'\n".to_string()),
+                ),
+        );
+
+        let mut written = 0usize;
+        let mut skipped = 0usize;
+        syncback_walk(
+            &dom,
+            root_ref,
+            "",
+            &instance_to_fs,
+            &nested_dir,
+            false,
+            &mut written,
+            &mut skipped,
+        )
+        .expect("syncback walk");
+
+        assert_eq!(written, 1);
+        assert_eq!(skipped, 0);
+
+        let restored = fs::read_to_string(nested_dir.join("nested-src/Server/DataService.luau"))
+            .expect("read restored nested script");
+        assert_eq!(restored, "return 'nested'\n");
+        assert!(
+            !root.join("nested-src/Server/DataService.luau").exists(),
+            "syncback should write under the selected project root"
         );
     }
 }

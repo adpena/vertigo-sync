@@ -2,89 +2,109 @@
 
 ## CLI Commands
 
-### `vertigo-sync serve`
-
-Start the sync server.
+Global options are passed before the subcommand.
 
 ```bash
-vertigo-sync [OPTIONS] serve [SERVE_OPTIONS]
+vertigo-sync --turbo serve
+vertigo-sync --root /path/to/project --turbo serve --project roblox/default.project.json
+vertigo-sync --root /path/to/project snapshot
+vertigo-sync --root /path/to/project build -o place.rbxl --project default.project.json
+```
+
+### Global Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--root <path>` | `.` | Workspace root used to resolve relative paths |
+| `--state-dir <path>` | `.vertigo-sync-state` | Directory for default snapshot, diff, and event files |
+| `--snapshot <path>` | - | Current snapshot JSON path used by `snapshot`, `diff`, and `event` |
+| `--previous <path>` | - | Previous snapshot JSON path used by `diff` and `event` |
+| `--diff <path>` | - | Diff JSON output path used by `diff` and `event` |
+| `--output <path>` | - | Primary output JSON path for `snapshot`, `event`, `doctor`, and `health` |
+| `--event-log <path>` | - | JSONL event log path used by `event` |
+| `--include <path>` | auto-detected or `src` | Include roots to sync |
+| `--interval-seconds <n>` | `2` | Polling interval for `watch` and `serve` modes |
+| `--port <port>` | `7575` | HTTP/WebSocket port for `serve` |
+| `--address <addr>` | `127.0.0.1` | HTTP bind address for `serve` |
+| `--channel-capacity <n>` | `1024` | Broadcast channel capacity for `serve` and `event` fanout |
+| `--coalesce-ms <n>` | `50` | Event coalescing window in milliseconds |
+| `--turbo` | `false` | Use 10 ms coalescing, 100 ms polling, and native filesystem watch |
+| `--json` | `false` | Emit machine-readable JSON instead of human-readable text |
+
+### `serve`
+
+Serve snapshot, diff, and event data over HTTP + SSE.
+
+```bash
+vertigo-sync --turbo serve --project default.project.json
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--root <path>` | `.` | Project root directory (must contain `default.project.json`) |
-| `--port <port>` | `7575` | HTTP/WebSocket server port |
-| `--turbo` | `false` | Enable turbo mode: reduces FSEvents coalescing from 50 ms to 10 ms |
+| `--project <path>` | `default.project.json` | Project file path |
 
-**Examples:**
+The server resolves `servePort` and `serveAddress` from the project file when present, falling back to the global `--port` and `--address` flags, then to `7575` and `127.0.0.1`.
 
-```bash
-# Default: serve current directory on port 7575
-vertigo-sync serve
+### `snapshot`, `diff`, `event`, `doctor`, `health`, `validate`, `watch`, `watch-native`
 
-# Turbo mode with custom root
-vertigo-sync --root /path/to/project serve --turbo
+These commands use the global flags above and do not add command-specific flags.
 
-# Custom port
-vertigo-sync serve --port 8080
-```
-
-### `vertigo-sync snapshot`
-
-Print the current source tree snapshot to stdout as JSON.
-
-```bash
-vertigo-sync [OPTIONS] snapshot
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--root <path>` | `.` | Project root directory |
-
-The snapshot includes every source file with its path, SHA-256 hash, byte size, and file type. The output is deterministic: same source tree always produces the same fingerprint.
-
-### `vertigo-sync doctor`
-
-Run determinism and health validation.
-
-```bash
-vertigo-sync [OPTIONS] doctor
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--root <path>` | `.` | Project root directory |
-
-Doctor runs two full snapshot passes and verifies that both produce the same fingerprint. It also checks source tree analysis, file integrity, and project configuration.
-
-### `vertigo-sync validate`
-
-Run Luau source validation with 36 built-in rules.
-
-```bash
-vertigo-sync [OPTIONS] validate
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--root <path>` | `.` | Project root directory |
-
-Returns a JSON report with file paths, line numbers, severity levels, messages, and rule names.
-
-### `vertigo-sync build`
+### `build`
 
 Build a place file from source.
 
 ```bash
-vertigo-sync [OPTIONS] build -o <output>
+vertigo-sync build -o <output>
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--root <path>` | `.` | Project root directory |
-| `-o <path>` | (required) | Output file path (`.rbxl` or `.rbxlx`) |
+| `-o, --output <path>` | required | Output `.rbxl` or `.rbxlx` file |
+| `--project <path>` | `default.project.json` | Project file path |
+| `--binary-models` | `false` | Enable binary model (`.rbxm`/`.rbxmx`) processing |
 
-### `vertigo-sync plugin-install`
+### `syncback`
+
+Extract scripts from a place file back to the filesystem.
+
+```bash
+vertigo-sync syncback --input place.rbxl
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input <path>` | required | Input `.rbxl` or `.rbxlx` file |
+| `--project <path>` | `default.project.json` | Project file used for path mapping |
+| `--dry-run` | `false` | Show what would be written without writing |
+
+### `sourcemap`
+
+Generate a Rojo-compatible `sourcemap.json` for luau-lsp.
+
+```bash
+vertigo-sync sourcemap
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output <path>` | `sourcemap.json` | Output path |
+| `--project <path>` | `default.project.json` | Project file path |
+| `--include-non-scripts` | `true` | Include non-script instances in the sourcemap |
+| `--watch` | `false` | Regenerate automatically when files change |
+
+### `init`
+
+Create a new Vertigo Sync project with a standard directory structure.
+
+```bash
+vertigo-sync init --name MyProject
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--name <name>` | current directory name | Project name |
+
+### `plugin-install`
 
 Install the Studio plugin to the Roblox plugins directory.
 
@@ -92,18 +112,7 @@ Install the Studio plugin to the Roblox plugins directory.
 vertigo-sync plugin-install
 ```
 
-Copies the plugin file to `~/Documents/Roblox/Plugins/VertigoSyncPlugin.lua` on macOS/Linux or the equivalent Windows path.
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VERTIGO_SYNC_PORT` | `7575` | Override the server port (equivalent to `--port`) |
-| `VERTIGO_SYNC_ROOT` | `.` | Override the project root (equivalent to `--root`) |
-| `VERTIGO_SYNC_LOG` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
-| `VERTIGO_SYNC_TURBO` | `false` | Set to `true` to enable turbo mode (equivalent to `--turbo`) |
-
-CLI flags take precedence over environment variables.
+The command copies the plugin file to the Roblox user plugins directory for the current platform.
 
 ## Project Configuration (`default.project.json`)
 
@@ -114,9 +123,10 @@ Vertigo Sync reads `default.project.json` in the Rojo-compatible format. The pro
 ```json
 {
   "name": "ProjectName",
-  "servePlaceIds": [123456789],
-  "placeId": 123456789,
-  "gameId": 987654321,
+  "globIgnorePaths": ["generated/**"],
+  "emitLegacyScripts": true,
+  "servePort": 7575,
+  "serveAddress": "127.0.0.1",
   "tree": {
     "$className": "DataModel",
     "ServiceName": {
@@ -136,6 +146,8 @@ Vertigo Sync reads `default.project.json` in the Rojo-compatible format. The pro
 | `$className` | The Roblox class name for this tree node |
 | `$path` | Relative path to a source directory or file |
 | `$ignoreUnknownInstances` | When `true`, preserves instances not managed by sync |
+| `$properties` | Property overrides applied to the generated instance |
+| `$attributes` | Attribute overrides applied to the generated instance |
 
 ### File Type Mapping
 

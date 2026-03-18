@@ -1551,8 +1551,41 @@ fn resolve_patch_target(source_root: &Path, raw_path: &str) -> anyhow::Result<Pa
 mod tests {
     use super::*;
     use base64::Engine;
+    use serde_json::json;
     use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
+
+    fn write_project(path: &Path, name: &str, source_root: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create project parent");
+        }
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&json!({
+                "name": name,
+                "tree": {
+                    "$className": "DataModel",
+                    "ServerScriptService": {
+                        "Server": {
+                            "$path": source_root
+                        }
+                    }
+                }
+            }))
+            .expect("serialize project"),
+        )
+        .expect("write project");
+    }
+
+    fn empty_snapshot(include: Vec<String>) -> crate::Snapshot {
+        crate::Snapshot {
+            version: 1,
+            include,
+            fingerprint: "test-fingerprint".to_string(),
+            entries: Vec::new(),
+        }
+    }
 
     #[test]
     fn normalize_snapshot_lookup_path_canonicalizes_separators() {
@@ -1700,5 +1733,100 @@ mod tests {
         assert_eq!(ack.reason_code, "ok");
         assert_eq!(ack.reason_message, "");
         assert_eq!(ack.applied, 3);
+    }
+
+    #[test]
+    fn handle_project_uses_selected_project_path() {
+        let workspace = tempdir().expect("tempdir");
+        write_project(
+            &workspace.path().join("default.project.json"),
+            "RootGame",
+            "root-src/Server",
+        );
+
+        let nested_root = workspace.path().join("apps/game");
+        write_project(
+            &nested_root.join("default.project.json"),
+            "NestedGame",
+            "nested-src/Server",
+        );
+
+        let state = crate::ServerState::with_full_config(
+            nested_root.clone(),
+            vec!["nested-src".to_string()],
+            empty_snapshot(vec!["nested-src".to_string()]),
+            32,
+            false,
+            50,
+            false,
+            crate::GlobIgnoreSet::empty(),
+            Some(nested_root.join("default.project.json")),
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let Json(value) = runtime
+            .block_on(handle_project(State(state)))
+            .expect("project response");
+
+        assert_eq!(value["name"], "NestedGame");
+    }
+
+    #[test]
+    fn handle_sourcemap_uses_selected_project_path_and_root() {
+        let workspace = tempdir().expect("tempdir");
+        write_project(
+            &workspace.path().join("default.project.json"),
+            "RootGame",
+            "root-src/Server",
+        );
+        fs::create_dir_all(workspace.path().join("root-src/Server")).expect("create root src");
+        fs::write(
+            workspace.path().join("root-src/Server/init.server.luau"),
+            "return 'root'\n",
+        )
+        .expect("write root source");
+
+        let nested_root = workspace.path().join("apps/game");
+        write_project(
+            &nested_root.join("default.project.json"),
+            "NestedGame",
+            "nested-src/Server",
+        );
+        fs::create_dir_all(nested_root.join("nested-src/Server")).expect("create nested src");
+        fs::write(
+            nested_root.join("nested-src/Server/init.server.luau"),
+            "return 'nested'\n",
+        )
+        .expect("write nested source");
+
+        let state = crate::ServerState::with_full_config(
+            nested_root.clone(),
+            vec!["nested-src".to_string()],
+            empty_snapshot(vec!["nested-src".to_string()]),
+            32,
+            false,
+            50,
+            false,
+            crate::GlobIgnoreSet::empty(),
+            Some(nested_root.join("default.project.json")),
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let Json(value) = runtime
+            .block_on(handle_sourcemap(
+                State(state),
+                Query(std::collections::HashMap::new()),
+            ))
+            .expect("sourcemap response");
+        let serialized = serde_json::to_string(&value).expect("serialize sourcemap");
+
+        assert!(serialized.contains("nested-src/Server/init.server.luau"));
+        assert!(!serialized.contains("root-src/Server/init.server.luau"));
     }
 }

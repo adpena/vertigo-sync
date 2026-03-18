@@ -5,10 +5,10 @@ Zero to syncing in 60 seconds.
 ## Step 1: Install
 
 ```bash
-cargo install vertigo-sync
+cargo install --path services/vertigo-sync
 ```
 
-Expected output:
+You should see cargo compile the crate and install the `vertigo-sync` binary.
 
 ```
   Installing vertigo-sync v0.1.0
@@ -23,19 +23,18 @@ Expected output:
 From your project root (the directory containing `default.project.json`):
 
 ```bash
-vertigo-sync serve --turbo
+vertigo-sync --turbo serve
 ```
 
-Expected output:
+You should see the server announce its listening address and selected project, for example:
 
 ```
-[vertigo-sync] Watching /Users/you/my-roblox-project
-[vertigo-sync] FSEvents coalescing: 10ms (turbo mode)
-[vertigo-sync] Snapshot: 529 files, fingerprint=a3f8c2...
-[vertigo-sync] Server listening on http://127.0.0.1:7575
-[vertigo-sync] WebSocket endpoint: ws://127.0.0.1:7575/ws
-[vertigo-sync] SSE endpoint: http://127.0.0.1:7575/events
-[vertigo-sync] Health: http://127.0.0.1:7575/health
+Vertigo Sync v0.1.0
+  Server: http://127.0.0.1:7575
+  WebSocket: ws://127.0.0.1:7575/ws
+  Mode: turbo (10ms coalesce)
+  Project: /Users/you/my-roblox-project/default.project.json
+  Watching: src
 ```
 
 ## Step 3: Open Studio
@@ -61,5 +60,5 @@ Edit any `.luau` file in your project. Within milliseconds, you will see:
 ## Next Steps
 
 - [Migration from Rojo](migration-from-rojo.md) -- if you are switching from Rojo
-- [Configuration Reference](configuration.md) -- all CLI flags and environment variables
+- [Configuration Reference](configuration.md) -- all CLI flags and project settings
 - [Troubleshooting](troubleshooting.md) -- common issues and fixes

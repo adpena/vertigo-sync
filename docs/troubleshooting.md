@@ -12,7 +12,7 @@ Common issues with symptoms, causes, and fixes.
 
 ```bash
 # Start the server
-vertigo-sync serve --turbo
+vertigo-sync --turbo serve
 
 # Or check if something else is using port 7575
 lsof -i :7575
@@ -21,7 +21,7 @@ lsof -i :7575
 If you need a different port:
 
 ```bash
-vertigo-sync serve --turbo --port 8080
+vertigo-sync --port 8080 serve
 ```
 
 Note: the Studio plugin currently expects port 7575. Custom port support in the plugin is planned.
@@ -81,7 +81,7 @@ curl http://127.0.0.1:7575/health
 curl http://127.0.0.1:7575/health
 
 # If not running, restart it
-vertigo-sync serve --turbo
+vertigo-sync --turbo serve
 
 # Check server logs for crash information
 ```
@@ -135,7 +135,7 @@ vertigo-sync serve --turbo
 
 **Symptom:** `vertigo-sync validate` reports errors.
 
-**Cause:** Source files have issues detected by the 36-rule linter. Common issues:
+**Cause:** Source files have issues detected by the built-in linter. Common issues:
 - Missing `--!strict` directive
 - Missing `@native` on hot-path functions
 - Usage of deprecated APIs

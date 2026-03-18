@@ -2,7 +2,16 @@
 name = "vertigo-sync"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Deterministic source snapshot and diff CLI for Vertigo"
+license = "MIT"
+repository = "https://github.com/adpena/vertigo"
+homepage = "https://github.com/adpena/vertigo"
+documentation = "https://docs.rs/vertigo-sync"
+readme = "README.md"
+keywords = ["roblox", "studio", "sync", "luau", "cli"]
+categories = ["command-line-utilities", "development-tools", "game-development"]
+exclude = ["target/**"]
 
 [[bin]]
 name = "vertigo-sync"

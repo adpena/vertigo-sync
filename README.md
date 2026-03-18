@@ -20,8 +20,8 @@ The comparison below is factual. Rojo's numbers are community-reported estimates
 | Cached snapshot (0 changes) | N/A | 9.2 ms | Vertigo Sync caches by mtime/size |
 | Diff computation | Instance-level | 194 us (file-level) | Different granularity |
 | Transport | WebSocket (v7.5+) | WebSocket + SSE + HTTP | Vertigo Sync adds SSE and polling fallbacks |
-| Built-in validation | None (use selene) | 36-rule Luau linter | Vertigo Sync includes validation; Rojo defers to external tools |
-| MCP tools | None | 42 tools | Vertigo Sync is designed for AI-agent consumption |
+| Built-in validation | None (use selene) | Built-in Luau linter | Vertigo Sync includes validation; Rojo defers to external tools |
+| MCP tools | None | Agent-native tools | Vertigo Sync is designed for AI-agent consumption |
 | Time-travel | No | Yes | Navigate sync history |
 | Prometheus metrics | No | Yes | Production observability |
 
@@ -41,60 +41,39 @@ If you encounter a behavioral difference not listed here, please [file an issue]
 ## Quickstart
 
 ```bash
-# Install
-cargo install vertigo-sync
+# Install from this checkout
+cargo install --path services/vertigo-sync
 
 # Start syncing
-vertigo-sync serve --turbo
+vertigo-sync --turbo serve
 
 # Serve a nested Roblox project from a monorepo root
-vertigo-sync serve --project roblox/default.project.json --turbo
+vertigo-sync --root . --turbo serve --project roblox/default.project.json
 
 # Install the Studio plugin
 vertigo-sync plugin-install
 ```
 
-Open Roblox Studio -- the plugin connects automatically.
+Open Roblox Studio. The plugin connects automatically when the server is listening on `127.0.0.1:7575`.
 
 ## Features
 
-- **Sub-millisecond sync** -- 13.5 ms cold snapshot, 9.2 ms cached, 194 us diff
+- **Low-latency sync** -- 13.5 ms cold snapshot, 9.2 ms cached, 194 us diff
 - **Frame-budgeted Studio plugin** -- never stalls Studio, 4 ms/frame budget with adaptive scaling
-- **Built-in Luau validation** -- 36 rules catching NCG deopt, strict mode violations, deprecated APIs, hot-path allocations
+- **Built-in Luau validation** -- catches NCG deopt, strict mode violations, deprecated APIs, and hot-path allocations
 - **WebSocket + SSE + HTTP** -- triple-transport with automatic fallback and lag recovery
 - **Time-travel** -- rewind and fast-forward through your sync history with a scrubber UI
-- **42 MCP tools** -- full agent-native read/write/validate surface for AI-assisted development
+- **Agent-native MCP tools** -- full read/write/validate surface for AI-assisted development
 - **Prometheus metrics** -- production observability at `/metrics`
 - **Instance pooling** -- pre-allocated instance pool eliminates GC pressure during sync
 - **Rojo-compatible** -- works with existing `default.project.json` files, no migration required
 
 ## Installation
 
-### From source (recommended)
+### From source
 
 ```bash
-cargo install vertigo-sync
-```
-
-### Pre-built binaries
-
-**macOS / Linux:**
-
-```bash
-# Coming soon: curl -fsSL https://vertigo-sync.dev/install.sh | sh
-```
-
-**Windows (PowerShell):**
-
-```powershell
-irm https://github.com/vertigo-sync/vertigo-sync/releases/latest/download/install.ps1 | iex
-```
-
-### Homebrew (macOS / Linux)
-
-```bash
-brew tap vertigo-sync/tap
-brew install vertigo-sync
+cargo install --path services/vertigo-sync
 ```
 
 ## Studio Plugin
@@ -129,11 +108,11 @@ The plugin runs a 4-stage pipeline on every Heartbeat:
 | Command | Description |
 |---------|-------------|
 | `vertigo-sync serve` | Start the sync server (default port 7575) |
-| `vertigo-sync serve --project path/to/default.project.json` | Serve a project file that lives below the current workspace root |
-| `vertigo-sync serve --turbo` | Start with 10 ms FSEvents coalescing (faster sync) |
+| `vertigo-sync --root path --turbo serve --project path/to/default.project.json` | Serve a project file that lives below the current workspace root |
+| `vertigo-sync --turbo serve` | Start with 10 ms FSEvents coalescing (faster sync) |
 | `vertigo-sync snapshot` | Print deterministic source tree snapshot |
 | `vertigo-sync doctor` | Run determinism and health validation |
-| `vertigo-sync validate` | Run Luau source validation (36 rules) |
+| `vertigo-sync validate` | Run Luau source validation |
 | `vertigo-sync build -o place.rbxl` | Build a place file from source |
 | `vertigo-sync plugin-install` | Install the Studio plugin |
 
@@ -146,7 +125,7 @@ Your existing `default.project.json` works as-is. Just change the command:
 rojo serve default.project.json
 
 # After (Vertigo Sync)
-vertigo-sync serve --project default.project.json --turbo
+vertigo-sync --turbo serve --project default.project.json
 ```
 
 See [Migration Guide](docs/migration-from-rojo.md) for the full walkthrough.
@@ -155,21 +134,20 @@ See [Migration Guide](docs/migration-from-rojo.md) for the full walkthrough.
 
 ### CLI Flags
 
+Global options are provided before the subcommand.
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--root <path>` | `.` | Project root directory |
-| `--port <port>` | `7575` | HTTP server port |
-| `--turbo` | `false` | Enable turbo mode (10 ms coalescing) |
-| `-o <path>` | - | Output path for build command |
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VERTIGO_SYNC_PORT` | `7575` | Override server port |
-| `VERTIGO_SYNC_ROOT` | `.` | Override project root |
-| `VERTIGO_SYNC_LOG` | `info` | Log level (trace, debug, info, warn, error) |
-| `VERTIGO_SYNC_TURBO` | `false` | Enable turbo mode |
+| `--root <path>` | `.` | Workspace root used to resolve relative paths |
+| `--state-dir <path>` | `.vertigo-sync-state` | Directory for default snapshot, diff, and event files |
+| `--include <path>` | auto-detected or `src` | Additional include roots (comma-separated or repeated) |
+| `--interval-seconds <n>` | `2` | Polling interval for watch and serve modes |
+| `--port <port>` | `7575` | HTTP/WebSocket port for `serve` |
+| `--address <addr>` | `127.0.0.1` | HTTP bind address for `serve` |
+| `--channel-capacity <n>` | `1024` | Broadcast channel capacity for `serve` and `event` |
+| `--coalesce-ms <n>` | `50` | Event coalescing window in milliseconds |
+| `--turbo` | `false` | Shortcut for 10 ms coalescing and native filesystem watch |
+| `--json` | `false` | Emit machine-readable JSON |
 
 ### Project Configuration
 
@@ -300,7 +278,7 @@ All patch operations return deterministic ack/reject envelopes with structured r
 
 ## MCP Tools
 
-Vertigo Sync exposes 42 MCP tools for agent-native source manipulation. See the [Agent DSL Reference](../../docs/vertigo-sync-agent-dsl.md) for the full catalog.
+Vertigo Sync exposes agent-native MCP tools for source manipulation. See the [Agent DSL Reference](../../docs/vertigo-sync-agent-dsl.md) for the full catalog.
 
 ### Categories
 
@@ -324,7 +302,7 @@ vsync_source("src/Server/Services/DataService.luau")   # Read
 
 ## Validation Rules
 
-The built-in Luau validator checks 36 rules across these categories:
+The built-in Luau validator checks rules across these categories:
 
 - **Strict mode** -- missing `--!strict` directive
 - **NCG optimization** -- missing `@native` on hot-path functions, closures in loops

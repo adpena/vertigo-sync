@@ -1521,10 +1521,10 @@ fn exec_doctor(state: &ServerState) -> Result<serde_json::Value, (StatusCode, St
 }
 
 fn exec_project(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
-    let project_path = state.root.join("default.project.json");
+    let project_path = state.project_path.clone();
     if !project_path.exists() {
         return Ok(serde_json::json!({
-            "error": "default.project.json not found",
+            "error": "selected project file not found",
             "path": project_path.display().to_string(),
         }));
     }
@@ -3423,6 +3423,40 @@ fn exec_convert_to_builder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::fs;
+    use std::path::Path;
+
+    fn write_project(path: &Path, name: &str, source_root: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create project parent");
+        }
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&json!({
+                "name": name,
+                "tree": {
+                    "$className": "DataModel",
+                    "ServerScriptService": {
+                        "Server": {
+                            "$path": source_root
+                        }
+                    }
+                }
+            }))
+            .expect("serialize project"),
+        )
+        .expect("write project");
+    }
+
+    fn empty_snapshot(include: Vec<String>) -> crate::Snapshot {
+        crate::Snapshot {
+            version: 1,
+            include,
+            fingerprint: "abc123".into(),
+            entries: vec![],
+        }
+    }
 
     #[test]
     fn tool_definitions_valid_json() {
@@ -3572,6 +3606,38 @@ mod tests {
         .expect("bridge execute should return structured envelope");
         assert_eq!(result["ok"], false);
         assert_eq!(result["error"]["code"], "BAD_PARAMS");
+    }
+
+    #[test]
+    fn exec_project_uses_selected_project_path() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        write_project(
+            &workspace.path().join("default.project.json"),
+            "RootGame",
+            "root-src/Server",
+        );
+
+        let nested_root = workspace.path().join("apps/game");
+        write_project(
+            &nested_root.join("default.project.json"),
+            "NestedGame",
+            "nested-src/Server",
+        );
+
+        let state = crate::ServerState::with_full_config(
+            nested_root.clone(),
+            vec!["nested-src".to_string()],
+            empty_snapshot(vec!["nested-src".to_string()]),
+            32,
+            false,
+            50,
+            false,
+            crate::GlobIgnoreSet::empty(),
+            Some(nested_root.join("default.project.json")),
+        );
+
+        let value = exec_project(&state).expect("project payload");
+        assert_eq!(value["name"], "NestedGame");
     }
 
     #[test]
