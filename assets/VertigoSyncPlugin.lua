@@ -448,30 +448,36 @@ local instancePool: { [string]: { Instance } } = {}
 
 -- ─── Time-Travel State ──────────────────────────────────────────────────────
 
-local historyEntries: { HistoryEntry } = {}
-local historyCurrentIndex: number = 0 -- 0 = live mode
-local historyLoaded = false
-local historyFetchFailed = false
-local historyFetchInFlight = false
-local historyLastFetchAt = 0
-local timeTravelBusy = false
-local TIME_TRAVEL_ACTIVE = false
+local HISTORY = {
+	entries = {} :: { HistoryEntry },
+	currentIndex = 0, -- 0 = live mode
+	loaded = false,
+	fetchFailed = false,
+	fetchInFlight = false,
+	lastFetchAt = 0,
+	busy = false,
+	active = false,
+}
 
 -- ─── Builder State ───────────────────────────────────────────────────────────
 
-local buildersEnabled = false -- set in init based on edit mode
-local builderSources: { [string]: string } = {} -- path -> source hash
-local builderOutputTags: { [string]: string } = {} -- path -> output tag
-local builderDependencyMap: { [string]: { [string]: boolean } } = {} -- shared module path -> set of builder paths
-local builderDirtySet: { [string]: boolean } = {} -- builder paths pending re-execution
-local builderDebounceScheduled: boolean = false
+local BUILDERS = {
+	enabled = false, -- set in init based on edit mode
+	sources = {} :: { [string]: string }, -- path -> source hash
+	outputTags = {} :: { [string]: string }, -- path -> output tag
+	dependencyMap = {} :: { [string]: { [string]: boolean } }, -- shared module path -> set of builder paths
+	dirtySet = {} :: { [string]: boolean }, -- builder paths pending re-execution
+	debounceScheduled = false,
+}
 
 -- ─── Settings State ──────────────────────────────────────────────────────────
 
-local settingBinaryModels = BINARY_MODELS_ENABLED
-local settingBuildersEnabled = BUILDERS_ENABLED_DEFAULT
-local settingTimeTravelUI = true
-local settingHistoryBuffer = TIME_TRAVEL_HISTORY_LIMIT
+local SETTINGS = {
+	binaryModels = BINARY_MODELS_ENABLED,
+	buildersEnabled = BUILDERS_ENABLED_DEFAULT,
+	timeTravelUI = true,
+	historyBuffer = TIME_TRAVEL_HISTORY_LIMIT,
+}
 
 -- Log level: 0=quiet, 1=normal, 2=verbose (controllable via sync_plugin_command)
 local logLevel: number = 1
@@ -483,17 +489,19 @@ local serverBootTimeCache: number? = nil -- cached server_boot_time from /health
 
 -- ─── Project Bootstrap State ────────────────────────────────────────────────
 
-local activePathMappings: { PathMapping } = {}
-local activePathPrefixLens: { number } = {}
-local projectBootstrapMode: ProjectBootstrapMode = "bootstrapping"
-local projectBootstrapMessage: string = "Waiting for /project"
-local activeProjectName: string? = nil
-local activeProjectMappingCount: number = 0
-local projectMappingsLoaded = false
-local projectSyncBlocked = false
-local projectEmitLegacyScripts = true
-local lastProjectStatusToastKey = ""
-local attachedRootGuards: { [Instance]: boolean } = {}
+local PROJECT = {
+	mappings = {} :: { PathMapping },
+	prefixLens = {} :: { number },
+	mode = "bootstrapping" :: ProjectBootstrapMode,
+	message = "Waiting for /project",
+	name = nil :: string?,
+	mappingCount = 0,
+	loaded = false,
+	blocked = false,
+	emitLegacyScripts = true,
+	lastStatusToastKey = "",
+	attachedRootGuards = {} :: { [Instance]: boolean },
+}
 local resolveMapping: (filePath: string) -> (PathMapping?, string?)
 local bootstrapManagedIndex: () -> ()
 
@@ -607,10 +615,10 @@ local function setStatusAttributes(status: SyncStatus, hash: string?)
 end
 
 local function setProjectStatus(mode: ProjectBootstrapMode, message: string, projectName: string?, blocked: boolean)
-	projectBootstrapMode = mode
-	projectBootstrapMessage = message
-	activeProjectName = projectName
-	projectSyncBlocked = blocked
+	PROJECT.mode = mode
+	PROJECT.message = message
+	PROJECT.name = projectName
+	PROJECT.blocked = blocked
 
 	Workspace:SetAttribute("VertigoSyncProjectMode", mode)
 	Workspace:SetAttribute("VertigoSyncProjectName", projectName)
@@ -618,13 +626,13 @@ local function setProjectStatus(mode: ProjectBootstrapMode, message: string, pro
 	Workspace:SetAttribute("VertigoSyncProjectBlocked", blocked)
 	Workspace:SetAttribute("VertigoSyncProjectLegacy", mode == "legacy")
 	Workspace:SetAttribute("VertigoSyncProjectMismatch", mode == "mismatch")
-	Workspace:SetAttribute("VertigoSyncProjectMappingCount", activeProjectMappingCount)
-	Workspace:SetAttribute("VertigoSyncEmitLegacyScripts", projectEmitLegacyScripts)
+	Workspace:SetAttribute("VertigoSyncProjectMappingCount", PROJECT.mappingCount)
+	Workspace:SetAttribute("VertigoSyncEmitLegacyScripts", PROJECT.emitLegacyScripts)
 
 	if (mode == "legacy" or mode == "mismatch") and message ~= "" then
 		local toastKey = mode .. "::" .. message
-		if toastKey ~= lastProjectStatusToastKey then
-			lastProjectStatusToastKey = toastKey
+		if toastKey ~= PROJECT.lastStatusToastKey then
+			PROJECT.lastStatusToastKey = toastKey
 			showToast(message, if mode == "legacy" then TOAST_COLOR_INFO else TOAST_COLOR_ERROR)
 		end
 	end
@@ -657,9 +665,9 @@ local function flushMetrics(force: boolean)
 		Workspace:SetAttribute("VertigoSyncFetchConcurrency", adaptiveFetchConcurrency)
 		Workspace:SetAttribute("VertigoSyncApplyCostUs", math.floor(applyCostEwmaSeconds * 1000000 + 0.5))
 		Workspace:SetAttribute("VertigoSyncRealtimeDefault", true)
-		Workspace:SetAttribute("VertigoSyncBinaryModels", settingBinaryModels)
-		Workspace:SetAttribute("VertigoSyncBuildersEnabled", buildersEnabled)
-		Workspace:SetAttribute("VertigoSyncTimeTravel", TIME_TRAVEL_ACTIVE)
+		Workspace:SetAttribute("VertigoSyncBinaryModels", SETTINGS.binaryModels)
+		Workspace:SetAttribute("VertigoSyncBuildersEnabled", BUILDERS.enabled)
+		Workspace:SetAttribute("VertigoSyncTimeTravel", HISTORY.active)
 	end
 end
 
@@ -837,35 +845,35 @@ end
 
 local function activateDynamicPathMappings(mappings: { PathMapping })
 	sortPathMappings(mappings)
-	activePathMappings = mappings
-	activePathPrefixLens = table.create(#mappings)
+	PROJECT.mappings = mappings
+	PROJECT.prefixLens = table.create(#mappings)
 	for i = 1, #mappings do
-		activePathPrefixLens[i] = #mappings[i].prefix
+		PROJECT.prefixLens[i] = #mappings[i].prefix
 	end
-	activeProjectMappingCount = #mappings
+	PROJECT.mappingCount = #mappings
 end
 
 local function projectStatusLabel(): string
-	if projectBootstrapMode == "legacy" then
+	if PROJECT.mode == "legacy" then
 		return "legacy"
 	end
-	if projectBootstrapMode == "mismatch" then
-		if activeProjectName ~= nil and activeProjectName ~= "" then
-			return "mismatch:" .. string.sub(activeProjectName, 1, 16)
+	if PROJECT.mode == "mismatch" then
+		if PROJECT.name ~= nil and PROJECT.name ~= "" then
+			return "mismatch:" .. string.sub(PROJECT.name, 1, 16)
 		end
-		return if projectSyncBlocked then "mismatch:block" else "mismatch"
+		return if PROJECT.blocked then "mismatch:block" else "mismatch"
 	end
-	if activeProjectName ~= nil and activeProjectName ~= "" then
-		return string.sub(activeProjectName, 1, 18)
+	if PROJECT.name ~= nil and PROJECT.name ~= "" then
+		return string.sub(PROJECT.name, 1, 18)
 	end
-	return if projectBootstrapMode == "bootstrapping" then "waiting" else "dynamic"
+	return if PROJECT.mode == "bootstrapping" then "waiting" else "dynamic"
 end
 
 local function attachGuardRoot(root: Instance)
-	if attachedRootGuards[root] then
+	if PROJECT.attachedRootGuards[root] then
 		return
 	end
-	attachedRootGuards[root] = true
+	PROJECT.attachedRootGuards[root] = true
 
 	root.DescendantAdded:Connect(function(descendant: Instance)
 		if inSelfMutationGuard() then
@@ -894,9 +902,9 @@ local function attachGuardRoot(root: Instance)
 end
 
 local function attachActivePathGuards()
-	local mappingCount: number = #activePathMappings
+	local mappingCount: number = #PROJECT.mappings
 	for i = 1, mappingCount do
-		attachGuardRoot(activePathMappings[i].root)
+		attachGuardRoot(PROJECT.mappings[i].root)
 	end
 end
 
@@ -933,10 +941,10 @@ local function applyProjectPayload(payload: any): boolean
 		return false
 	end
 
-	projectEmitLegacyScripts = if type(payload.emit_legacy_scripts) == "boolean" then payload.emit_legacy_scripts else true
+	PROJECT.emitLegacyScripts = if type(payload.emit_legacy_scripts) == "boolean" then payload.emit_legacy_scripts else true
 	activateDynamicPathMappings(runtimeMappings)
-	projectMappingsLoaded = true
-	projectSyncBlocked = false
+	PROJECT.loaded = true
+	PROJECT.blocked = false
 	bootstrapManagedIndex()
 	attachActivePathGuards()
 
@@ -952,8 +960,8 @@ local function applyProjectPayload(payload: any): boolean
 end
 
 local function ensureProjectBootstrap(force: boolean): boolean
-	if projectMappingsLoaded and not force then
-		return not projectSyncBlocked
+	if PROJECT.loaded and not force then
+		return not PROJECT.blocked
 	end
 
 	local ok, payloadOrErr, statusCode = requestJson("/project")
@@ -962,28 +970,28 @@ local function ensureProjectBootstrap(force: boolean): boolean
 	end
 
 	if statusCode == 404 then
-		projectMappingsLoaded = false
-		projectSyncBlocked = true
-		setProjectStatus("mismatch", string.format("Server at %s does not expose /project", getServerBaseUrl()), activeProjectName, true)
+		PROJECT.loaded = false
+		PROJECT.blocked = true
+		setProjectStatus("mismatch", string.format("Server at %s does not expose /project", getServerBaseUrl()), PROJECT.name, true)
 		return false
 	end
 
 	if statusCode == 0 then
-		if projectBootstrapMode == "bootstrapping" then
-			setProjectStatus("bootstrapping", "Waiting for /project", activeProjectName, false)
+		if PROJECT.mode == "bootstrapping" then
+			setProjectStatus("bootstrapping", "Waiting for /project", PROJECT.name, false)
 		end
 		return false
 	end
 
-	projectMappingsLoaded = false
-	projectSyncBlocked = true
-	setProjectStatus("mismatch", string.format("Failed to load /project: %s", tostring(payloadOrErr)), activeProjectName, true)
+	PROJECT.loaded = false
+	PROJECT.blocked = true
+	setProjectStatus("mismatch", string.format("Failed to load /project: %s", tostring(payloadOrErr)), PROJECT.name, true)
 	return false
 end
 
 local function handleServerUrlChanged()
-	projectMappingsLoaded = false
-	projectSyncBlocked = false
+	PROJECT.loaded = false
+	PROJECT.blocked = false
 	resyncRequested = true
 	closeWebSocket("server_url_changed")
 	setProjectStatus("bootstrapping", "Waiting for /project", nil, false)
@@ -1141,7 +1149,7 @@ local function processPluginCommands(commands: { any })
 				message = "invalid budget_ms (1-16)"
 			end
 		elseif cmd.command == "run_builders" then
-			if buildersEnabled and isEditMode() then
+			if BUILDERS.enabled and isEditMode() then
 				task.defer(runInitialBuilders)
 				message = "builders scheduled"
 			else
@@ -1174,13 +1182,13 @@ local function processPluginCommands(commands: { any })
 					message = "rewind requires a non-empty params.fingerprint"
 				else
 					local okFetch: boolean = true
-					if not historyLoaded then
+					if not HISTORY.loaded then
 						local fetchOk: boolean, fetchErr: string? = pcall(fetchHistory)
 						if not fetchOk then
 							success = false
 							message = "fetchHistory threw: " .. tostring(fetchErr)
 							okFetch = false
-						elseif not historyLoaded then
+						elseif not HISTORY.loaded then
 							success = false
 							message = "failed to load history"
 							okFetch = false
@@ -1188,7 +1196,7 @@ local function processPluginCommands(commands: { any })
 					end
 					if okFetch then
 						local targetIndex: number? = nil
-						for i, entry in historyEntries do
+						for i, entry in HISTORY.entries do
 							if entry.fingerprint == params.fingerprint then
 								targetIndex = i
 								break
@@ -1209,9 +1217,9 @@ local function processPluginCommands(commands: { any })
 					end
 				end
 			elseif params.action == "step_back" then
-				if not historyLoaded then
+				if not HISTORY.loaded then
 					local fetchOk: boolean = pcall(fetchHistory)
-					if not fetchOk or not historyLoaded then
+					if not fetchOk or not HISTORY.loaded then
 						success = false
 						message = "failed to load history for step_back"
 					end
@@ -1234,9 +1242,9 @@ local function processPluginCommands(commands: { any })
 					message = "stepped forward"
 				end
 			elseif params.action == "jump_oldest" then
-				if not historyLoaded then
+				if not HISTORY.loaded then
 					local fetchOk: boolean = pcall(fetchHistory)
-					if not fetchOk or not historyLoaded then
+					if not fetchOk or not HISTORY.loaded then
 						success = false
 						message = "failed to load history for jump_oldest"
 					end
@@ -1311,18 +1319,18 @@ local function reportPluginState()
 		lagged_events = laggedEvents,
 		dropped_updates = droppedUpdates,
 		managed_count = managedCount,
-		time_travel_active = TIME_TRAVEL_ACTIVE,
-		time_travel_seq = if TIME_TRAVEL_ACTIVE then historyCurrentIndex else nil,
-		binary_models_enabled = settingBinaryModels,
-		builders_enabled = buildersEnabled,
+		time_travel_active = HISTORY.active,
+		time_travel_seq = if HISTORY.active then HISTORY.currentIndex else nil,
+		binary_models_enabled = SETTINGS.binaryModels,
+		builders_enabled = BUILDERS.enabled,
 		builders_last_rebuild = builderLastRebuild,
 		builders_last_path = builderLastPath,
-		project_mode = projectBootstrapMode,
-		project_name = activeProjectName,
-		project_message = projectBootstrapMessage,
-		project_blocked = projectSyncBlocked,
-		project_mapping_count = activeProjectMappingCount,
-		project_emit_legacy_scripts = projectEmitLegacyScripts,
+		project_mode = PROJECT.mode,
+		project_name = PROJECT.name,
+		project_message = PROJECT.message,
+		project_blocked = PROJECT.blocked,
+		project_mapping_count = PROJECT.mappingCount,
+		project_emit_legacy_scripts = PROJECT.emitLegacyScripts,
 		studio_mode = describeStudioMode(),
 		uptime_seconds = math.floor(now - pluginBootTime + 0.5),
 	}
@@ -1521,10 +1529,10 @@ end
 -- ─── Path resolution / mapping ──────────────────────────────────────────────
 
 resolveMapping = function(filePath: string): (PathMapping?, string?)
-	local mappingCount: number = #activePathMappings
+	local mappingCount: number = #PROJECT.mappings
 	for i = 1, mappingCount do
-		local prefixLen: number = activePathPrefixLens[i]
-		local mapping: PathMapping = activePathMappings[i]
+		local prefixLen: number = PROJECT.prefixLens[i]
+		local mapping: PathMapping = PROJECT.mappings[i]
 		if prefixLen == 0 or string.sub(filePath, 1, prefixLen) == mapping.prefix then
 			local remainder: string = string.sub(filePath, prefixLen + 1)
 			return mapping, remainder
@@ -1562,7 +1570,7 @@ end
 local function classForFile(fileName: string): string
 	local mapped: string? = CLASS_MAP[fileName]
 	if mapped ~= nil then
-		if not projectEmitLegacyScripts and mapped == "LocalScript" then
+		if not PROJECT.emitLegacyScripts and mapped == "LocalScript" then
 			return "Script"
 		end
 		return mapped
@@ -1571,7 +1579,7 @@ local function classForFile(fileName: string): string
 	if string.find(fileName, ".server.", 1, true) then
 		return "Script"
 	elseif string.find(fileName, ".client.", 1, true) then
-		return if projectEmitLegacyScripts then "LocalScript" else "Script"
+		return if PROJECT.emitLegacyScripts then "LocalScript" else "Script"
 	end
 	-- Extended file type support
 	if string.find(fileName, ".jsonc", 1, true) then
@@ -1590,7 +1598,7 @@ local function classForFile(fileName: string): string
 end
 
 local function runContextForPath(filePath: string): Enum.RunContext?
-	if projectEmitLegacyScripts then
+	if PROJECT.emitLegacyScripts then
 		return nil
 	end
 
@@ -1822,9 +1830,9 @@ bootstrapManagedIndex = function()
 	managedIndex = {}
 	managedShaByPath = {}
 
-	local mappingCount: number = #activePathMappings
+	local mappingCount: number = #PROJECT.mappings
 	for i = 1, mappingCount do
-		local mapping: PathMapping = activePathMappings[i]
+		local mapping: PathMapping = PROJECT.mappings[i]
 		local boundaryRoot: Instance? = findBoundaryRoot(mapping)
 		if boundaryRoot ~= nil then
 			visitManagedScope(boundaryRoot, function(descendant: Instance)
@@ -1876,9 +1884,9 @@ end
 -- Uses MANAGED_PATH_ATTR to find root instances, then destroys the entire subtree.
 local function cleanupModelInstances(path: string)
 	-- Find all root instances tagged with this model path
-	local mappingCount: number = #activePathMappings
+	local mappingCount: number = #PROJECT.mappings
 	for i = 1, mappingCount do
-		local mapping: PathMapping = activePathMappings[i]
+		local mapping: PathMapping = PROJECT.mappings[i]
 		local boundaryRoot: Instance? = findBoundaryRoot(mapping)
 		if boundaryRoot ~= nil then
 			local pendingDestroy: { Instance } = {}
@@ -2093,10 +2101,10 @@ local function computeBuilderDependencies(builderPath: string, scriptInstance: L
 			if lastSegment ~= "" and string.find(requireArg, lastSegment, 1, true) ~= nil then
 				-- This builder depends on something under this dependency path
 				-- Register all files under this prefix as potential triggers
-				if builderDependencyMap[depPrefix] == nil then
-					builderDependencyMap[depPrefix] = {}
+				if BUILDERS.dependencyMap[depPrefix] == nil then
+					BUILDERS.dependencyMap[depPrefix] = {}
 				end
-				builderDependencyMap[depPrefix][builderPath] = true
+				BUILDERS.dependencyMap[depPrefix][builderPath] = true
 			end
 		end
 
@@ -2106,19 +2114,19 @@ end
 
 -- Schedule a debounced batch of dirty builder re-executions
 local function scheduleBuilderBatch()
-	if builderDebounceScheduled then
+	if BUILDERS.debounceScheduled then
 		return
 	end
-	builderDebounceScheduled = true
+	BUILDERS.debounceScheduled = true
 	task.defer(function()
 		task.wait(BUILDER_DEBOUNCE_SECONDS)
-		builderDebounceScheduled = false
+		BUILDERS.debounceScheduled = false
 
 		local dirtyPaths: { string } = {}
-		for path: string in builderDirtySet do
+		for path: string in BUILDERS.dirtySet do
 			table.insert(dirtyPaths, path)
 		end
-		builderDirtySet = {}
+		BUILDERS.dirtySet = {}
 
 		if #dirtyPaths == 0 then
 			return
@@ -2146,7 +2154,7 @@ local function scheduleBuilderBatch()
 				local outputTag: string = "BuilderOutput_" .. sanitized .. "_" .. string.sub(sourceHash, 1, 8)
 
 				-- Check if output already exists with matching hash
-				if builderOutputTags[path] == outputTag then
+				if BUILDERS.outputTags[path] == outputTag then
 					local existingOutputs: { Instance } = CollectionService:GetTagged(outputTag)
 					if #existingOutputs > 0 then
 						continue
@@ -2154,8 +2162,8 @@ local function scheduleBuilderBatch()
 				end
 
 				-- Clean up old output
-				if builderOutputTags[path] ~= nil then
-					for _, old: Instance in CollectionService:GetTagged(builderOutputTags[path]) do
+				if BUILDERS.outputTags[path] ~= nil then
+					for _, old: Instance in CollectionService:GetTagged(BUILDERS.outputTags[path]) do
 						old:Destroy()
 					end
 				end
@@ -2202,8 +2210,8 @@ local function scheduleBuilderBatch()
 				-- Recompute dependencies for the builder
 				computeBuilderDependencies(path, inst :: LuaSourceContainer)
 
-				builderSources[path] = sourceHash
-				builderOutputTags[path] = outputTag
+				BUILDERS.sources[path] = sourceHash
+				BUILDERS.outputTags[path] = outputTag
 
 				-- Signal runtime to refresh tag caches
 				Workspace:SetAttribute("VertigoBuilderLastRebuild", os.clock())
@@ -2225,14 +2233,14 @@ local function executeBuilder(path: string, scriptInstance: LuaSourceContainer)
 	local outputTag: string = "BuilderOutput_" .. sanitized .. "_" .. string.sub(sourceHash, 1, 8)
 
 	-- Check if output already exists with matching hash
-	local existingOutputs: { Instance } = CollectionService:GetTagged(builderOutputTags[path] or "")
-	if #existingOutputs > 0 and builderOutputTags[path] == outputTag then
+	local existingOutputs: { Instance } = CollectionService:GetTagged(BUILDERS.outputTags[path] or "")
+	if #existingOutputs > 0 and BUILDERS.outputTags[path] == outputTag then
 		return -- Builder output is current, skip
 	end
 
 	-- Clean up old output
-	if builderOutputTags[path] ~= nil then
-		for _, old: Instance in CollectionService:GetTagged(builderOutputTags[path]) do
+	if BUILDERS.outputTags[path] ~= nil then
+		for _, old: Instance in CollectionService:GetTagged(BUILDERS.outputTags[path]) do
 			old:Destroy()
 		end
 	end
@@ -2281,8 +2289,8 @@ local function executeBuilder(path: string, scriptInstance: LuaSourceContainer)
 	computeBuilderDependencies(path, scriptInstance)
 
 	-- Update tracking state
-	builderSources[path] = sourceHash
-	builderOutputTags[path] = outputTag
+	BUILDERS.sources[path] = sourceHash
+	BUILDERS.outputTags[path] = outputTag
 
 	-- Signal runtime to refresh tag caches
 	Workspace:SetAttribute("VertigoBuilderLastRebuild", os.clock())
@@ -2402,7 +2410,7 @@ local function applyWrite(path: string, source: string, sha256: string?)
 	end
 
 	-- Builder re-execution check — direct builder change or dependency cascade
-	if buildersEnabled then
+	if BUILDERS.enabled then
 		local isBuilder: boolean = false
 		local builderPathCount: number = #BUILDER_PATHS
 		for i = 1, builderPathCount do
@@ -2414,7 +2422,7 @@ local function applyWrite(path: string, source: string, sha256: string?)
 
 		if isBuilder then
 			-- Direct builder change — add to dirty set and schedule batch
-			builderDirtySet[path] = true
+			BUILDERS.dirtySet[path] = true
 			scheduleBuilderBatch()
 		else
 			-- Check if this is a shared dependency that builders depend on
@@ -2423,10 +2431,10 @@ local function applyWrite(path: string, source: string, sha256: string?)
 				local depPrefix: string = BUILDER_DEPENDENCY_PATHS[i]
 				if string.sub(path, 1, #depPrefix) == depPrefix then
 					-- Cascade: find all builders that depend on this prefix
-					local dependentBuilders: { [string]: boolean }? = builderDependencyMap[depPrefix]
+					local dependentBuilders: { [string]: boolean }? = BUILDERS.dependencyMap[depPrefix]
 					if dependentBuilders ~= nil then
 						for builderPath: string in dependentBuilders do
-							builderDirtySet[builderPath] = true
+							BUILDERS.dirtySet[builderPath] = true
 						end
 						scheduleBuilderBatch()
 					end
@@ -2481,7 +2489,7 @@ local function stageOperation(path: string, action: PendingAction, expectedSha: 
 
 	-- Skip binary model entries if feature is disabled
 	local fileType: string? = fileTypeForPath(path)
-	if isBinaryModelType(fileType) and not settingBinaryModels then
+	if isBinaryModelType(fileType) and not SETTINGS.binaryModels then
 		return
 	end
 
@@ -3051,7 +3059,7 @@ end
 
 @native
 local function processApplyQueue()
-	if not syncEnabled and not TIME_TRAVEL_ACTIVE then
+	if not syncEnabled and not HISTORY.active then
 		return
 	end
 	if not isEditMode() then
@@ -3176,28 +3184,28 @@ end
 local TimeTravel = {}
 
 function TimeTravel.fetchHistory(force: boolean?): boolean
-	if historyFetchInFlight then
-		return historyLoaded
+	if HISTORY.fetchInFlight then
+		return HISTORY.loaded
 	end
 
 	local now: number = os.clock()
-	if not force and historyLoaded and (now - historyLastFetchAt) < HISTORY_REFRESH_INTERVAL_SECONDS then
+	if not force and HISTORY.loaded and (now - HISTORY.lastFetchAt) < HISTORY_REFRESH_INTERVAL_SECONDS then
 		return true
 	end
 
-	historyFetchInFlight = true
-	local endpoint: string = string.format("/history?limit=%d", settingHistoryBuffer)
+	HISTORY.fetchInFlight = true
+	local endpoint: string = string.format("/history?limit=%d", SETTINGS.historyBuffer)
 	local ok: boolean, payload: any = requestJson(endpoint)
-	historyLastFetchAt = now
-	historyFetchInFlight = false
+	HISTORY.lastFetchAt = now
+	HISTORY.fetchInFlight = false
 	if not ok then
 		warnMsg(string.format("History fetch failed: %s", tostring(payload)))
-		historyFetchFailed = true
+		HISTORY.fetchFailed = true
 		return false
 	end
 	if type(payload) ~= "table" then
 		warnMsg("History payload malformed")
-		historyFetchFailed = true
+		HISTORY.fetchFailed = true
 		return false
 	end
 	-- Validate history entry shape
@@ -3215,23 +3223,23 @@ function TimeTravel.fetchHistory(force: boolean?): boolean
 			table.insert(validated, entry :: HistoryEntry)
 		end
 	end
-	historyEntries = validated
-	historyLoaded = true
-	historyFetchFailed = false
+	HISTORY.entries = validated
+	HISTORY.loaded = true
+	HISTORY.fetchFailed = false
 	return true
 end
 
 function TimeTravel.rewindToIndex(targetIndex: number)
-	if targetIndex < 1 or targetIndex > #historyEntries or timeTravelBusy then
+	if targetIndex < 1 or targetIndex > #HISTORY.entries or HISTORY.busy then
 		return
 	end
-	if TIME_TRAVEL_ACTIVE and historyCurrentIndex == targetIndex then
+	if HISTORY.active and HISTORY.currentIndex == targetIndex then
 		return
 	end
 
-	local targetFingerprint: string = historyEntries[targetIndex].fingerprint
-	TIME_TRAVEL_ACTIVE = true
-	timeTravelBusy = true
+	local targetFingerprint: string = HISTORY.entries[targetIndex].fingerprint
+	HISTORY.active = true
+	HISTORY.busy = true
 
 	-- Pause normal sync
 	syncEnabled = false
@@ -3241,16 +3249,16 @@ function TimeTravel.rewindToIndex(targetIndex: number)
 	if not ok then
 		warnMsg("Rewind failed: " .. tostring(payload))
 		syncEnabled = true
-		TIME_TRAVEL_ACTIVE = false
-		timeTravelBusy = false
+		HISTORY.active = false
+		HISTORY.busy = false
 		return
 	end
 
 	if type(payload) ~= "table" then
 		warnMsg("Rewind payload malformed")
 		syncEnabled = true
-		TIME_TRAVEL_ACTIVE = false
-		timeTravelBusy = false
+		HISTORY.active = false
+		HISTORY.busy = false
 		return
 	end
 
@@ -3289,22 +3297,22 @@ function TimeTravel.rewindToIndex(targetIndex: number)
 	end
 
 	lastHash = diff.current_fingerprint
-	historyCurrentIndex = targetIndex
+	HISTORY.currentIndex = targetIndex
 
 	setStatusAttributes("connected", diff.current_fingerprint)
 	Workspace:SetAttribute("VertigoSyncTimeTravel", true)
-	Workspace:SetAttribute("VertigoSyncTimeTravelSeq", historyEntries[targetIndex].seq)
+	Workspace:SetAttribute("VertigoSyncTimeTravelSeq", HISTORY.entries[targetIndex].seq)
 
-	info(string.format("Rewound to seq %d (fingerprint=%s)", historyEntries[targetIndex].seq, targetFingerprint))
-	timeTravelBusy = false
+	info(string.format("Rewound to seq %d (fingerprint=%s)", HISTORY.entries[targetIndex].seq, targetFingerprint))
+	HISTORY.busy = false
 end
 
 function TimeTravel.resumeLiveSync()
-	if timeTravelBusy then
+	if HISTORY.busy then
 		return
 	end
-	TIME_TRAVEL_ACTIVE = false
-	historyCurrentIndex = 0
+	HISTORY.active = false
+	HISTORY.currentIndex = 0
 	syncEnabled = true
 	resyncRequested = true -- Force full resync to get back to current state
 	Workspace:SetAttribute("VertigoSyncTimeTravel", false)
@@ -3316,15 +3324,15 @@ function TimeTravel.resumeLiveSync()
 end
 
 function TimeTravel.stepBackward()
-	if not historyLoaded or #historyEntries == 0 then
+	if not HISTORY.loaded or #HISTORY.entries == 0 then
 		return
 	end
 	local targetIndex: number
-	if historyCurrentIndex == 0 then
+	if HISTORY.currentIndex == 0 then
 		-- First step back from live: go to latest history entry
-		targetIndex = #historyEntries
+		targetIndex = #HISTORY.entries
 	else
-		targetIndex = historyCurrentIndex - 1
+		targetIndex = HISTORY.currentIndex - 1
 	end
 	if targetIndex < 1 then
 		return
@@ -3333,14 +3341,14 @@ function TimeTravel.stepBackward()
 end
 
 function TimeTravel.stepForward()
-	if not historyLoaded or #historyEntries == 0 then
+	if not HISTORY.loaded or #HISTORY.entries == 0 then
 		return
 	end
-	if historyCurrentIndex == 0 then
+	if HISTORY.currentIndex == 0 then
 		return -- already live
 	end
-	local targetIndex: number = historyCurrentIndex + 1
-	if targetIndex > #historyEntries then
+	local targetIndex: number = HISTORY.currentIndex + 1
+	if targetIndex > #HISTORY.entries then
 		-- Past the end of history: resume live
 		TimeTravel.resumeLiveSync()
 		return
@@ -3349,7 +3357,7 @@ function TimeTravel.stepForward()
 end
 
 function TimeTravel.jumpToOldest()
-	if not historyLoaded or #historyEntries == 0 then
+	if not HISTORY.loaded or #HISTORY.entries == 0 then
 		return
 	end
 	TimeTravel.rewindToIndex(1)
@@ -3366,7 +3374,7 @@ end
 local function _initPlugin()
 
 local function runInitialBuilders()
-	if not buildersEnabled then
+	if not BUILDERS.enabled then
 		return
 	end
 	if not isEditMode() then
@@ -3388,7 +3396,7 @@ local function runInitialBuilders()
 		-- Signal ZoneService to skip builders on Play
 		Workspace:SetAttribute("VertigoSyncWorldReady", true)
 
-		-- Restore builderOutputTags from persisted attributes on baked Models.
+		-- Restore BUILDERS.outputTags from persisted attributes on baked Models.
 		-- This enables stale detection across Studio restarts without CollectionService tags.
 		local restoredCount: number = 0
 		for _, child: Instance in ipairs(Workspace:GetChildren()) do
@@ -3401,8 +3409,8 @@ local function runInitialBuilders()
 					local parts: { string } = string.split(joined, ".")
 					local sanitized: string = table.concat(parts, "_")
 					local restoredTag: string = "BuilderOutput_" .. sanitized .. "_" .. string.sub(buildHash, 1, 8)
-					if builderOutputTags[buildPath] == nil then
-						builderOutputTags[buildPath] = restoredTag
+					if BUILDERS.outputTags[buildPath] == nil then
+						BUILDERS.outputTags[buildPath] = restoredTag
 						restoredCount += 1
 					end
 				end
@@ -3425,7 +3433,7 @@ local function runInitialBuilders()
 					computeBuilderDependencies(path, inst :: LuaSourceContainer)
 					-- Check if this builder's output hash matches current source
 					local currentSha: string = inst:GetAttribute(MANAGED_SHA_ATTR) or ""
-					local lastBuiltTag: string = builderOutputTags[path] or ""
+					local lastBuiltTag: string = BUILDERS.outputTags[path] or ""
 					if currentSha ~= "" and lastBuiltTag == "" then
 						-- No record of previous build — check if any tagged output exists
 						-- Use string.split to build expected tag prefix
@@ -3437,11 +3445,11 @@ local function runInitialBuilders()
 						local existingOutputs: { Instance } = CollectionService:GetTagged(expectedTag)
 						if #existingOutputs > 0 then
 							-- Output exists with matching hash — skip
-							builderOutputTags[path] = expectedTag
+							BUILDERS.outputTags[path] = expectedTag
 						else
 							-- Source changed since baked output — rebuild this builder
 							staleCount += 1
-							builderDirtySet[path] = true
+							BUILDERS.dirtySet[path] = true
 						end
 					end
 				end
@@ -3490,7 +3498,7 @@ local function runInitialBuilders()
 		local sourceHash: string = inst:GetAttribute(MANAGED_SHA_ATTR) or "unknown"
 
 		-- Skip if output already exists with matching hash
-		local existingTag: string? = builderOutputTags[path]
+		local existingTag: string? = BUILDERS.outputTags[path]
 		if existingTag ~= nil then
 			local segments: { string } = string.split(path, "/")
 			local joined: string = table.concat(segments, "_")
@@ -3536,8 +3544,8 @@ local function checkHealth(): boolean
 				-- Server restarted — trigger resync
 				throttledLog("server_restart", string.format("Server restart detected (boot_time %d -> %d), requesting resync", serverBootTimeCache :: number, reportedBootTime), false)
 				resyncRequested = true
-				projectMappingsLoaded = false
-				setProjectStatus("bootstrapping", "Refreshing /project after server restart", activeProjectName, false)
+				PROJECT.loaded = false
+				setProjectStatus("bootstrapping", "Refreshing /project after server restart", PROJECT.name, false)
 			end
 			serverBootTimeCache = reportedBootTime
 		end
@@ -3702,19 +3710,19 @@ widget.Title = "Vertigo Sync"
 local function loadSettings()
 	local binaryModels: any = plugin:GetSetting("VertigoSyncBinaryModels")
 	if type(binaryModels) == "boolean" then
-		settingBinaryModels = binaryModels
+		SETTINGS.binaryModels = binaryModels
 	end
 	local builders: any = plugin:GetSetting("VertigoSyncBuildersEnabled")
 	if type(builders) == "boolean" then
-		settingBuildersEnabled = builders
+		SETTINGS.buildersEnabled = builders
 	end
 	local timeTravelUI: any = plugin:GetSetting("VertigoSyncTimeTravelUI")
 	if type(timeTravelUI) == "boolean" then
-		settingTimeTravelUI = timeTravelUI
+		SETTINGS.timeTravelUI = timeTravelUI
 	end
 	local histBuf: any = plugin:GetSetting("VertigoSyncHistoryBuffer")
 	if type(histBuf) == "number" and histBuf >= 16 and histBuf <= 1024 then
-		settingHistoryBuffer = math.floor(histBuf)
+		SETTINGS.historyBuffer = math.floor(histBuf)
 	end
 end
 
@@ -4276,14 +4284,14 @@ togglesLayout.SortOrder = Enum.SortOrder.LayoutOrder
 togglesLayout.Padding = UDim.new(0, 4)
 togglesLayout.Parent = togglesPanel
 
-local _, binaryModelsTrack, _ = createToggleSwitch(togglesPanel, "BinaryModelsToggle", "Binary Models", settingBinaryModels, 1)
-local _, buildersTrack, _ = createToggleSwitch(togglesPanel, "BuildersToggle", "Builders", settingBuildersEnabled, 2)
-local _, timeTravelTrack, _ = createToggleSwitch(togglesPanel, "TimeTravelToggle", "Time Travel", settingTimeTravelUI, 3)
+local _, binaryModelsTrack, _ = createToggleSwitch(togglesPanel, "BinaryModelsToggle", "Binary Models", SETTINGS.binaryModels, 1)
+local _, buildersTrack, _ = createToggleSwitch(togglesPanel, "BuildersToggle", "Builders", SETTINGS.buildersEnabled, 2)
+local _, timeTravelTrack, _ = createToggleSwitch(togglesPanel, "TimeTravelToggle", "Time Travel", SETTINGS.timeTravelUI, 3)
 
 -- ═══ Time-Travel Panel ══════════════════════════════════════════════════════
 
 local timeTravelPanel: Frame = createPanel(mainFrame, "TimeTravelPanel", 3, 178)
-timeTravelPanel.Visible = settingTimeTravelUI
+timeTravelPanel.Visible = SETTINGS.timeTravelUI
 
 -- Navigation row
 local ttNavRow: Frame = Instance.new("Frame")
@@ -4447,10 +4455,10 @@ for i = 1, HISTORY_ROW_COUNT do
 		}):Play()
 	end)
 	rowBtn.MouseButton1Click:Connect(function()
-		if historyFetchFailed or timeTravelBusy then
+		if HISTORY.fetchFailed or HISTORY.busy then
 			return
 		end
-		local entryCount: number = #historyEntries
+		local entryCount: number = #HISTORY.entries
 		local rowIdx: number = entryCount - (i - 1)
 		if rowIdx < 1 or rowIdx > entryCount then
 			return
@@ -4535,7 +4543,7 @@ historyBufferLayout.Parent = historyBufferRow
 local historyBufferDecreaseBtn: TextButton = createSmallButton(historyBufferRow, "HistoryBufferDecrease", "-", 24)
 historyBufferDecreaseBtn.LayoutOrder = 1
 
-local historyBufferValueLabel: TextLabel = createLabel(historyBufferRow, "HistoryBufferValue", tostring(settingHistoryBuffer), {
+local historyBufferValueLabel: TextLabel = createLabel(historyBufferRow, "HistoryBufferValue", tostring(SETTINGS.historyBuffer), {
 	size = UDim2.new(0, 52, 0, 24),
 	color = THEME_TEXT,
 	fontSize = 12,
@@ -4581,7 +4589,7 @@ settingsToggleLabel.Parent = settingsToggleRow
 
 local function updateHistoryBufferUI()
 	historyBufferLabel.Text = "Timeline depth"
-	historyBufferValueLabel.Text = tostring(settingHistoryBuffer)
+	historyBufferValueLabel.Text = tostring(SETTINGS.historyBuffer)
 end
 
 updateHistoryBufferUI()
@@ -4594,31 +4602,31 @@ end
 local binaryModelsClickRegion = getTrackClickRegion(binaryModelsTrack)
 if binaryModelsClickRegion then
 	binaryModelsClickRegion.MouseButton1Click:Connect(function()
-		settingBinaryModels = not settingBinaryModels
-		animateToggle(binaryModelsTrack, settingBinaryModels)
-		saveSetting("VertigoSyncBinaryModels", settingBinaryModels)
-		Workspace:SetAttribute("VertigoSyncBinaryModels", settingBinaryModels)
+		SETTINGS.binaryModels = not SETTINGS.binaryModels
+		animateToggle(binaryModelsTrack, SETTINGS.binaryModels)
+		saveSetting("VertigoSyncBinaryModels", SETTINGS.binaryModels)
+		Workspace:SetAttribute("VertigoSyncBinaryModels", SETTINGS.binaryModels)
 	end)
 end
 
 local buildersClickRegion = getTrackClickRegion(buildersTrack)
 if buildersClickRegion then
 	buildersClickRegion.MouseButton1Click:Connect(function()
-		settingBuildersEnabled = not settingBuildersEnabled
-		animateToggle(buildersTrack, settingBuildersEnabled)
-		buildersEnabled = settingBuildersEnabled and isEditMode()
-		saveSetting("VertigoSyncBuildersEnabled", settingBuildersEnabled)
-		Workspace:SetAttribute("VertigoSyncBuildersEnabled", buildersEnabled)
+		SETTINGS.buildersEnabled = not SETTINGS.buildersEnabled
+		animateToggle(buildersTrack, SETTINGS.buildersEnabled)
+		BUILDERS.enabled = SETTINGS.buildersEnabled and isEditMode()
+		saveSetting("VertigoSyncBuildersEnabled", SETTINGS.buildersEnabled)
+		Workspace:SetAttribute("VertigoSyncBuildersEnabled", BUILDERS.enabled)
 	end)
 end
 
 local timeTravelClickRegion = getTrackClickRegion(timeTravelTrack)
 if timeTravelClickRegion then
 	timeTravelClickRegion.MouseButton1Click:Connect(function()
-		settingTimeTravelUI = not settingTimeTravelUI
-		animateToggle(timeTravelTrack, settingTimeTravelUI)
-		timeTravelPanel.Visible = settingTimeTravelUI
-		saveSetting("VertigoSyncTimeTravelUI", settingTimeTravelUI)
+		SETTINGS.timeTravelUI = not SETTINGS.timeTravelUI
+		animateToggle(timeTravelTrack, SETTINGS.timeTravelUI)
+		timeTravelPanel.Visible = SETTINGS.timeTravelUI
+		saveSetting("VertigoSyncTimeTravelUI", SETTINGS.timeTravelUI)
 	end)
 end
 
@@ -4632,46 +4640,46 @@ settingsToggleBtn.MouseButton1Click:Connect(function()
 end)
 
 historyBufferDecreaseBtn.MouseButton1Click:Connect(function()
-	local nextValue = math.max(16, settingHistoryBuffer - 16)
-	if nextValue == settingHistoryBuffer then
+	local nextValue = math.max(16, SETTINGS.historyBuffer - 16)
+	if nextValue == SETTINGS.historyBuffer then
 		return
 	end
-	settingHistoryBuffer = nextValue
-	saveSetting("VertigoSyncHistoryBuffer", settingHistoryBuffer)
+	SETTINGS.historyBuffer = nextValue
+	saveSetting("VertigoSyncHistoryBuffer", SETTINGS.historyBuffer)
 	updateHistoryBufferUI()
 end)
 
 historyBufferIncreaseBtn.MouseButton1Click:Connect(function()
-	local nextValue = math.min(1024, settingHistoryBuffer + 16)
-	if nextValue == settingHistoryBuffer then
+	local nextValue = math.min(1024, SETTINGS.historyBuffer + 16)
+	if nextValue == SETTINGS.historyBuffer then
 		return
 	end
-	settingHistoryBuffer = nextValue
-	saveSetting("VertigoSyncHistoryBuffer", settingHistoryBuffer)
+	SETTINGS.historyBuffer = nextValue
+	saveSetting("VertigoSyncHistoryBuffer", SETTINGS.historyBuffer)
 	updateHistoryBufferUI()
 end)
 
 historyBufferRefreshBtn.MouseButton1Click:Connect(function()
-	historyFetchFailed = false
+	HISTORY.fetchFailed = false
 	TimeTravel.fetchHistory(true)
 end)
 
 -- Time-travel button handlers
 btnJumpOldest.MouseButton1Click:Connect(function()
-	if historyFetchFailed then
+	if HISTORY.fetchFailed then
 		return
 	end
-	if not historyLoaded then
+	if not HISTORY.loaded then
 		TimeTravel.fetchHistory(true)
 	end
 	TimeTravel.jumpToOldest()
 end)
 
 btnStepBack.MouseButton1Click:Connect(function()
-	if historyFetchFailed then
+	if HISTORY.fetchFailed then
 		return
 	end
-	if not historyLoaded then
+	if not HISTORY.loaded then
 		TimeTravel.fetchHistory(true)
 	end
 	TimeTravel.stepBackward()
@@ -4687,7 +4695,7 @@ end)
 
 -- Retry history button
 retryHistoryBtn.MouseButton1Click:Connect(function()
-	historyFetchFailed = false
+	HISTORY.fetchFailed = false
 	retryHistoryBtn.Visible = false
 	TimeTravel.fetchHistory(true)
 end)
@@ -4723,17 +4731,17 @@ end)
 Workspace:GetAttributeChangedSignal("VertigoSyncBinaryModels"):Connect(function()
 	local val: any = Workspace:GetAttribute("VertigoSyncBinaryModels")
 	if type(val) == "boolean" then
-		settingBinaryModels = val
-		animateToggle(binaryModelsTrack, settingBinaryModels)
+		SETTINGS.binaryModels = val
+		animateToggle(binaryModelsTrack, SETTINGS.binaryModels)
 	end
 end)
 
 Workspace:GetAttributeChangedSignal("VertigoSyncBuildersEnabled"):Connect(function()
 	local val: any = Workspace:GetAttribute("VertigoSyncBuildersEnabled")
 	if type(val) == "boolean" then
-		settingBuildersEnabled = val
-		buildersEnabled = settingBuildersEnabled and isEditMode()
-		animateToggle(buildersTrack, settingBuildersEnabled)
+		SETTINGS.buildersEnabled = val
+		BUILDERS.enabled = SETTINGS.buildersEnabled and isEditMode()
+		animateToggle(buildersTrack, SETTINGS.buildersEnabled)
 	end
 end)
 
@@ -4788,8 +4796,8 @@ local function refreshStatusUI()
 		dotColor = THEME_ACCENT
 	elseif connectionState == "error" then
 		local errDetail: string
-		if projectSyncBlocked then
-			errDetail = projectBootstrapMessage
+		if PROJECT.blocked then
+			errDetail = PROJECT.message
 		else
 			errDetail = if consecutiveErrors > 0
 				then string.format("Health check failed (%d)", consecutiveErrors)
@@ -4855,9 +4863,9 @@ local function refreshStatusUI()
 		statusLine3.Text = nextStatusLine3Text
 	end
 	local nextStatusLine3Color: Color3
-	if projectBootstrapMode == "mismatch" then
+	if PROJECT.mode == "mismatch" then
 		nextStatusLine3Color = THEME_RED
-	elseif projectBootstrapMode == "legacy" then
+	elseif PROJECT.mode == "legacy" then
 		nextStatusLine3Color = THEME_YELLOW
 	else
 		nextStatusLine3Color = THEME_TEXT_DIM
@@ -4868,14 +4876,14 @@ local function refreshStatusUI()
 	end
 
 	-- Time-travel panel
-	if settingTimeTravelUI then
+	if SETTINGS.timeTravelUI then
 		local nextDisplayKey: string
-		if TIME_TRAVEL_ACTIVE and historyCurrentIndex > 0 and #historyEntries > 0 then
-			local ratio: number = historyCurrentIndex / math.max(#historyEntries, 1)
-			nextDisplayKey = string.format("tt:%d:%d", historyCurrentIndex, #historyEntries)
+		if HISTORY.active and HISTORY.currentIndex > 0 and #HISTORY.entries > 0 then
+			local ratio: number = HISTORY.currentIndex / math.max(#HISTORY.entries, 1)
+			nextDisplayKey = string.format("tt:%d:%d", HISTORY.currentIndex, #HISTORY.entries)
 			if lastTimeTravelDisplayKey ~= nextDisplayKey then
 				lastTimeTravelDisplayKey = nextDisplayKey
-				ttSeqLabel.Text = string.format("%d / %d", historyCurrentIndex, #historyEntries)
+				ttSeqLabel.Text = string.format("%d / %d", HISTORY.currentIndex, #HISTORY.entries)
 				ttSeqLabel.TextColor3 = THEME_ACCENT
 				local thumbXScale = ratio
 				TweenService:Create(scrubberFill, TWEEN_FAST, { Size = UDim2.new(ratio, 0, 1, 0) }):Play()
@@ -4899,17 +4907,17 @@ local function refreshStatusUI()
 		end
 
 		-- Show retry button if fetch failed
-		if lastRetryHistoryVisible ~= historyFetchFailed then
-			lastRetryHistoryVisible = historyFetchFailed
-			retryHistoryBtn.Visible = historyFetchFailed
+		if lastRetryHistoryVisible ~= HISTORY.fetchFailed then
+			lastRetryHistoryVisible = HISTORY.fetchFailed
+			retryHistoryBtn.Visible = HISTORY.fetchFailed
 		end
 
 		-- Update history rows
-		local entryCount: number = #historyEntries
+		local entryCount: number = #HISTORY.entries
 		for i = 1, HISTORY_ROW_COUNT do
 			local rowIdx: number = entryCount - (i - 1)
 			if rowIdx >= 1 and rowIdx <= entryCount then
-				local entry: HistoryEntry = historyEntries[rowIdx]
+				local entry: HistoryEntry = HISTORY.entries[rowIdx]
 				local timeStr: string = if type(entry.timestamp) == "string" then string.sub(entry.timestamp, 12, 19) else "??:??:??"
 				local nextRowText = string.format(
 					'%s  <font color="#34C759">+%d</font> <font color="#FF9F0A">~%d</font> <font color="#FF453A">-%d</font>',
@@ -4918,7 +4926,7 @@ local function refreshStatusUI()
 					entry.modified,
 					entry.deleted
 				)
-				local nextRowColor = if rowIdx == historyCurrentIndex then THEME_ACCENT else THEME_TEXT_DIM
+				local nextRowColor = if rowIdx == HISTORY.currentIndex then THEME_ACCENT else THEME_TEXT_DIM
 				if lastHistoryRowTexts[i] ~= nextRowText then
 					lastHistoryRowTexts[i] = nextRowText
 					historyRowLabels[i].Text = nextRowText
@@ -5037,7 +5045,7 @@ local function tickSyncManager()
 	if resyncRequested or lastHash == nil then
 		if not ensureProjectBootstrap(false) then
 			closeWebSocket("project_bootstrap_pending")
-			setStatusAttributes(if projectSyncBlocked then "error" else "disconnected", lastHash)
+			setStatusAttributes(if PROJECT.blocked then "error" else "disconnected", lastHash)
 			updateButtonAppearance()
 			return
 		end
@@ -5066,14 +5074,14 @@ end
 
 -- ─── Initialization ──────────────────────────────────────────────────────────
 
-buildersEnabled = settingBuildersEnabled and isEditMode()
+BUILDERS.enabled = SETTINGS.buildersEnabled and isEditMode()
 initInstancePool()
 Workspace:SetAttribute("VertigoSyncServerUrl", getServerBaseUrl())
 
 Workspace:SetAttribute("VertigoSyncPluginVersion", PLUGIN_VERSION)
 Workspace:SetAttribute("VertigoSyncRealtimeDefault", true)
-Workspace:SetAttribute("VertigoSyncBinaryModels", settingBinaryModels)
-Workspace:SetAttribute("VertigoSyncBuildersEnabled", buildersEnabled)
+Workspace:SetAttribute("VertigoSyncBinaryModels", SETTINGS.binaryModels)
+Workspace:SetAttribute("VertigoSyncBuildersEnabled", BUILDERS.enabled)
 setProjectStatus("bootstrapping", "Waiting for /project", nil, false)
 setStatusAttributes("disconnected", nil)
 bootstrapManagedIndex()
@@ -5083,8 +5091,8 @@ info(string.format(
 	PLUGIN_VERSION,
 	describeStudioMode(),
 	if WebSocketService ~= nil then "available" else "unavailable",
-	tostring(settingBinaryModels),
-	tostring(buildersEnabled)
+	tostring(SETTINGS.binaryModels),
+	tostring(BUILDERS.enabled)
 ))
 updateButtonAppearance()
 flushMetrics(true)
@@ -5097,7 +5105,7 @@ end)
 
 RunService.Heartbeat:Connect(function()
 	-- When time-travel is active, skip polling/WS but still drain the apply queue
-	if not TIME_TRAVEL_ACTIVE then
+	if not HISTORY.active then
 		processFetchQueue()
 	end
 	processApplyQueue()
@@ -5108,7 +5116,7 @@ end)
 
 task.spawn(function()
 	while true do
-		if not TIME_TRAVEL_ACTIVE then
+		if not HISTORY.active then
 			tickSyncManager()
 		end
 		task.wait(0.25)
@@ -5130,7 +5138,7 @@ task.spawn(function()
 	-- Wait for initial sync to complete before fetching history
 	task.wait(3)
 	while true do
-		if settingTimeTravelUI and currentStatus == "connected" and not TIME_TRAVEL_ACTIVE then
+		if SETTINGS.timeTravelUI and currentStatus == "connected" and not HISTORY.active then
 			TimeTravel.fetchHistory()
 		end
 		task.wait(HISTORY_REFRESH_INTERVAL_SECONDS)
@@ -5142,7 +5150,7 @@ end)
 task.spawn(function()
 	-- Wait for initial snapshot to complete
 	task.wait(5)
-	if buildersEnabled and currentStatus == "connected" then
+	if BUILDERS.enabled and currentStatus == "connected" then
 		runInitialBuilders()
 	end
 end)
