@@ -90,9 +90,10 @@ Rules cover strict mode, NCG optimization, deprecated APIs, hot-path allocations
 | Welcome screen | No | Yes (first-time setup guide) |
 | Toast notifications | No | Yes (sync events, errors) |
 | Time-travel | No | Yes (scrubber + history list) |
-| Feature toggles | No | Yes (binary models, builders) |
+| Feature toggles | No | Yes (binary models, builders; builders stay off until enabled) |
 | Instance pooling | No | Yes (128 per class, zero GC in hot path) |
 | Adaptive frame budget | No | Yes (scales with Studio frame time) |
+| Project identity binding | No | Yes (plugin remembers last good project and fails closed on ambiguous discovery) |
 
 ## What Is New
 

@@ -2,7 +2,7 @@
 //!
 //! Endpoints:
 //!   GET  /health             — status + version
-//!   GET  /snapshot           — current snapshot JSON
+//!   GET  /snapshot           — current snapshot JSON (or exact historical snapshot via ?at=...)
 //!   GET  /diff?since=<hash>  — diff from historical hash to current
 //!   GET  /events             — SSE stream of SyncDiffEvent
 //!   GET  /sources/content    — batched source fetch for high-rate hotload
@@ -39,7 +39,7 @@ use crate::mcp::{handle_mcp_execute, handle_mcp_tools};
 use crate::serve_rbxl::{new_shared_rbxl_state, rbxl_router};
 use crate::{
     EventCoalescer, GlobIgnoreSet, ServerState, ServerStateOptions, Snapshot, SnapshotDiff,
-    build_snapshot, build_snapshot_with_ignores, diff_snapshots,
+    build_snapshot, build_snapshot_with_ignores,
 };
 use std::sync::atomic::Ordering;
 
@@ -231,6 +231,7 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
     // Read-only routes — no auth required.
     let read_routes = Router::new()
         .route("/health", get(handle_health))
+        .route("/discover", get(handle_discover))
         .route("/snapshot", get(handle_snapshot))
         .route("/diff", get(handle_diff))
         .route("/events", get(handle_events))
@@ -241,7 +242,6 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/validate", get(handle_validate))
         .route("/metrics", get(handle_metrics))
         .route("/history", get(handle_history))
-        .route("/rewind", get(handle_rewind))
         .route("/model/{*path}", get(handle_model))
         .route("/config", get(handle_config))
         .route("/sourcemap", get(handle_sourcemap))
@@ -368,11 +368,32 @@ pub async fn run_serve(options: ServeOptions) -> anyhow::Result<()> {
 
 async fn handle_health(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {
     let boot_elapsed = state.boot_time.elapsed().as_secs();
+    let project = crate::project::parse_project(&state.project_path).ok();
     Json(serde_json::json!({
         "status": "ok",
         "version": "0.1.0",
-        "server_boot_time": boot_elapsed
+        "server_boot_time": boot_elapsed,
+        "server_id": state.server_id,
+        "project_name": project.as_ref().map(|tree| tree.name.clone()),
+        "project_id": project.as_ref().map(|tree| tree.project_id.clone()),
     }))
+}
+
+async fn handle_discover(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let tree = match crate::project::parse_project(&state.project_path) {
+        Ok(tree) => tree,
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    Ok(Json(serde_json::json!({
+        "server_id": state.server_id,
+        "project_name": tree.name,
+        "project_id": tree.project_id,
+        "project_path": state.project_path,
+        "root": state.root,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -499,11 +520,19 @@ async fn handle_get_plugin_managed(
 
 // ---------------------------------------------------------------------------
 
+#[derive(Deserialize)]
+struct SnapshotQuery {
+    at: Option<String>,
+}
+
 async fn handle_snapshot(
     State(state): State<Arc<ServerState>>,
+    Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<Snapshot>, StatusCode> {
-    let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(Json((**lock).clone()))
+    let snapshot = state
+        .snapshot_ref_at(query.at.as_deref())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json((*snapshot).clone()))
 }
 
 #[derive(Deserialize)]
@@ -515,24 +544,14 @@ async fn handle_diff(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<DiffQuery>,
 ) -> Result<Json<SnapshotDiff>, (StatusCode, String)> {
-    let old = {
-        let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        lock.get(&query.since).cloned()
-    };
-
-    let old = old.ok_or_else(|| {
+    let diff = state.diff_since_fingerprint(&query.since).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             format!("snapshot {} not found in history", query.since),
         )
     })?;
 
-    let current = {
-        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::clone(&lock)
-    };
-
-    Ok(Json(diff_snapshots(&old, &current)))
+    Ok(Json(diff))
 }
 
 async fn handle_events(
@@ -723,6 +742,23 @@ fn serve_source_for_ws(state: &Arc<ServerState>, raw_path: &str) -> serde_json::
             });
         }
     };
+    let snapshot_entry = match snapshot_metadata_for_path(state, &normalized) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return serde_json::json!({
+                "type": "source",
+                "path": raw_path,
+                "error": "file not found: path not present in active snapshot",
+            });
+        }
+        Err((_, error)) => {
+            return serde_json::json!({
+                "type": "source",
+                "path": raw_path,
+                "error": error,
+            });
+        }
+    };
     let resolved = match resolve_source_file(&source_root, &normalized) {
         Ok(path) => path,
         Err((_, error)) => {
@@ -737,8 +773,8 @@ fn serve_source_for_ws(state: &Arc<ServerState>, raw_path: &str) -> serde_json::
     match std::fs::read_to_string(&resolved) {
         Ok(content) => {
             let content_bytes = content.len() as u64;
-            let hash = match snapshot_metadata_for_path(state, &normalized) {
-                Ok(Some((sha, expected_bytes))) if expected_bytes == content_bytes => sha,
+            let hash = match snapshot_entry {
+                (sha, expected_bytes) if expected_bytes == content_bytes => sha,
                 _ => sha256_hex(content.as_bytes()),
             };
 
@@ -1209,6 +1245,11 @@ async fn handle_sources_content(
     let snapshot_meta = snapshot_metadata_for_paths(&state, &requested)?;
 
     for raw_path in requested {
+        if !snapshot_meta.contains_key(&raw_path) {
+            missing.push(raw_path);
+            continue;
+        }
+
         let resolved = match resolve_source_file(&source_root, &raw_path) {
             Ok(path) => path,
             Err((StatusCode::NOT_FOUND, _)) => {
@@ -1322,18 +1363,18 @@ async fn handle_source(
     AxumPath(raw_path): AxumPath<String>,
 ) -> Result<(HeaderMap, String), (StatusCode, String)> {
     let source_root = state.canonical_root.clone();
-    let resolved = resolve_source_file(&source_root, &raw_path)?;
-
-    let content = std::fs::read_to_string(&resolved)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     let normalized = normalize_snapshot_lookup_path(&raw_path).ok_or((
         StatusCode::BAD_REQUEST,
         "path traversal not allowed".to_string(),
     ))?;
+    let snapshot_entry = snapshot_metadata_for_path(&state, &normalized)?
+        .ok_or((StatusCode::NOT_FOUND, "file not found: path not present in active snapshot".to_string()))?;
+    let resolved = resolve_source_file(&source_root, &normalized)?;
+    let content = std::fs::read_to_string(&resolved)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let content_bytes = content.len() as u64;
-    let hash = match snapshot_metadata_for_path(&state, &normalized)? {
-        Some((sha, expected_bytes)) if expected_bytes == content_bytes => sha,
+    let hash = match snapshot_entry {
+        (sha, expected_bytes) if expected_bytes == content_bytes => sha,
         _ => sha256_hex(content.as_bytes()),
     };
 
@@ -1381,45 +1422,8 @@ async fn handle_history(
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Vec<crate::HistoryEntry>>, (StatusCode, String)> {
     let limit = query.limit.min(500);
-    let event_log_path = state.root.join(".vertigo-sync-state").join("events.jsonl");
-    let entries = crate::read_history(&event_log_path, limit)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let entries = state.recent_history_rows(limit);
     Ok(Json(entries))
-}
-
-// ---------------------------------------------------------------------------
-// GET /rewind?to=<fingerprint> — reverse diff to a historical snapshot
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct RewindQuery {
-    to: String,
-}
-
-async fn handle_rewind(
-    State(state): State<Arc<ServerState>>,
-    Query(query): Query<RewindQuery>,
-) -> Result<Json<crate::SnapshotDiff>, (StatusCode, String)> {
-    let target = {
-        let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        lock.get(&query.to).cloned()
-    };
-
-    let target = target.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("fingerprint {} not found in history ring buffer", query.to),
-        )
-    })?;
-
-    let current = {
-        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
-        std::sync::Arc::clone(&lock)
-    };
-
-    let forward = crate::diff_snapshots(&target, &current);
-    let reversed = crate::reverse_diff(&forward);
-    Ok(Json(reversed))
 }
 
 // ---------------------------------------------------------------------------
@@ -1631,6 +1635,76 @@ mod tests {
         assert_eq!(resolved, file_path.canonicalize().expect("canonical file"));
     }
 
+    #[tokio::test]
+    async fn handle_sources_content_treats_non_snapshot_paths_as_missing() {
+        let root_dir = tempdir().expect("tempdir");
+        let src_dir = root_dir.path().join("src");
+        fs::create_dir_all(&src_dir).expect("create src");
+        fs::write(src_dir.join("live.luau"), "return 1\n").expect("write live");
+        fs::write(src_dir.join("ignored.luau"), "return 2\n").expect("write ignored");
+
+        let snapshot =
+            build_snapshot(root_dir.path(), &[String::from("src/live.luau")]).expect("snapshot");
+        let state = ServerState::with_full_config(
+            root_dir.path().to_path_buf(),
+            vec![String::from("src/live.luau")],
+            snapshot,
+            ServerStateOptions {
+                channel_capacity: 64,
+                turbo: false,
+                coalesce_ms: 50,
+                binary_models: false,
+                glob_ignores: crate::GlobIgnoreSet::empty(),
+                project_path: Some(root_dir.path().join("default.project.json")),
+            },
+        );
+
+        let response = handle_sources_content(
+            State(state),
+            Query(SourcesContentQuery {
+                paths: "src/live.luau,src/ignored.luau".to_string(),
+            }),
+        )
+        .await
+        .expect("sources content");
+
+        assert_eq!(response.0.entries.len(), 1);
+        assert_eq!(response.0.entries[0].path, "src/live.luau");
+        assert_eq!(response.0.missing, vec!["src/ignored.luau".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn handle_source_rejects_non_snapshot_paths() {
+        let root_dir = tempdir().expect("tempdir");
+        let src_dir = root_dir.path().join("src");
+        fs::create_dir_all(&src_dir).expect("create src");
+        fs::write(src_dir.join("live.luau"), "return 1\n").expect("write live");
+        fs::write(src_dir.join("ignored.luau"), "return 2\n").expect("write ignored");
+
+        let snapshot =
+            build_snapshot(root_dir.path(), &[String::from("src/live.luau")]).expect("snapshot");
+        let state = ServerState::with_full_config(
+            root_dir.path().to_path_buf(),
+            vec![String::from("src/live.luau")],
+            snapshot,
+            ServerStateOptions {
+                channel_capacity: 64,
+                turbo: false,
+                coalesce_ms: 50,
+                binary_models: false,
+                glob_ignores: crate::GlobIgnoreSet::empty(),
+                project_path: Some(root_dir.path().join("default.project.json")),
+            },
+        );
+
+        let error = handle_source(State(state), AxumPath("src/ignored.luau".to_string()))
+            .await
+            .expect_err("ignored path should be rejected");
+
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert!(error.1.contains("active snapshot"));
+    }
+
     #[test]
     fn plan_patch_ops_rejects_duplicate_targets_after_normalization() {
         let root_dir = tempdir().expect("tempdir");
@@ -1790,6 +1864,218 @@ mod tests {
             .expect("project response");
 
         assert_eq!(value["name"], "NestedGame");
+        assert!(value["project_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn handle_discover_reports_project_identity() {
+        let workspace = tempdir().expect("tempdir");
+        let nested_root = workspace.path().join("apps/game");
+        write_project(
+            &nested_root.join("default.project.json"),
+            "NestedGame",
+            "nested-src/Server",
+        );
+
+        let state = crate::ServerState::with_full_config(
+            nested_root.clone(),
+            vec!["nested-src".to_string()],
+            empty_snapshot(vec!["nested-src".to_string()]),
+            crate::ServerStateOptions {
+                channel_capacity: 32,
+                turbo: false,
+                coalesce_ms: 50,
+                binary_models: false,
+                glob_ignores: crate::GlobIgnoreSet::empty(),
+                project_path: Some(nested_root.join("default.project.json")),
+            },
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let Json(value) = runtime
+            .block_on(handle_discover(State(state)))
+            .expect("discover response");
+
+        assert_eq!(value["project_name"], "NestedGame");
+        assert!(value["project_id"].as_str().is_some());
+        assert!(value["server_id"].as_str().is_some());
+        assert!(value.get("mappings").is_none());
+    }
+
+    #[test]
+    fn handle_history_reports_live_snapshot_transitions() {
+        let workspace = tempdir().expect("tempdir");
+        let root = workspace.path().join("game");
+        write_project(&root.join("default.project.json"), "NestedGame", "src");
+
+        let state = crate::ServerState::with_full_config(
+            root.clone(),
+            vec!["src".to_string()],
+            empty_snapshot(vec!["src".to_string()]),
+            crate::ServerStateOptions {
+                channel_capacity: 32,
+                turbo: false,
+                coalesce_ms: 50,
+                binary_models: false,
+                glob_ignores: crate::GlobIgnoreSet::empty(),
+                project_path: Some(root.join("default.project.json")),
+            },
+        );
+
+        state
+            .install_snapshot_and_broadcast(crate::Snapshot {
+                version: 1,
+                include: vec!["src".to_string()],
+                fingerprint: "fp-1".to_string(),
+                entries: vec![crate::SnapshotEntry {
+                    path: "src/test.luau".to_string(),
+                    sha256: "sha-1".to_string(),
+                    bytes: 10,
+                    meta: None,
+                    file_type: Some("luau".to_string()),
+                }],
+            })
+            .expect("install new snapshot");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let Json(entries) = runtime
+            .block_on(handle_history(
+                State(state),
+                Query(HistoryQuery { limit: 10 }),
+            ))
+            .expect("history response");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].fingerprint, "fp-1");
+        assert_eq!(entries[0].added, 1);
+        assert_eq!(entries[0].modified, 0);
+        assert_eq!(entries[0].deleted, 0);
+        assert!(!entries[0].timestamp.is_empty());
+    }
+
+    #[test]
+    fn handle_history_returns_oldest_to_newest_for_time_travel_navigation() {
+        let workspace = tempdir().expect("tempdir");
+        let root = workspace.path().join("game");
+        write_project(&root.join("default.project.json"), "NestedGame", "src");
+
+        let state = crate::ServerState::with_full_config(
+            root.clone(),
+            vec!["src".to_string()],
+            empty_snapshot(vec!["src".to_string()]),
+            crate::ServerStateOptions {
+                channel_capacity: 32,
+                turbo: false,
+                coalesce_ms: 50,
+                binary_models: false,
+                glob_ignores: crate::GlobIgnoreSet::empty(),
+                project_path: Some(root.join("default.project.json")),
+            },
+        );
+
+        for (fingerprint, path) in [
+            ("fp-1", "src/first.luau"),
+            ("fp-2", "src/second.luau"),
+            ("fp-3", "src/third.luau"),
+        ] {
+            state
+                .install_snapshot_and_broadcast(crate::Snapshot {
+                    version: 1,
+                    include: vec!["src".to_string()],
+                    fingerprint: fingerprint.to_string(),
+                    entries: vec![crate::SnapshotEntry {
+                        path: path.to_string(),
+                        sha256: format!("sha-{fingerprint}"),
+                        bytes: 10,
+                        meta: None,
+                        file_type: Some("luau".to_string()),
+                    }],
+                })
+                .expect("install snapshot");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let Json(entries) = runtime
+            .block_on(handle_history(
+                State(state),
+                Query(HistoryQuery { limit: 10 }),
+            ))
+            .expect("history response");
+
+        let fingerprints: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.fingerprint.as_str())
+            .collect();
+        assert_eq!(fingerprints, vec!["fp-1", "fp-2", "fp-3"]);
+    }
+
+    #[test]
+    fn handle_history_limit_keeps_newest_entries_in_chronological_order() {
+        let workspace = tempdir().expect("tempdir");
+        let root = workspace.path().join("game");
+        write_project(&root.join("default.project.json"), "NestedGame", "src");
+
+        let state = crate::ServerState::with_full_config(
+            root.clone(),
+            vec!["src".to_string()],
+            empty_snapshot(vec!["src".to_string()]),
+            crate::ServerStateOptions {
+                channel_capacity: 32,
+                turbo: false,
+                coalesce_ms: 50,
+                binary_models: false,
+                glob_ignores: crate::GlobIgnoreSet::empty(),
+                project_path: Some(root.join("default.project.json")),
+            },
+        );
+
+        for (fingerprint, path) in [
+            ("fp-1", "src/first.luau"),
+            ("fp-2", "src/second.luau"),
+            ("fp-3", "src/third.luau"),
+            ("fp-4", "src/fourth.luau"),
+        ] {
+            state
+                .install_snapshot_and_broadcast(crate::Snapshot {
+                    version: 1,
+                    include: vec!["src".to_string()],
+                    fingerprint: fingerprint.to_string(),
+                    entries: vec![crate::SnapshotEntry {
+                        path: path.to_string(),
+                        sha256: format!("sha-{fingerprint}"),
+                        bytes: 10,
+                        meta: None,
+                        file_type: Some("luau".to_string()),
+                    }],
+                })
+                .expect("install snapshot");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let Json(entries) = runtime
+            .block_on(handle_history(
+                State(state),
+                Query(HistoryQuery { limit: 2 }),
+            ))
+            .expect("history response");
+
+        let fingerprints: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.fingerprint.as_str())
+            .collect();
+        assert_eq!(fingerprints, vec!["fp-3", "fp-4"]);
     }
 
     #[test]

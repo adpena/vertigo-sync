@@ -54,7 +54,9 @@ vsync --root . --turbo serve --project roblox/default.project.json
 vsync plugin-install
 ```
 
-Open Roblox Studio. The plugin connects automatically when the server is listening on `127.0.0.1:7575`.
+Open Roblox Studio. On first use, click `Check Connection` once to trust a local `vsync` server. After that, the plugin remembers the last good project identity, reconnects automatically, and refuses ambiguous matches. If multiple local sync servers are running, set `workspace:SetAttribute("VertigoSyncServerUrl", "http://127.0.0.1:<port>")` explicitly.
+
+Use `vsync discover` to print the active project identity and the currently reachable server identity from the CLI. By default it probes the server URL implied by the selected project file's `serveAddress` and `servePort`.
 
 ## Features
 
@@ -93,6 +95,18 @@ The plugin provides:
 - **Persistent settings** across Studio sessions via `plugin:GetSetting()`
 - **Instance pooling** -- 128 pre-allocated instances per class, zero `Instance.new()` in the hot path
 - **Adaptive frame budget** -- dynamically scales apply rate and fetch concurrency based on Studio frame time
+
+Builder execution is disabled by default for safety. Enable the Builders toggle in the plugin only when you explicitly want edit-mode procedural geometry execution.
+
+The canonical Studio plugin source lives in `assets/plugin_src/`. `assets/VertigoSyncPlugin.lua` is generated during Cargo builds and is the single-file artifact installed into Studio.
+Marketplace/source icon assets live in `branding/marketplace/`.
+
+The local Studio plugin deliberately ships with no hardcoded Roblox asset ID for the toolbar icon. For marketplace packaging or local verification with an uploaded asset, set either:
+
+- `workspace:SetAttribute("VertigoSyncToolbarIconAssetId", "rbxassetid://<your-asset-id>")`
+- `plugin:SetSetting("VertigoSyncToolbarIconAssetId", "rbxassetid://<your-asset-id>")`
+
+That keeps OSS installs deterministic and prevents broken toolbar icon fetches from stale asset IDs.
 
 ### Plugin Architecture
 
@@ -202,7 +216,7 @@ filesystem ──► vsync server ──► Studio plugin
                    ├── GET /validate
                    ├── GET /metrics
                    ├── GET /history?limit=N
-                   ├── GET /rewind?to=<hash>
+                   ├── GET /snapshot?at=<hash>
                    ├── GET /config
                    └── POST /sync/patch
 ```
@@ -248,7 +262,7 @@ Scaling is roughly linear at ~20 us/file up to the ~500 file range.
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Server health probe |
-| `/snapshot` | GET | Full deterministic snapshot with file hashes |
+| `/snapshot` | GET | Full deterministic snapshot with file hashes; supports exact historical lookup via `?at=<hash>` |
 | `/diff?since=<hash>` | GET | Incremental diff since a previous snapshot |
 | `/source/<path>` | GET | Raw source file content (SHA-256 in `X-SHA256` header) |
 | `/sources` | GET | File listing with paths and hashes |
@@ -258,7 +272,6 @@ Scaling is roughly linear at ~20 us/file up to the ~500 file range.
 | `/validate` | GET | Luau lint report |
 | `/metrics` | GET | Prometheus metrics |
 | `/history?limit=N` | GET | Recent sync history entries |
-| `/rewind?to=<hash>` | GET | Rewind to a previous snapshot |
 | `/config` | GET | Server configuration |
 | `/sync/patch` | POST | Apply patches (Studio to disk) |
 
@@ -284,7 +297,7 @@ Vertigo Sync exposes agent-native MCP tools for source manipulation. See the [Ag
 
 | Category | Tools | Description |
 |----------|-------|-------------|
-| **Read** | 13 | `vsync_health`, `vsync_snapshot`, `vsync_diff`, `vsync_source`, `vsync_grep`, ... |
+| **Read** | 14 | `vsync_health`, `vsync_snapshot`, `sync_snapshot`, `vsync_diff`, `vsync_source`, `vsync_grep`, ... |
 | **Write** | 5 | `vsync_write`, `vsync_patch`, `vsync_delete`, `vsync_move`, `vsync_mkdir` |
 | **Validate** | 3 | `vsync_validate`, `vsync_validate_content`, `vsync_check_conflict` |
 | **Pipeline** | 3 | `vsync_safe_write`, `vsync_describe_changes`, `vsync_pipeline` |

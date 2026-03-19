@@ -114,6 +114,20 @@ vsync plugin-install
 
 The command copies the plugin file to the Roblox user plugins directory for the current platform.
 
+For toolbar icon testing after you upload a Roblox image asset, set one of:
+
+```lua
+workspace:SetAttribute("VertigoSyncToolbarIconAssetId", "rbxassetid://<asset-id>")
+```
+
+or:
+
+```lua
+plugin:SetSetting("VertigoSyncToolbarIconAssetId", "rbxassetid://<asset-id>")
+```
+
+If unset, the plugin uses no toolbar icon rather than a broken hardcoded asset reference.
+
 ## Project Configuration (`default.project.json`)
 
 Vertigo Sync reads `default.project.json` in the Rojo-compatible format. The project file defines how source directories map to Roblox DataModel locations.
@@ -127,6 +141,15 @@ Vertigo Sync reads `default.project.json` in the Rojo-compatible format. The pro
   "emitLegacyScripts": true,
   "servePort": 7575,
   "serveAddress": "127.0.0.1",
+  "vertigoSync": {
+    "builders": {
+      "roots": ["src/ServerScriptService/StudioPreview"],
+      "dependencyRoots": [
+        "src/ServerScriptService/ImportService",
+        "src/ReplicatedStorage/Shared"
+      ]
+    }
+  },
   "tree": {
     "$className": "DataModel",
     "ServiceName": {
@@ -148,6 +171,31 @@ Vertigo Sync reads `default.project.json` in the Rojo-compatible format. The pro
 | `$ignoreUnknownInstances` | When `true`, preserves instances not managed by sync |
 | `$properties` | Property overrides applied to the generated instance |
 | `$attributes` | Attribute overrides applied to the generated instance |
+
+### `vertigoSync.builders`
+
+Use `vertigoSync.builders` to declare edit-mode preview entrypoints explicitly.
+
+```json
+{
+  "vertigoSync": {
+    "builders": {
+      "roots": ["src/ServerScriptService/StudioPreview"],
+      "dependencyRoots": [
+        "src/ServerScriptService/ImportService",
+        "src/ReplicatedStorage/Shared"
+      ]
+    }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `roots` | Filesystem prefixes that contain preview/builder `ModuleScript` entrypoints |
+| `dependencyRoots` | Filesystem prefixes that should trigger builder re-execution when synced files change |
+
+Each builder module should expose a `Build()` function. If `Build()` returns an `Instance` or an array of `Instance`s, Vertigo Sync treats those roots as the authoritative preview output for cleanup and rebuild tracking.
 
 ### File Type Mapping
 
@@ -187,16 +235,29 @@ The plugin persists these settings across Studio sessions using `plugin:GetSetti
 | Setting Key | Default | Description |
 |-------------|---------|-------------|
 | `VertigoSyncBinaryModels` | `false` | Enable binary model (`.rbxm`/`.rbxmx`) instance creation |
-| `VertigoSyncBuildersEnabled` | `true` | Enable builder execution in edit mode |
+| `VertigoSyncBuildersEnabled` | `false` | Enable builder execution in edit mode |
 | `VertigoSyncTimeTravelUI` | `true` | Show time-travel panel in the DockWidget |
 | `VertigoSyncHistoryBuffer` | `256` | Maximum history entries (16-1024) |
+
+`VertigoSyncBuildersEnabled` defaults to `false` so freshly installed plugins do not execute builder code unless a user explicitly opts in.
 
 These settings can also be toggled via Workspace attributes for external control:
 
 ```lua
 workspace:SetAttribute("VertigoSyncBinaryModels", true)
-workspace:SetAttribute("VertigoSyncBuildersEnabled", false)
+workspace:SetAttribute("VertigoSyncBuildersEnabled", true)
 ```
+
+For server selection, the plugin checks these optional overrides first:
+
+```lua
+workspace:SetAttribute("VertigoSyncServerUrl", "http://127.0.0.1:34872")
+workspace:SetAttribute("VertigoSyncProjectId", "your-project-id")
+```
+
+If you do not set them, the plugin requires one explicit `Check Connection` trust action on first use, then remembers the last good project binding and refuses to auto-attach when multiple healthy local servers are available.
+
+For CLI inspection, `vsync discover` prints the selected project metadata and the identity reported by a reachable sync server. If you do not pass `--server-url`, it derives the default URL from the selected project's `serveAddress` and `servePort`.
 
 ## Plugin Telemetry Attributes
 

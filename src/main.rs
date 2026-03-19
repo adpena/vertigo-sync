@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use vertigo_sync::errors::SyncError;
@@ -27,10 +28,12 @@ use vertigo_sync::{
                   vsync serve                                               Start syncing using the discovered project\n  \
                   vsync serve --turbo                                       Start syncing in turbo mode\n  \
                   vsync serve --project roblox/default.project.json         Serve a nested Roblox project explicitly\n  \
+                  vsync discover                                             Print local project/server identity\n  \
                   vsync build -o game.rbxl                                  Build a place file\n  \
                   vsync doctor                                              Check project health\n  \
                   vsync init                                                Create a new project\n  \
-                  vsync plugin-install                                      Install Studio plugin\n\n\
+                  vsync plugin-install                                      Install Studio plugin\n  \
+                  vsync plugin-set-icon rbxassetid://1234567890             Stamp installed plugin with a toolbar icon asset\n\n\
                   Learn more: https://github.com/pena/vertigo-sync",
     term_width = 100
 )]
@@ -135,6 +138,32 @@ struct ProjectContext {
     tree: vertigo_sync::project::ProjectTree,
 }
 
+#[derive(Debug, Serialize)]
+struct DiscoveryProjectReport {
+    name: String,
+    project_id: String,
+    project_path: String,
+    project_root: String,
+    includes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveryServerReport {
+    server_url: String,
+    reachable: bool,
+    server_id: Option<String>,
+    project_name: Option<String>,
+    project_id: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveryReport {
+    project: DiscoveryProjectReport,
+    server: DiscoveryServerReport,
+    matches: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Walk include roots and write deterministic snapshot JSON.
@@ -152,8 +181,18 @@ enum Command {
     /// Run source-tree health checks.
     #[command(display_order = 11)]
     Health,
-    /// Validate Luau source files for common issues.
+    /// Print the active project identity and, if reachable, the bound server identity.
     #[command(display_order = 12)]
+    Discover {
+        /// Project file path (default: default.project.json).
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
+        /// Server base URL to inspect (default: derived from project serveAddress/servePort, or http://127.0.0.1:7575).
+        #[arg(long)]
+        server_url: Option<String>,
+    },
+    /// Validate Luau source files for common issues.
+    #[command(display_order = 13)]
     Validate,
     /// Serve snapshot/diff/events over HTTP + SSE.
     #[command(display_order = 20)]
@@ -232,6 +271,12 @@ enum Command {
     /// Install the Vertigo Sync Studio plugin.
     #[command(display_order = 41)]
     PluginInstall,
+    /// Set the toolbar icon asset on the installed Studio plugin.
+    #[command(display_order = 42)]
+    PluginSetIcon {
+        /// Roblox image asset ID, for example `rbxassetid://1234567890` or `1234567890`.
+        asset_id: String,
+    },
 }
 
 #[tokio::main]
@@ -246,6 +291,10 @@ async fn main() -> Result<()> {
         Command::Event => command_event(&root, &state_dir, &cli),
         Command::Doctor => command_doctor(&root, &state_dir, &cli),
         Command::Health => command_health(&root, &state_dir, &cli),
+        Command::Discover {
+            project,
+            server_url,
+        } => command_discover(&root, project, server_url.as_deref(), &cli).await,
         Command::Watch { project } => command_watch(&root, &state_dir, project, &cli),
         Command::WatchNative { project } => command_watch_native(&root, &state_dir, project, &cli),
         Command::Validate => command_validate(&root, &cli),
@@ -267,6 +316,7 @@ async fn main() -> Result<()> {
         } => command_sourcemap(&root, output, project, *include_non_scripts, *watch, &cli).await,
         Command::Init { name } => command_init(&root, name.as_deref()),
         Command::PluginInstall => command_plugin_install(),
+        Command::PluginSetIcon { asset_id } => command_plugin_set_icon(asset_id),
         Command::Serve { project } => {
             let project_context = resolve_project_context(&root, project, &cli.include)?;
             let includes = project_context.includes.clone();
@@ -357,6 +407,113 @@ fn resolve_effective_includes(project_path: &Path, cli_includes: &[String]) -> V
 
     // Fall back.
     vec!["src".to_string()]
+}
+
+#[derive(Debug)]
+struct HttpTarget {
+    host: String,
+    port: u16,
+    path_prefix: String,
+}
+
+fn parse_http_url(raw: &str) -> Result<HttpTarget> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .with_context(|| format!("unsupported discovery URL scheme: {trimmed}"))?;
+
+    let (authority, path_prefix) = match without_scheme.split_once('/') {
+        Some((left, right)) => (left, format!("/{}", right.trim_matches('/'))),
+        None => (without_scheme, String::new()),
+    };
+
+    if authority.is_empty() {
+        bail!("missing host in discovery URL: {trimmed}");
+    }
+
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .with_context(|| format!("invalid bracketed host in discovery URL: {trimmed}"))?;
+        let host = &rest[..end];
+        let port_str = rest[end + 1..]
+            .strip_prefix(':')
+            .with_context(|| format!("missing port in discovery URL: {trimmed}"))?;
+        let port = port_str
+            .parse::<u16>()
+            .with_context(|| format!("invalid port in discovery URL: {trimmed}"))?;
+        (host.to_string(), port)
+    } else {
+        let (host, port_str) = authority
+            .rsplit_once(':')
+            .with_context(|| format!("missing port in discovery URL: {trimmed}"))?;
+        if host.is_empty() {
+            bail!("missing host in discovery URL: {trimmed}");
+        }
+        let port = port_str
+            .parse::<u16>()
+            .with_context(|| format!("invalid port in discovery URL: {trimmed}"))?;
+        (host.to_string(), port)
+    };
+
+    Ok(HttpTarget {
+        host,
+        port,
+        path_prefix,
+    })
+}
+
+async fn fetch_json_http(base_url: &str, endpoint: &str) -> Result<serde_json::Value> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let target = parse_http_url(base_url)?;
+    let endpoint = endpoint.trim_start_matches('/');
+    let path = if target.path_prefix.is_empty() {
+        format!("/{}", endpoint)
+    } else {
+        format!("{}/{}", target.path_prefix, endpoint)
+    };
+
+    let mut stream = tokio::net::TcpStream::connect((target.host.as_str(), target.port))
+        .await
+        .with_context(|| format!("failed to connect to {}:{}", target.host, target.port))?;
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        target.host
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .with_context(|| format!("failed to write request to {}:{}", target.host, target.port))?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.with_context(|| {
+        format!(
+            "failed to read response from {}:{}",
+            target.host, target.port
+        )
+    })?;
+    let response = String::from_utf8(response).context("discovery response was not UTF-8")?;
+
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .context("malformed HTTP response from discovery server")?;
+    let status_line = headers
+        .lines()
+        .next()
+        .context("missing HTTP status line from discovery server")?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .context("missing HTTP status code from discovery server")?
+        .parse::<u16>()
+        .context("invalid HTTP status code from discovery server")?;
+    if !(200..300).contains(&status_code) {
+        bail!("discovery request failed with HTTP {status_code}");
+    }
+
+    serde_json::from_str(body).context("failed to decode discovery JSON")
 }
 
 fn resolve_project_context(
@@ -660,12 +817,21 @@ fn command_event(root: &Path, state_dir: &Path, cli: &Cli) -> Result<()> {
 }
 
 fn command_doctor(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
-    let includes = resolve_effective_includes(&root.join("default.project.json"), &cli.include);
-    let determinism = run_doctor(root, &includes)?;
-    let health = run_health_doctor(root, &includes)?;
+    let project_context =
+        resolve_project_context(root, Path::new("default.project.json"), &cli.include)?;
+    let determinism = run_doctor(&project_context.project_root, &project_context.includes)?;
+    let health = run_health_doctor(&project_context.project_root, &project_context.includes)?;
+    let project_report = serde_json::json!({
+        "name": project_context.tree.name,
+        "project_id": project_context.tree.project_id,
+        "project_path": project_context.project_path,
+        "project_root": project_context.project_root,
+        "includes": project_context.includes,
+    });
 
     if cli.json {
         let report = serde_json::json!({
+            "project": project_report,
             "determinism": determinism,
             "health": health,
         });
@@ -677,6 +843,19 @@ fn command_doctor(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
     } else {
         output::header("Vertigo Sync Doctor");
         output::separator("Vertigo Sync Doctor");
+        eprintln!();
+
+        output::header("Project");
+        output::kv("Name", &project_context.tree.name);
+        output::kv("Project ID", &project_context.tree.project_id);
+        output::kv(
+            "Project File",
+            &project_context.project_path.display().to_string(),
+        );
+        output::kv(
+            "Project Root",
+            &project_context.project_root.display().to_string(),
+        );
         eprintln!();
 
         // Determinism section.
@@ -726,6 +905,7 @@ fn command_doctor(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
         if let Some(output_path) = cli.output.as_ref() {
             let path = resolve_relative_to_root(root, output_path);
             let report = serde_json::json!({
+                "project": project_report,
                 "determinism": determinism,
                 "health": health,
             });
@@ -748,8 +928,9 @@ fn command_doctor(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
 }
 
 fn command_health(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
-    let includes = resolve_effective_includes(&root.join("default.project.json"), &cli.include);
-    let report = run_health_doctor(root, &includes)?;
+    let project_context =
+        resolve_project_context(root, Path::new("default.project.json"), &cli.include)?;
+    let report = run_health_doctor(&project_context.project_root, &project_context.includes)?;
 
     if cli.json {
         if let Some(output_path) = cli.output.as_ref() {
@@ -789,9 +970,114 @@ fn command_health(root: &Path, _state_dir: &Path, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+fn discover_server_url(project_context: &ProjectContext, override_url: Option<&str>) -> String {
+    if let Some(server_url) = override_url {
+        return server_url.to_string();
+    }
+
+    let address = project_context
+        .tree
+        .serve_address
+        .as_deref()
+        .unwrap_or("127.0.0.1");
+    let port = project_context.tree.serve_port.unwrap_or(7575);
+    format!("http://{address}:{port}")
+}
+
+async fn command_discover(
+    root: &Path,
+    project: &Path,
+    server_url: Option<&str>,
+    cli: &Cli,
+) -> Result<()> {
+    let project_context = resolve_project_context(root, project, &cli.include)?;
+    let server_url = discover_server_url(&project_context, server_url);
+    let project_report = DiscoveryProjectReport {
+        name: project_context.tree.name.clone(),
+        project_id: project_context.tree.project_id.clone(),
+        project_path: project_context.project_path.display().to_string(),
+        project_root: project_context.project_root.display().to_string(),
+        includes: project_context.includes.clone(),
+    };
+
+    let server_result = fetch_json_http(&server_url, "/discover").await;
+    let server_report = match server_result {
+        Ok(value) => DiscoveryServerReport {
+            server_url: server_url.clone(),
+            reachable: true,
+            server_id: value
+                .get("server_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
+            project_name: value
+                .get("project_name")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
+            project_id: value
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
+            error: None,
+        },
+        Err(err) => DiscoveryServerReport {
+            server_url,
+            reachable: false,
+            server_id: None,
+            project_name: None,
+            project_id: None,
+            error: Some(err.to_string()),
+        },
+    };
+
+    let matches = server_report
+        .project_id
+        .as_ref()
+        .is_some_and(|server_project_id| server_project_id == &project_report.project_id);
+
+    let report = DiscoveryReport {
+        project: project_report,
+        server: server_report,
+        matches,
+    };
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        output::header("Vertigo Sync Discovery");
+        output::kv("Project", &report.project.name);
+        output::kv("Project ID", &report.project.project_id);
+        output::kv("Project Path", &report.project.project_path);
+        output::kv("Project Root", &report.project.project_root);
+        output::kv("Server URL", &report.server.server_url);
+        if report.server.reachable {
+            output::success("Server reachable");
+            if let Some(ref server_id) = report.server.server_id {
+                output::kv("Server ID", server_id);
+            }
+            if let Some(ref server_project) = report.server.project_name {
+                output::kv("Server Project", server_project);
+            }
+            if let Some(ref server_project_id) = report.server.project_id {
+                output::kv("Server Project ID", server_project_id);
+            }
+            if report.matches {
+                output::success("Project identity matches server");
+            } else {
+                output::warn("Project identity does not match server");
+            }
+        } else if let Some(ref err) = report.server.error {
+            output::warn(&format!("Server unreachable: {err}"));
+        }
+    }
+
+    Ok(())
+}
+
 fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
-    let includes = resolve_effective_includes(&root.join("default.project.json"), &cli.include);
-    let report = validate::validate_source(root, &includes)?;
+    let project_context =
+        resolve_project_context(root, Path::new("default.project.json"), &cli.include)?;
+    let report =
+        validate::validate_source(&project_context.project_root, &project_context.includes)?;
 
     if cli.json {
         println!("{}", serde_json::to_string(&report)?);
@@ -825,13 +1111,15 @@ fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
     }
 
     // Optionally run selene if available.
-    if let Some(selene_output) = validate::run_selene(root, &includes)
-        && !selene_output.is_empty()
+    if let Some(selene_output) =
+        validate::run_selene(&project_context.project_root, &project_context.includes)
     {
-        eprintln!();
-        output::header("selene output");
-        for line in &selene_output {
-            output::info(line);
+        if !selene_output.is_empty() {
+            eprintln!();
+            output::header("selene output");
+            for line in &selene_output {
+                output::info(line);
+            }
         }
     }
 
@@ -1408,6 +1696,7 @@ fn command_init(root: &Path, name: Option<&str>) -> Result<()> {
         output::step(1, 4, "Creating default.project.json");
         let project_json = serde_json::json!({
             "name": project_name,
+            "projectId": uuid::Uuid::new_v4().to_string(),
             "tree": {
                 "$className": "DataModel",
                 "ServerScriptService": {
@@ -1473,6 +1762,7 @@ fn command_init(root: &Path, name: Option<&str>) -> Result<()> {
     eprintln!();
     output::info("Next steps:");
     output::info("  vsync serve --turbo             Start syncing");
+    output::info("  vsync discover                  Print project/server identity");
     output::info("  vsync plugin-install            Install Studio plugin");
     output::info("  vsync doctor                    Verify project health");
 
@@ -1485,6 +1775,7 @@ fn command_init(root: &Path, name: Option<&str>) -> Result<()> {
 
 /// Embedded Studio plugin source, compiled into the binary.
 const PLUGIN_SOURCE: &str = include_str!("../assets/VertigoSyncPlugin.lua");
+const TOOLBAR_ICON_LINE_PREFIX: &str = "DEFAULT_TOOLBAR_ICON_ASSET = ";
 
 fn command_plugin_install() -> Result<()> {
     let plugins_dir = detect_plugins_dir()?;
@@ -1505,6 +1796,99 @@ fn command_plugin_install() -> Result<()> {
     output::info("Restart Roblox Studio to load the plugin.");
 
     Ok(())
+}
+
+fn command_plugin_set_icon(asset_id: &str) -> Result<()> {
+    let plugins_dir = detect_plugins_dir()?;
+    let dest = plugins_dir.join("VertigoSyncPlugin.lua");
+
+    if !dest.exists() {
+        bail!(
+            "installed plugin not found at {}; run `vsync plugin-install` first",
+            dest.display()
+        );
+    }
+
+    let normalized = normalize_toolbar_icon_asset(asset_id)?;
+    let existing = std::fs::read_to_string(&dest)
+        .with_context(|| format!("failed to read {}", dest.display()))?;
+
+    let replacement = format!(r#"{}"{}","#, TOOLBAR_ICON_LINE_PREFIX, normalized);
+    let mut updated_lines = Vec::new();
+    let mut replaced = false;
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        if !replaced && trimmed.starts_with(TOOLBAR_ICON_LINE_PREFIX) {
+            let indentation_len = line.len() - trimmed.len();
+            let indentation = &line[..indentation_len];
+            updated_lines.push(format!("{indentation}{replacement}"));
+            replaced = true;
+        } else {
+            updated_lines.push(line.to_string());
+        }
+    }
+
+    if !replaced {
+        bail!(
+            "installed plugin does not contain the expected toolbar icon line; reinstall the plugin first"
+        );
+    }
+
+    let updated = format!("{}\n", updated_lines.join("\n"));
+
+    std::fs::write(&dest, updated)
+        .with_context(|| format!("failed to write {}", dest.display()))?;
+
+    output::success(&format!(
+        "Updated installed plugin toolbar icon to {normalized}"
+    ));
+    output::info("Restart Roblox Studio to reload the plugin.");
+
+    Ok(())
+}
+
+fn normalize_toolbar_icon_asset(asset_id: &str) -> Result<String> {
+    let trimmed = asset_id.trim();
+    if trimmed.is_empty() {
+        bail!("asset ID must not be empty");
+    }
+
+    if let Some(raw) = trimmed.strip_prefix("rbxassetid://") {
+        if raw.chars().all(|ch| ch.is_ascii_digit()) && !raw.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+        bail!("asset ID must be numeric after `rbxassetid://`");
+    }
+
+    if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return Ok(format!("rbxassetid://{trimmed}"));
+    }
+
+    bail!("asset ID must be numeric or `rbxassetid://<numeric>`");
+}
+
+#[cfg(test)]
+mod plugin_icon_tests {
+    use super::normalize_toolbar_icon_asset;
+
+    #[test]
+    fn normalize_toolbar_icon_asset_accepts_plain_numeric() {
+        let asset = normalize_toolbar_icon_asset("71461188969386").unwrap();
+        assert_eq!(asset, "rbxassetid://71461188969386");
+    }
+
+    #[test]
+    fn normalize_toolbar_icon_asset_accepts_prefixed_numeric() {
+        let asset = normalize_toolbar_icon_asset("rbxassetid://71461188969386").unwrap();
+        assert_eq!(asset, "rbxassetid://71461188969386");
+    }
+
+    #[test]
+    fn normalize_toolbar_icon_asset_rejects_invalid() {
+        assert!(normalize_toolbar_icon_asset("rbxassetid://abc").is_err());
+        assert!(normalize_toolbar_icon_asset("abc").is_err());
+        assert!(normalize_toolbar_icon_asset("").is_err());
+    }
 }
 
 /// Detect the OS-appropriate Roblox Studio plugins directory.
@@ -1916,10 +2300,12 @@ fn default_event_output_path(state_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, SyncbackContext, populate_from_dir, resolve_container_class,
+        Cli, Command, PLUGIN_SOURCE, ProjectContext, SyncbackContext, discover_server_url,
+        fetch_json_http, parse_http_url, populate_from_dir, resolve_container_class,
         resolve_effective_includes, resolve_instance_name, resolve_project_context,
         resolve_syncback_path, syncback_walk,
     };
+    use axum::{Json, Router, routing::get};
     use clap::Parser;
     use serde_json::json;
     use std::fs;
@@ -2255,6 +2641,243 @@ mod tests {
             }
             other => panic!("expected watch-native command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_http_url_accepts_localhost_and_path_prefix() {
+        let target = parse_http_url("http://127.0.0.1:7575/api").expect("parse url");
+        assert_eq!(target.host, "127.0.0.1");
+        assert_eq!(target.port, 7575);
+        assert_eq!(target.path_prefix, "/api");
+    }
+
+    #[test]
+    fn parse_http_url_rejects_https() {
+        assert!(parse_http_url("https://127.0.0.1:7575").is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_json_http_reads_discover_payload() {
+        let app = Router::new().route(
+            "/discover",
+            get(|| async {
+                Json(json!({
+                    "server_id": "server-123",
+                    "project_name": "Game",
+                    "project_id": "proj-123"
+                }))
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{}:{}", addr.ip(), addr.port());
+        let value = fetch_json_http(&url, "/discover")
+            .await
+            .expect("fetch discover json");
+        server.abort();
+
+        assert_eq!(value["server_id"], "server-123");
+        assert_eq!(value["project_name"], "Game");
+        assert_eq!(value["project_id"], "proj-123");
+    }
+
+    #[test]
+    fn discover_server_url_prefers_project_serve_settings() {
+        let context = ProjectContext {
+            project_path: PathBuf::from("/tmp/default.project.json"),
+            project_root: PathBuf::from("/tmp"),
+            includes: vec!["src".to_string()],
+            tree: vertigo_sync::project::ProjectTree {
+                name: "Game".to_string(),
+                project_id: "proj-123".to_string(),
+                mappings: vec![],
+                glob_ignore_paths: vec![],
+                emit_legacy_scripts: true,
+                serve_port: Some(34872),
+                serve_address: Some("127.0.0.1".to_string()),
+                vertigo_sync: None,
+            },
+        };
+
+        assert_eq!(
+            discover_server_url(&context, None),
+            "http://127.0.0.1:34872"
+        );
+        assert_eq!(
+            discover_server_url(&context, Some("http://127.0.0.1:9999")),
+            "http://127.0.0.1:9999"
+        );
+    }
+
+    #[test]
+    fn embedded_plugin_keeps_builders_opt_in_by_default() {
+        assert!(
+            PLUGIN_SOURCE.contains("BUILDERS_ENABLED_DEFAULT = false"),
+            "embedded plugin should keep builders disabled by default"
+        );
+    }
+
+    #[test]
+    fn embedded_plugin_hardens_oversized_source_and_queue_overflow() {
+        assert!(
+            PLUGIN_SOURCE.contains("MAX_LUA_SOURCE_LENGTH = 199999"),
+            "embedded plugin should enforce a Lua source size guard"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("local SCRIPT_CLASSES = table.freeze({"),
+            "embedded plugin should define script-class membership for Lua source guards"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("applyQueueLimit = 0"),
+            "embedded plugin should default the apply queue limit to unlimited"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoSyncApplyQueueLimit"),
+            "embedded plugin should expose a configurable apply queue limit setting"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("OVERSIZE_SOURCE:"),
+            "embedded plugin should mark oversized source writes as hard rejections"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("resetTransientSyncState()"),
+            "embedded plugin should hard-reset transient sync state on overflow"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("bootstrapManagedIndex()"),
+            "embedded plugin should rebuild managed state before full snapshot reconciliation"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("hardRejectedShaByPath[entryPath]"),
+            "embedded plugin should remember hard-rejected snapshot entries by sha"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("stageDelete(path)"),
+            "embedded plugin should stage managed-path deletions during snapshot reconciliation"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("Write apply permanently failed for %s after %d retries: %s"),
+            "embedded plugin should keep permanent write failures observable"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("resyncRequested = true"),
+            "embedded plugin should force a full resync after hard sync divergence"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("beginFullResync()\n\tbootstrapManagedIndex()"),
+            "embedded plugin should rebuild managed state before staging rewind operations"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("\"Time Travel\""),
+            "embedded plugin should expose a compact time-travel title"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("HistoryHeader")
+                && PLUGIN_SOURCE.contains("\"time\"")
+                && PLUGIN_SOURCE.contains("\"add\"")
+                && PLUGIN_SOURCE.contains("\"mod\"")
+                && PLUGIN_SOURCE.contains("\"del\""),
+            "embedded plugin should render a compact diff history header"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("ttLiveDot")
+                && PLUGIN_SOURCE.contains("JumpOldest\", \"|<\"")
+                && PLUGIN_SOURCE.contains("StepBack\", \"<\"")
+                && PLUGIN_SOURCE.contains("StepFwd\", \">\"")
+                && PLUGIN_SOURCE.contains("JumpLatest\", \">|\""),
+            "embedded plugin should expose compact transport controls for time travel"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoSyncBuilderQueueDepth")
+                && PLUGIN_SOURCE.contains("VertigoSyncBuilderPumpActive")
+                && PLUGIN_SOURCE.contains("VertigoSyncBuilderLastMs")
+                && PLUGIN_SOURCE.contains("VertigoSyncBuilderAvgMs")
+                && PLUGIN_SOURCE.contains("VertigoSyncBuilderMaxMs"),
+            "embedded plugin should expose builder scheduler performance attributes"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("Builder slice over budget:")
+                && PLUGIN_SOURCE.contains("recordBuilderPerf(path, result, builderElapsed * 1000)"),
+            "embedded plugin should record and surface slow builder slices"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("result.BackgroundBuild == true")
+                && PLUGIN_SOURCE.contains("Builder scheduled: %s"),
+            "embedded plugin should support non-blocking background builders"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoSyncTimeTravelHardPause"),
+            "embedded plugin should expose a hard-pause time-travel attribute for historical preview isolation"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("Keep fetch/apply running even during historical mode"),
+            "embedded plugin should continue fetch/apply during historical mode so rewound snapshots fully materialize"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoPreviewSyncState")
+                && PLUGIN_SOURCE.contains("previewStatusSummary()")
+                && PLUGIN_SOURCE.contains("builderStatusSummary()"),
+            "embedded plugin should surface preview and builder telemetry in the panel"
+        );
+    }
+
+    fn rough_top_level_symbol_count(source: &str) -> usize {
+        let mut count = 0usize;
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("type ") || trimmed.starts_with("local function ") {
+                count += 1;
+                continue;
+            }
+            if !line.starts_with("local ") {
+                continue;
+            }
+
+            let body = &trimmed["local ".len()..];
+            let stop = body
+                .find(':')
+                .or_else(|| body.find('='))
+                .unwrap_or(body.len());
+            let names = &body[..stop];
+            count += names
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .count();
+        }
+        count
+    }
+
+    #[test]
+    fn embedded_plugin_stays_under_roblox_top_level_symbol_budget() {
+        let symbol_count = rough_top_level_symbol_count(PLUGIN_SOURCE);
+        assert!(
+            PLUGIN_SOURCE.contains("local Runtime = {}"),
+            "embedded plugin should namespace runtime helpers to keep the top-level scope small"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("pcall(Runtime.applyWrite, path, ready.source, ready.sha256 or op.expectedSha)"),
+            "embedded plugin should keep apply queue writes namespaced after the Runtime refactor"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("if UI.historyListFrame ~= nil then"),
+            "embedded plugin should guard optional history list UI wiring"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("task.defer(Runtime.processFetchQueue)"),
+            "embedded plugin should defer the namespaced fetch queue pump after 413 fallback"
+        );
+        assert!(
+            symbol_count < 190,
+            "embedded plugin should stay under the Roblox plugin top-level symbol budget; got {symbol_count}"
+        );
     }
 
     #[test]
