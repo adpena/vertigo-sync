@@ -1294,6 +1294,7 @@ impl RbxlDomCache {
 
 /// Thread-safe state for the serve command.
 pub struct ServerState {
+    pub server_id: String,
     pub root: PathBuf,
     pub canonical_root: PathBuf,
     pub project_path: PathBuf,
@@ -1301,6 +1302,8 @@ pub struct ServerState {
     pub current: Mutex<Arc<Snapshot>>,
     pub history: Mutex<BTreeMap<String, Arc<Snapshot>>>,
     pub history_order: Mutex<VecDeque<String>>,
+    pub history_rows: Mutex<VecDeque<HistoryEntry>>,
+    pub history_timestamps: Mutex<BTreeMap<String, String>>,
     pub tx: tokio::sync::broadcast::Sender<SyncDiffEvent>,
     pub patch_lock: tokio::sync::Mutex<()>,
     pub sequence: Mutex<u64>,
@@ -1395,14 +1398,18 @@ impl ServerState {
         let arc = Arc::new(initial);
         let mut history = BTreeMap::new();
         let mut history_order = VecDeque::new();
+        let history_rows = VecDeque::new();
+        let mut history_timestamps = BTreeMap::new();
         history.insert(arc.fingerprint.clone(), Arc::clone(&arc));
         history_order.push_back(arc.fingerprint.clone());
+        history_timestamps.insert(arc.fingerprint.clone(), chrono::Utc::now().to_rfc3339());
         let canonical_root = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
         let project_path = options
             .project_path
             .unwrap_or_else(|| root.join("default.project.json"));
 
         Arc::new(Self {
+            server_id: uuid::Uuid::new_v4().to_string(),
             root,
             canonical_root,
             project_path,
@@ -1410,6 +1417,8 @@ impl ServerState {
             current: Mutex::new(arc),
             history: Mutex::new(history),
             history_order: Mutex::new(history_order),
+            history_rows: Mutex::new(history_rows),
+            history_timestamps: Mutex::new(history_timestamps),
             tx,
             patch_lock: tokio::sync::Mutex::new(()),
             sequence: Mutex::new(0),
@@ -1470,6 +1479,46 @@ impl ServerState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         queue.drain(..).collect()
+    }
+
+    /// Return up to `limit` cached history rows in chronological order
+    /// (oldest to newest), without cloning the entire ring buffer.
+    pub fn recent_history_rows(&self, limit: usize) -> Vec<HistoryEntry> {
+        let rows = self.history_rows.lock().unwrap_or_else(|e| e.into_inner());
+        let take = rows.len().min(limit);
+        let mut selected: Vec<HistoryEntry> = rows.iter().rev().take(take).cloned().collect();
+        selected.reverse();
+        selected
+    }
+
+    /// Resolve the current snapshot, the `live` alias, or an exact historical
+    /// snapshot by fingerprint.
+    pub fn snapshot_ref_at(&self, at: Option<&str>) -> Option<Arc<Snapshot>> {
+        match at {
+            None | Some("live") => {
+                let lock = self.current.lock().unwrap_or_else(|e| e.into_inner());
+                Some(Arc::clone(&lock))
+            }
+            Some(fingerprint) => {
+                let history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+                history.get(fingerprint).cloned()
+            }
+        }
+    }
+
+    /// Compute the diff from a historical snapshot to the current snapshot.
+    pub fn diff_since_fingerprint(&self, fingerprint: &str) -> Option<SnapshotDiff> {
+        let previous = {
+            let history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+            history.get(fingerprint).cloned()
+        }?;
+
+        let current = {
+            let lock = self.current.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(&lock)
+        };
+
+        Some(diff_snapshots(&previous, &current))
     }
 
     /// Poll source tree and broadcast diff if changed.
@@ -1552,16 +1601,37 @@ impl ServerState {
         {
             let mut hist_lock = self.history.lock().unwrap_or_else(|e| e.into_inner());
             let mut order_lock = self.history_order.lock().unwrap_or_else(|e| e.into_inner());
+            let mut rows_lock = self.history_rows.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ts_lock = self
+                .history_timestamps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
 
             let fp = new_arc.fingerprint.clone();
             if !hist_lock.contains_key(&fp) {
+                let timestamp = event.timestamp.clone();
+                let history_seq = order_lock.len() as u64;
+                let (scope, geometry_affecting) = classify_history_diff(&diff);
                 hist_lock.insert(fp.clone(), Arc::clone(&new_arc));
-                order_lock.push_back(fp);
+                order_lock.push_back(fp.clone());
+                rows_lock.push_back(HistoryEntry {
+                    seq: history_seq,
+                    fingerprint: fp.clone(),
+                    timestamp: timestamp.clone(),
+                    added: diff.added.len(),
+                    modified: diff.modified.len(),
+                    deleted: diff.deleted.len(),
+                    geometry_affecting,
+                    scope,
+                });
+                ts_lock.insert(fp, timestamp);
 
                 // Evict oldest entries beyond the limit.
                 while order_lock.len() > MAX_HISTORY_ENTRIES {
                     if let Some(oldest) = order_lock.pop_front() {
                         hist_lock.remove(&oldest);
+                        ts_lock.remove(&oldest);
+                        rows_lock.pop_front();
                     }
                 }
             }
@@ -2167,6 +2237,80 @@ pub struct HistoryEntry {
     pub added: usize,
     pub modified: usize,
     pub deleted: usize,
+    #[serde(default)]
+    pub geometry_affecting: bool,
+    #[serde(default)]
+    pub scope: String,
+}
+
+pub fn classify_history_path(path: &str) -> (&'static str, bool) {
+    if path.contains("AustinManifest")
+        || path.contains("AustinPreviewManifest")
+        || path.contains("StudioPreview/AustinPreviewBuilder.lua")
+        || path.contains("/ImportService/")
+    {
+        return ("geometry", true);
+    }
+    if path.contains("assets/plugin_src/")
+        || path.contains("assets/VertigoSyncPlugin.lua")
+        || path.contains("/branding/")
+    {
+        return ("plugin", false);
+    }
+    if path.starts_with("docs/")
+        || path == "README.md"
+        || path == "CONTRIBUTING.md"
+        || path == "LICENSE"
+    {
+        return ("docs", false);
+    }
+    ("code", false)
+}
+
+pub fn classify_history_diff(diff: &SnapshotDiff) -> (String, bool) {
+    let mut saw_geometry = false;
+    let mut saw_plugin = false;
+    let mut saw_docs = false;
+    let mut saw_code = false;
+
+    let mut classify = |path: &str| {
+        let (scope, geometry) = classify_history_path(path);
+        saw_geometry |= geometry;
+        match scope {
+            "geometry" => {}
+            "plugin" => saw_plugin = true,
+            "docs" => saw_docs = true,
+            _ => saw_code = true,
+        }
+    };
+
+    for entry in &diff.added {
+        classify(&entry.path);
+    }
+    for entry in &diff.modified {
+        classify(&entry.path);
+    }
+    for entry in &diff.deleted {
+        classify(&entry.path);
+    }
+    for entry in &diff.renamed {
+        classify(&entry.old_path);
+        classify(&entry.new_path);
+    }
+
+    let scope = if saw_geometry {
+        "geometry"
+    } else if saw_plugin && !(saw_docs || saw_code) {
+        "plugin"
+    } else if saw_docs && !(saw_plugin || saw_code) {
+        "docs"
+    } else if saw_plugin || saw_docs || saw_code {
+        "mixed"
+    } else {
+        "unknown"
+    };
+
+    (scope.to_string(), saw_geometry)
 }
 
 /// Read the most recent `limit` entries from the event log (NDJSON).
@@ -2234,6 +2378,8 @@ pub fn read_history(event_log_path: &Path, limit: usize) -> Result<Vec<HistoryEn
             added,
             modified,
             deleted,
+            geometry_affecting: false,
+            scope: String::new(),
         });
     }
 
@@ -2842,6 +2988,74 @@ mod tests {
         assert_eq!(rev.modified.len(), 1);
         assert_eq!(rev.modified[0].previous_sha256, "new_h");
         assert_eq!(rev.modified[0].current_sha256, "old_h");
+    }
+
+    #[test]
+    fn snapshot_ref_at_returns_live_and_historical_snapshots() {
+        let state = ServerState::new(
+            std::env::temp_dir(),
+            vec!["src".to_string()],
+            Snapshot {
+                version: 1,
+                include: vec!["src".to_string()],
+                fingerprint: "fp-live-1".to_string(),
+                entries: vec![],
+            },
+            32,
+        );
+
+        state
+            .install_snapshot_and_broadcast(Snapshot {
+                version: 1,
+                include: vec!["src".to_string()],
+                fingerprint: "fp-historical".to_string(),
+                entries: vec![SnapshotEntry {
+                    path: "src/a.luau".to_string(),
+                    sha256: "sha-a".to_string(),
+                    bytes: 10,
+                    meta: None,
+                    file_type: Some("luau".to_string()),
+                }],
+            })
+            .expect("install historical snapshot");
+
+        state
+            .install_snapshot_and_broadcast(Snapshot {
+                version: 1,
+                include: vec!["src".to_string()],
+                fingerprint: "fp-live-2".to_string(),
+                entries: vec![SnapshotEntry {
+                    path: "src/b.luau".to_string(),
+                    sha256: "sha-b".to_string(),
+                    bytes: 12,
+                    meta: None,
+                    file_type: Some("luau".to_string()),
+                }],
+            })
+            .expect("install live snapshot");
+
+        assert_eq!(
+            state
+                .snapshot_ref_at(None)
+                .expect("current snapshot")
+                .fingerprint,
+            "fp-live-2"
+        );
+        assert_eq!(
+            state
+                .snapshot_ref_at(Some("live"))
+                .expect("live alias snapshot")
+                .fingerprint,
+            "fp-live-2"
+        );
+        assert_eq!(
+            state
+                .snapshot_ref_at(Some("fp-historical"))
+                .expect("historical snapshot")
+                .fingerprint,
+            "fp-historical"
+        );
+        assert!(state.snapshot_ref_at(Some("missing")).is_none());
     }
 
     // -----------------------------------------------------------------------

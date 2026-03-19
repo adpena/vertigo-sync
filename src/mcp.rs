@@ -95,8 +95,13 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
         ),
         tool_def(
             "vsync_snapshot",
-            "Get current source tree snapshot with file hashes",
-            vec![],
+            "Get the current source tree snapshot, or an exact historical snapshot by fingerprint",
+            vec![param(
+                "fingerprint",
+                "string",
+                "Optional historical snapshot fingerprint to retrieve exactly",
+                false,
+            )],
         ),
         tool_def(
             "vsync_diff",
@@ -464,7 +469,7 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
             "Extract all MeshPart instances with their MeshId from the loaded .rbxl",
             vec![],
         ),
-        // ── New: History, rewind, model, config ──────────────────────
+        // ── New: History, snapshot, model, config ─────────────────────
         tool_def(
             "sync_history",
             "Get recent sync event history from the event log",
@@ -476,13 +481,13 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
             )],
         ),
         tool_def(
-            "sync_rewind",
-            "Compute reverse diff to rewind to a historical snapshot fingerprint",
+            "sync_snapshot",
+            "Get the current source tree snapshot, or an exact historical snapshot by fingerprint",
             vec![param(
                 "fingerprint",
                 "string",
-                "Target snapshot fingerprint to rewind to",
-                true,
+                "Optional historical snapshot fingerprint to retrieve exactly",
+                false,
             )],
         ),
         tool_def(
@@ -638,7 +643,7 @@ pub async fn handle_mcp_execute(
     let result = match req.tool.as_str() {
         // Existing tools
         "vsync_health" => exec_health(),
-        "vsync_snapshot" => exec_snapshot(&state),
+        "vsync_snapshot" => exec_snapshot(&state, &req.arguments),
         "vsync_diff" => exec_diff(&state, &req.arguments),
         "vsync_sources" => exec_sources(&state),
         "vsync_source" => exec_source(&state, &req.arguments),
@@ -679,9 +684,9 @@ pub async fn handle_mcp_execute(
         "vsync_rbxl_query" => exec_rbxl_query(&state, &req.arguments),
         "vsync_rbxl_scripts" => exec_rbxl_scripts(&state),
         "vsync_rbxl_meshes" => exec_rbxl_meshes(&state),
-        // New: History, rewind, model, config
+        // New: History, snapshot, model, config
         "sync_history" => exec_sync_history(&state, &req.arguments),
-        "sync_rewind" => exec_sync_rewind(&state, &req.arguments),
+        "sync_snapshot" => exec_snapshot(&state, &req.arguments),
         "sync_model_manifest" => exec_sync_model_manifest(&state, &req.arguments),
         "sync_config" => exec_sync_config(&state),
         // Plugin state reporting
@@ -775,10 +780,6 @@ fn bridge_method_catalog() -> &'static [(&'static str, &'static str)] {
         (
             "sync.history",
             "Get recent sync event history from the event log",
-        ),
-        (
-            "sync.rewind",
-            "Compute reverse diff to rewind to a historical snapshot fingerprint",
         ),
         (
             "sync.model_manifest",
@@ -1003,7 +1004,7 @@ fn exec_bridge_method(
             "methods": bridge_capabilities_json(),
         })),
         "sync.health" => exec_health(),
-        "sync.snapshot" => exec_snapshot(state),
+        "sync.snapshot" => exec_snapshot(state, params),
         "sync.diff" => exec_diff(state, params),
         "sync.status" => exec_status(state),
         "sync.events" => exec_events(state, params),
@@ -1031,7 +1032,6 @@ fn exec_bridge_method(
         "project.mappings" => exec_project(state),
         "metrics.get" => exec_metrics(state),
         "sync.history" => exec_sync_history(state, params),
-        "sync.rewind" => exec_sync_rewind(state, params),
         "sync.model_manifest" => exec_sync_model_manifest(state, params),
         "sync.config" => exec_sync_config(state),
         "sync.plugin_state" => exec_sync_plugin_state(state),
@@ -1304,9 +1304,24 @@ fn exec_health() -> Result<serde_json::Value, (StatusCode, String)> {
     }))
 }
 
-fn exec_snapshot(state: &ServerState) -> Result<serde_json::Value, (StatusCode, String)> {
-    let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
-    serde_json::to_value(&**lock).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+fn exec_snapshot(
+    state: &ServerState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let snapshot = state
+        .snapshot_ref_at(args.get("fingerprint").and_then(|v| v.as_str()))
+        .ok_or_else(|| {
+            let target = args
+                .get("fingerprint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("live");
+            (
+                StatusCode::NOT_FOUND,
+                format!("snapshot {target} not found in history"),
+            )
+        })?;
+
+    serde_json::to_value(&*snapshot).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 fn exec_diff(
@@ -1320,24 +1335,12 @@ fn exec_diff(
         )
     })?;
 
-    let old = {
-        let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        lock.get(since_hash).cloned()
-    };
-
-    let old = old.ok_or_else(|| {
+    let diff = state.diff_since_fingerprint(since_hash).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             format!("snapshot {} not found in history", since_hash),
         )
     })?;
-
-    let current = {
-        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::clone(&lock)
-    };
-
-    let diff = diff_snapshots(&old, &current);
     serde_json::to_value(&diff).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
@@ -2803,7 +2806,7 @@ fn execute_step(
 
     match step.tool.as_str() {
         "vsync_health" => exec_health().map_err(|(_, e)| e),
-        "vsync_snapshot" => exec_snapshot(state).map_err(|(_, e)| e),
+        "vsync_snapshot" => exec_snapshot(state, &args).map_err(|(_, e)| e),
         "vsync_diff" => exec_diff(state, &args).map_err(|(_, e)| e),
         "vsync_sources" => exec_sources(state).map_err(|(_, e)| e),
         "vsync_source" => exec_source(state, &args).map_err(|(_, e)| e),
@@ -2833,7 +2836,7 @@ fn execute_step(
         "vsync_bridge_execute" => exec_bridge_execute(state, &args).map_err(|(_, e)| e),
         "vsync_bridge_batch" => exec_bridge_batch(state, &args).map_err(|(_, e)| e),
         "sync_history" => exec_sync_history(state, &args).map_err(|(_, e)| e),
-        "sync_rewind" => exec_sync_rewind(state, &args).map_err(|(_, e)| e),
+        "sync_snapshot" => exec_snapshot(state, &args).map_err(|(_, e)| e),
         "sync_model_manifest" => exec_sync_model_manifest(state, &args).map_err(|(_, e)| e),
         "sync_config" => exec_sync_config(state).map_err(|(_, e)| e),
         "sync_plugin_state" => exec_sync_plugin_state(state).map_err(|(_, e)| e),
@@ -3545,7 +3548,7 @@ mod tests {
 
     #[test]
     fn tool_count_matches_expected() {
-        // Ensure we don't accidentally drop tools. 13 existing + 14 new + 1 pipeline + 3 bridge + 5 rbxl = 36.
+        // Ensure we don't accidentally drop tools as the MCP surface grows.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -3553,7 +3556,7 @@ mod tests {
         assert_eq!(
             tools.0.len(),
             47,
-            "expected 47 MCP tools (45 existing + 2 new: scaffold_builder, convert_to_builder)"
+            "expected 47 MCP tools including sync_snapshot"
         );
     }
 
@@ -3981,6 +3984,87 @@ mod tests {
     }
 
     #[test]
+    fn sync_history_uses_cached_rows_in_chronological_order() {
+        let snap1 = crate::Snapshot {
+            version: 1,
+            include: vec!["src".into()],
+            fingerprint: "snap-h1".into(),
+            entries: vec![],
+        };
+        let state = crate::ServerState::new(std::env::temp_dir(), vec!["src".into()], snap1, 32);
+
+        for (fingerprint, path) in [("snap-h2", "src/a.luau"), ("snap-h3", "src/b.luau")] {
+            state
+                .install_snapshot_and_broadcast(crate::Snapshot {
+                    version: 1,
+                    include: vec!["src".into()],
+                    fingerprint: fingerprint.to_string(),
+                    entries: vec![crate::SnapshotEntry {
+                        path: path.to_string(),
+                        sha256: format!("sha-{fingerprint}"),
+                        bytes: 10,
+                        meta: None,
+                        file_type: Some("luau".to_string()),
+                    }],
+                })
+                .expect("install snapshot");
+        }
+
+        let result = exec_sync_history(&state, &serde_json::json!({"limit": 2})).unwrap();
+        let entries = result.as_array().expect("history array");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["fingerprint"], "snap-h2");
+        assert_eq!(entries[1]["fingerprint"], "snap-h3");
+        assert_eq!(entries[0]["seq"], 1);
+        assert_eq!(entries[1]["seq"], 2);
+    }
+
+    #[test]
+    fn sync_snapshot_returns_exact_historical_snapshot_by_fingerprint() {
+        let snap1 = crate::Snapshot {
+            version: 1,
+            include: vec!["src".into()],
+            fingerprint: "snap-s1".into(),
+            entries: vec![],
+        };
+        let state = crate::ServerState::new(std::env::temp_dir(), vec!["src".into()], snap1, 32);
+
+        state
+            .install_snapshot_and_broadcast(crate::Snapshot {
+                version: 1,
+                include: vec!["src".into()],
+                fingerprint: "snap-s2".into(),
+                entries: vec![crate::SnapshotEntry {
+                    path: "src/a.luau".into(),
+                    sha256: "sha-s2".into(),
+                    bytes: 12,
+                    meta: None,
+                    file_type: Some("luau".to_string()),
+                }],
+            })
+            .expect("install snapshot");
+
+        state
+            .install_snapshot_and_broadcast(crate::Snapshot {
+                version: 1,
+                include: vec!["src".into()],
+                fingerprint: "snap-s3".into(),
+                entries: vec![crate::SnapshotEntry {
+                    path: "src/b.luau".into(),
+                    sha256: "sha-s3".into(),
+                    bytes: 14,
+                    meta: None,
+                    file_type: Some("luau".to_string()),
+                }],
+            })
+            .expect("install snapshot");
+
+        let result = exec_snapshot(&state, &serde_json::json!({"fingerprint": "snap-s2"})).unwrap();
+        assert_eq!(result["fingerprint"], "snap-s2");
+        assert_eq!(result["entries"][0]["path"], "src/a.luau");
+    }
+
+    #[test]
     fn file_history_across_snapshot_transitions() {
         // Create state with initial snapshot containing one file.
         let entry = crate::SnapshotEntry {
@@ -4183,7 +4267,7 @@ fn exec_rbxl_meshes(state: &Arc<ServerState>) -> Result<serde_json::Value, (Stat
 }
 
 // ---------------------------------------------------------------------------
-// New MCP tool implementations: history, rewind, model, config
+// New MCP tool implementations: history, snapshot, model, config
 // ---------------------------------------------------------------------------
 
 fn exec_sync_history(
@@ -4192,52 +4276,9 @@ fn exec_sync_history(
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
     let limit = limit.min(500);
-
-    let event_log_path = state.root.join(".vertigo-sync-state").join("events.jsonl");
-    let entries = crate::read_history(&event_log_path, limit)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let entries = state.recent_history_rows(limit);
 
     serde_json::to_value(&entries).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-}
-
-fn exec_sync_rewind(
-    state: &ServerState,
-    args: &serde_json::Value,
-) -> Result<serde_json::Value, (StatusCode, String)> {
-    let fingerprint = args
-        .get("fingerprint")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "missing required parameter: fingerprint".to_string(),
-            )
-        })?;
-
-    let target = {
-        let lock = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        lock.get(fingerprint).cloned()
-    };
-
-    let target = target.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!(
-                "fingerprint {} not found in history ring buffer",
-                fingerprint
-            ),
-        )
-    })?;
-
-    let current = {
-        let lock = state.current.lock().unwrap_or_else(|e| e.into_inner());
-        std::sync::Arc::clone(&lock)
-    };
-
-    let forward = crate::diff_snapshots(&target, &current);
-    let reversed = crate::reverse_diff(&forward);
-
-    serde_json::to_value(&reversed).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 fn exec_sync_model_manifest(
@@ -4406,6 +4447,7 @@ async fn exec_sync_plugin_command(
         "set_frame_budget",
         "run_builders",
         "set_log_level",
+        "time_travel",
     ];
     if !valid_commands.contains(&command.as_str()) {
         return Err((

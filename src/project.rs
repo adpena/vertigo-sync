@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectTree {
     pub name: String,
+    pub project_id: String,
     pub mappings: Vec<PathMapping>,
     /// Glob patterns for paths to exclude from the snapshot (Rojo-compatible).
     #[serde(default)]
@@ -30,6 +32,13 @@ pub struct ProjectTree {
     /// Optional serve address from project file (Rojo `serveAddress` parity).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub serve_address: Option<String>,
+    /// Optional vertigo-sync project-local configuration.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "vertigoSync"
+    )]
+    pub vertigo_sync: Option<VertigoSyncConfig>,
 }
 
 fn default_true() -> bool {
@@ -55,6 +64,20 @@ pub struct PathMapping {
     pub attributes: Option<BTreeMap<String, serde_json::Value>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VertigoSyncConfig {
+    #[serde(default)]
+    pub builders: VertigoSyncBuildersConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VertigoSyncBuildersConfig {
+    #[serde(default)]
+    pub roots: Vec<String>,
+    #[serde(rename = "dependencyRoots", default)]
+    pub dependency_roots: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Raw JSON schema (mirrors Rojo project file structure)
 // ---------------------------------------------------------------------------
@@ -62,6 +85,8 @@ pub struct PathMapping {
 #[derive(Debug, Deserialize)]
 struct RawProject {
     name: String,
+    #[serde(rename = "projectId", default)]
+    project_id: Option<String>,
     tree: RawTreeNode,
     /// Optional JSON Schema URL — ignored but must not create a phantom instance.
     #[serde(rename = "$schema", default)]
@@ -77,6 +102,8 @@ struct RawProject {
     /// Optional serve address from project file (Rojo parity).
     #[serde(rename = "serveAddress", default)]
     pub serve_address: Option<String>,
+    #[serde(rename = "vertigoSync", default)]
+    vertigo_sync: Option<RawVertigoSyncConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +116,20 @@ struct RawTreeNode {
     ignore_unknown_instances: Option<bool>,
     #[serde(flatten)]
     children: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawVertigoSyncConfig {
+    #[serde(default)]
+    builders: RawVertigoSyncBuildersConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawVertigoSyncBuildersConfig {
+    #[serde(default)]
+    roots: Vec<String>,
+    #[serde(rename = "dependencyRoots", default)]
+    dependency_roots: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,14 +180,73 @@ fn parse_project_str(content: &str, source_path: &Path) -> Result<ProjectTree> {
         );
     }
 
+    let project_id = resolve_project_id(&raw, source_path, &mappings);
+
     Ok(ProjectTree {
         name: raw.name,
+        project_id,
         mappings,
         glob_ignore_paths: raw.glob_ignore_paths,
         emit_legacy_scripts: raw.emit_legacy_scripts,
         serve_port: raw.serve_port,
         serve_address: raw.serve_address,
+        vertigo_sync: raw.vertigo_sync.map(|config| VertigoSyncConfig {
+            builders: VertigoSyncBuildersConfig {
+                roots: config
+                    .builders
+                    .roots
+                    .into_iter()
+                    .map(|path| normalize_fs_path(&path))
+                    .collect(),
+                dependency_roots: config
+                    .builders
+                    .dependency_roots
+                    .into_iter()
+                    .map(|path| normalize_fs_path(&path))
+                    .collect(),
+            },
+        }),
     })
+}
+
+fn resolve_project_id(raw: &RawProject, source_path: &Path, mappings: &[PathMapping]) -> String {
+    let explicit = raw
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(project_id) = explicit {
+        return project_id.to_string();
+    }
+
+    let canonical_source = source_path
+        .canonicalize()
+        .unwrap_or_else(|_| source_path.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(b"vertigo-sync-project-id-v1\0");
+    hasher.update(canonical_source.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(raw.name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(if raw.emit_legacy_scripts { b"1" } else { b"0" });
+    hasher.update(b"\0");
+    hasher.update(raw.serve_port.unwrap_or_default().to_string().as_bytes());
+    hasher.update(b"\0");
+    if let Some(address) = &raw.serve_address {
+        hasher.update(address.as_bytes());
+    }
+    hasher.update(b"\0");
+    for mapping in mappings {
+        hasher.update(mapping.fs_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(mapping.instance_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(mapping.class_name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(if mapping.ignore_unknown { b"1" } else { b"0" });
+        hasher.update(b"\0");
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn walk_tree_node(
@@ -463,6 +563,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_project_extracts_vertigo_sync_builder_config() {
+        let tree = parse_project_str(
+            r#"{
+                "name": "ArnisRoblox",
+                "vertigoSync": {
+                    "builders": {
+                        "roots": ["src\\ServerScriptService\\StudioPreview"],
+                        "dependencyRoots": ["src/ServerScriptService/ImportService", "src/ReplicatedStorage/Shared"]
+                    }
+                },
+                "tree": {
+                    "$className": "DataModel",
+                    "ServerScriptService": {
+                        "$path": "src/ServerScriptService"
+                    }
+                }
+            }"#,
+            &PathBuf::from("test.project.json"),
+        )
+        .unwrap();
+
+        let config = tree.vertigo_sync.expect("vertigo sync config");
+        assert_eq!(
+            config.builders.roots,
+            vec!["src/ServerScriptService/StudioPreview"]
+        );
+        assert_eq!(
+            config.builders.dependency_roots,
+            vec![
+                "src/ServerScriptService/ImportService",
+                "src/ReplicatedStorage/Shared"
+            ]
+        );
+    }
+
+    #[test]
     fn resolve_instance_class_init_scripts() {
         assert_eq!(
             resolve_instance_class("src/Server/init.server.luau"),
@@ -710,6 +846,7 @@ mod tests {
     fn serve_port_and_address_from_project() {
         let json = r#"{
             "name": "test-serve",
+            "projectId": "test-serve-id",
             "servePort": 8080,
             "serveAddress": "0.0.0.0",
             "tree": {
@@ -722,6 +859,7 @@ mod tests {
         let tree = parse_project_str(json, &PathBuf::from("serve.project.json")).unwrap();
         assert_eq!(tree.serve_port, Some(8080));
         assert_eq!(tree.serve_address, Some("0.0.0.0".to_string()));
+        assert_eq!(tree.project_id, "test-serve-id");
     }
 
     #[test]
@@ -730,6 +868,30 @@ mod tests {
             parse_project_str(test_project_json(), &PathBuf::from("test.project.json")).unwrap();
         assert_eq!(tree.serve_port, None);
         assert_eq!(tree.serve_address, None);
+        assert!(!tree.project_id.is_empty());
+    }
+
+    #[test]
+    fn derived_project_id_is_stable_for_same_source_path() {
+        let path = PathBuf::from("nested/default.project.json");
+        let left = parse_project_str(test_project_json(), &path).unwrap();
+        let right = parse_project_str(test_project_json(), &path).unwrap();
+        assert_eq!(left.project_id, right.project_id);
+    }
+
+    #[test]
+    fn derived_project_id_changes_with_source_path() {
+        let left = parse_project_str(
+            test_project_json(),
+            &PathBuf::from("a/default.project.json"),
+        )
+        .unwrap();
+        let right = parse_project_str(
+            test_project_json(),
+            &PathBuf::from("b/default.project.json"),
+        )
+        .unwrap();
+        assert_ne!(left.project_id, right.project_id);
     }
 
     // P1-A: nested projects

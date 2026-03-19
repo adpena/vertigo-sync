@@ -1,6 +1,3 @@
--- AUTO-GENERATED FILE. DO NOT EDIT DIRECTLY.
--- Source modules: assets/plugin_src/*.lua
-
 --!strict
 --!native
 --[[

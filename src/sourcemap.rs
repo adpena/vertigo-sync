@@ -393,10 +393,12 @@ mod tests {
 
         let tree = ProjectTree {
             name: "test-project".to_string(),
+            project_id: "test-project".to_string(),
             glob_ignore_paths: vec![],
             emit_legacy_scripts: true,
             serve_port: None,
             serve_address: None,
+            vertigo_sync: None,
             mappings: vec![
                 PathMapping {
                     fs_path: "src/Server".to_string(),
@@ -517,10 +519,12 @@ mod tests {
 
         let tree = ProjectTree {
             name: "test".to_string(),
+            project_id: "test".to_string(),
             glob_ignore_paths: vec![],
             emit_legacy_scripts: true,
             serve_port: None,
             serve_address: None,
+            vertigo_sync: None,
             mappings: vec![PathMapping {
                 fs_path: "src/Data".to_string(),
                 instance_path: "ReplicatedStorage.Data".to_string(),
@@ -578,10 +582,12 @@ mod tests {
 
         let tree = ProjectTree {
             name: "test".to_string(),
+            project_id: "test".to_string(),
             glob_ignore_paths: vec![],
             emit_legacy_scripts: true,
             serve_port: None,
             serve_address: None,
+            vertigo_sync: None,
             mappings: vec![PathMapping {
                 fs_path: "src/Net".to_string(),
                 instance_path: "ReplicatedStorage.Net".to_string(),
