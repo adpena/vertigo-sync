@@ -12,16 +12,24 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+pub mod config;
+pub mod fmt;
+pub mod init;
+pub mod migrate;
 pub mod builder_codegen;
 pub mod errors;
 pub mod mcp;
 pub mod output;
+pub mod plugin_smoke;
 pub mod project;
 pub mod rbxl;
 pub mod serve_rbxl;
 pub mod server;
+pub mod scripts;
 pub mod sourcemap;
+pub mod lint;
 pub mod validate;
+pub mod package;
 
 // ---------------------------------------------------------------------------
 // Event coalescer — batches filesystem events within a configurable window

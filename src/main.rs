@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use vertigo_sync::errors::SyncError;
 use vertigo_sync::output;
+use vertigo_sync::plugin_smoke;
 use vertigo_sync::project::parse_project;
 use vertigo_sync::server::{ServeOptions, run_serve};
 use vertigo_sync::validate;
@@ -29,6 +30,7 @@ use vertigo_sync::{
                   vsync serve --turbo                                       Start syncing in turbo mode\n  \
                   vsync serve --project roblox/default.project.json         Serve a nested Roblox project explicitly\n  \
                   vsync discover                                             Print local project/server identity\n  \
+                  vsync plugin-smoke-log --log latest.log                  Scan a Studio log for fatal plugin smoke failures\n  \
                   vsync build -o game.rbxl                                  Build a place file\n  \
                   vsync doctor                                              Check project health\n  \
                   vsync init                                                Create a new project\n  \
@@ -136,6 +138,7 @@ struct ProjectContext {
     project_root: PathBuf,
     includes: Vec<String>,
     tree: vertigo_sync::project::ProjectTree,
+    vsync_config: Option<vertigo_sync::config::VsyncConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,6 +165,12 @@ struct DiscoveryReport {
     project: DiscoveryProjectReport,
     server: DiscoveryServerReport,
     matches: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ValidateCommandReport {
+    source: validate::ValidationReport,
+    plugin_safety: validate::PluginSafetyReport,
 }
 
 #[derive(Debug, Subcommand)]
@@ -194,6 +203,19 @@ enum Command {
     /// Validate Luau source files for common issues.
     #[command(display_order = 13)]
     Validate,
+    /// Scan a Roblox Studio log for fatal Vertigo Sync plugin smoke failures.
+    #[command(display_order = 14)]
+    PluginSmokeLog {
+        /// Path to a Roblox Studio log file.
+        #[arg(long)]
+        log: PathBuf,
+        /// External user_/cloud_ plugins permitted during this smoke run.
+        #[arg(long = "allow-plugin", action = ArgAction::Append)]
+        allow_plugin: Vec<String>,
+        /// Ignore Roblox-managed cloud_ plugin loads unless they emit a separate fatal smoke pattern.
+        #[arg(long, default_value_t = false)]
+        ignore_cloud_plugins: bool,
+    },
     /// Serve snapshot/diff/events over HTTP + SSE.
     #[command(display_order = 20)]
     Serve {
@@ -268,6 +290,43 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Install packages from vsync.toml.
+    #[command(display_order = 44)]
+    Install {
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
+    },
+    /// Add a dependency to vsync.toml.
+    #[command(display_order = 45, hide = true)]
+    Add {
+        /// Package spec (e.g., "roblox/roact@^17.0.0")
+        package: String,
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
+    },
+    /// Remove a dependency from vsync.toml.
+    #[command(display_order = 46, hide = true)]
+    Remove {
+        /// Package name
+        package: String,
+    },
+    /// Update dependencies.
+    #[command(display_order = 47, hide = true)]
+    Update {
+        /// Specific package to update (default: all)
+        package: Option<String>,
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
+    },
+    /// Migrate from Rojo ecosystem configs to vsync.toml.
+    #[command(display_order = 48)]
+    Migrate,
+    /// Run a project script defined in vsync.toml [scripts].
+    #[command(display_order = 49)]
+    Run {
+        /// Script name.
+        name: String,
+    },
     /// Install the Vertigo Sync Studio plugin.
     #[command(display_order = 41)]
     PluginInstall,
@@ -276,6 +335,21 @@ enum Command {
     PluginSetIcon {
         /// Roblox image asset ID, for example `rbxassetid://1234567890` or `1234567890`.
         asset_id: String,
+    },
+    /// Format Luau source files.
+    #[command(display_order = 43)]
+    Fmt {
+        /// Check formatting without writing changes (exit 1 if unformatted).
+        #[arg(long, default_value_t = false)]
+        check: bool,
+        /// Print a unified diff for each file that would change.
+        #[arg(long, default_value_t = false)]
+        diff: bool,
+        /// Specific path to format (default: all project includes).
+        path: Option<PathBuf>,
+        /// Project file path.
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
     },
 }
 
@@ -298,6 +372,13 @@ async fn main() -> Result<()> {
         Command::Watch { project } => command_watch(&root, &state_dir, project, &cli),
         Command::WatchNative { project } => command_watch_native(&root, &state_dir, project, &cli),
         Command::Validate => command_validate(&root, &cli),
+        Command::PluginSmokeLog {
+            log,
+            allow_plugin,
+            ignore_cloud_plugins,
+        } => {
+            command_plugin_smoke_log(log, allow_plugin, *ignore_cloud_plugins, &cli)
+        }
         Command::Build {
             output,
             project,
@@ -315,8 +396,76 @@ async fn main() -> Result<()> {
             watch,
         } => command_sourcemap(&root, output, project, *include_non_scripts, *watch, &cli).await,
         Command::Init { name } => command_init(&root, name.as_deref()),
+        Command::Migrate => command_migrate(&root),
+        Command::Run { name } => {
+            let project_context = resolve_project_context(
+                &root,
+                Path::new("default.project.json"),
+                &cli.include,
+            )?;
+            let scripts = project_context
+                .vsync_config
+                .as_ref()
+                .map(|c| &c.scripts);
+            let empty = std::collections::BTreeMap::new();
+            let scripts = scripts.unwrap_or(&empty);
+            match vertigo_sync::scripts::resolve_script(name, scripts) {
+                Some(command) => {
+                    let project_name = &project_context.tree.name;
+                    let code = vertigo_sync::scripts::run_script(
+                        name,
+                        &command,
+                        &project_context.project_root,
+                        project_name,
+                    )?;
+                    std::process::exit(code);
+                }
+                None => {
+                    if scripts.is_empty() {
+                        anyhow::bail!(
+                            "no script '{name}' found — no [scripts] defined in vsync.toml"
+                        );
+                    } else {
+                        let available: Vec<&str> = scripts.keys().map(|s| s.as_str()).collect();
+                        anyhow::bail!(
+                            "unknown script '{name}'. Available scripts: {}",
+                            available.join(", ")
+                        );
+                    }
+                }
+            }
+        }
         Command::PluginInstall => command_plugin_install(),
         Command::PluginSetIcon { asset_id } => command_plugin_set_icon(asset_id),
+        Command::Fmt {
+            check,
+            diff,
+            path,
+            project,
+        } => command_fmt(&root, project, path.as_deref(), *check, *diff, &cli),
+        Command::Install { project } => {
+            let ctx = resolve_project_context(&root, project, &cli.include)?;
+            let config = ctx.vsync_config.clone().unwrap_or_default();
+            let report =
+                vertigo_sync::package::installer::install(&ctx.project_root, &config).await?;
+            output::success(&format!(
+                "{} installed, {} cached, {} total",
+                report.installed, report.cached, report.total
+            ));
+            Ok(())
+        }
+        Command::Add { package: _, project: _ } => {
+            output::success("vsync add is coming soon");
+            Ok(())
+        }
+        Command::Remove { package: _ } => {
+            output::success("vsync remove is coming soon");
+            Ok(())
+        }
+        Command::Update { package: _, project: _ } => {
+            output::success("vsync update is coming soon");
+            Ok(())
+        }
         Command::Serve { project } => {
             let project_context = resolve_project_context(&root, project, &cli.include)?;
             let includes = project_context.includes.clone();
@@ -534,11 +683,14 @@ fn resolve_project_context(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| root.to_path_buf());
 
+    let vsync_config = vertigo_sync::config::load_config(&project_root)?;
+
     Ok(ProjectContext {
         project_path,
         project_root,
         includes,
         tree,
+        vsync_config,
     })
 }
 
@@ -1076,20 +1228,30 @@ async fn command_discover(
 fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
     let project_context =
         resolve_project_context(root, Path::new("default.project.json"), &cli.include)?;
-    let report =
-        validate::validate_source(&project_context.project_root, &project_context.includes)?;
+    let report = validate::validate_source_with_ignores(
+        &project_context.project_root,
+        &project_context.includes,
+        &project_context.tree.glob_ignore_paths,
+    )?;
+    let plugin_safety =
+        validate::validate_plugin_source_text("embedded://VertigoSyncPlugin.lua", PLUGIN_SOURCE)?;
+    let combined = ValidateCommandReport {
+        source: report.clone(),
+        plugin_safety: plugin_safety.clone(),
+    };
 
     if cli.json {
-        println!("{}", serde_json::to_string(&report)?);
+        println!("{}", serde_json::to_string(&combined)?);
         if let Some(output_path) = cli.output.as_ref() {
             let path = resolve_relative_to_root(root, output_path);
-            write_json_file(&path, &report)?;
+            write_json_file(&path, &combined)?;
         }
-        if report.errors > 0 {
+        if report.errors > 0 || !plugin_safety.errors.is_empty() {
             bail!(
-                "validation failed: {} error(s), {} warning(s)",
+                "validation failed: {} source error(s), {} source warning(s), {} plugin safety error(s)",
                 report.errors,
-                report.warnings
+                report.warnings,
+                plugin_safety.errors.len()
             )
         }
         return Ok(());
@@ -1121,6 +1283,67 @@ fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
                 output::info(line);
             }
         }
+        output::warn("Selene passthrough is deprecated and will be removed in v1.0. Built-in lint rules will replace it.");
+    }
+
+    // Built-in configurable lint pass.
+    {
+        let lint_config = project_context
+            .vsync_config
+            .as_ref()
+            .map(|c| c.lint.clone())
+            .unwrap_or_default();
+        let lint_issues = vertigo_sync::lint::lint_source_tree(
+            &project_context.project_root,
+            &project_context.includes,
+            &lint_config,
+        );
+        if !lint_issues.is_empty() {
+            eprintln!();
+            output::header("lint");
+            let mut lint_errors = 0usize;
+            let mut lint_warnings = 0usize;
+            for issue in &lint_issues {
+                let msg = format!(
+                    "{}:{}: {} [{}] {}",
+                    issue.file, issue.line, issue.severity, issue.rule, issue.message
+                );
+                match issue.severity {
+                    vertigo_sync::lint::LintSeverity::Error => {
+                        output::error_msg(&msg);
+                        lint_errors += 1;
+                    }
+                    vertigo_sync::lint::LintSeverity::Warning => {
+                        output::warn(&msg);
+                        lint_warnings += 1;
+                    }
+                }
+            }
+            eprintln!();
+            output::info(&format!(
+                "lint: {} error(s), {} warning(s)",
+                lint_errors, lint_warnings
+            ));
+        }
+    }
+
+    eprintln!();
+    output::header("plugin safety");
+    output::info(&format!(
+        "top-level symbols: {} / {}",
+        plugin_safety.top_level_symbol_count, plugin_safety.top_level_symbol_budget
+    ));
+    if let Some(top_finding) = plugin_safety.function_risk_findings.first() {
+        output::info(&format!(
+            "highest function risk: `{}` lines {}-{} score {}",
+            top_finding.name, top_finding.start_line, top_finding.end_line, top_finding.risk_score
+        ));
+    }
+    for warning in &plugin_safety.warnings {
+        output::warn(&format!("[{}]: {}", warning.rule, warning.message));
+    }
+    for error in &plugin_safety.errors {
+        output::error_msg(&format!("[{}]: {}", error.rule, error.message));
     }
 
     eprintln!();
@@ -1141,25 +1364,229 @@ fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
         }
     }
 
-    if let Some(output_path) = cli.output.as_ref() {
-        let path = resolve_relative_to_root(root, output_path);
-        write_json_file(&path, &report)?;
+    if plugin_safety.errors.is_empty() {
+        output::success("generated plugin passed safety validation");
+    } else {
+        output::error_msg(&format!(
+            "generated plugin failed safety validation with {} error(s)",
+            plugin_safety.errors.len()
+        ));
     }
 
-    if report.errors > 0 {
+    if let Some(output_path) = cli.output.as_ref() {
+        let path = resolve_relative_to_root(root, output_path);
+        write_json_file(&path, &combined)?;
+    }
+
+    if report.errors > 0 || !plugin_safety.errors.is_empty() {
         let err = SyncError::ValidationFailed {
-            errors: report.errors,
+            errors: report.errors + plugin_safety.errors.len(),
             warnings: report.warnings,
         };
         output::error_msg(&err.suggestion());
         bail!(
-            "validation failed: {} error(s), {} warning(s)",
+            "validation failed: {} source error(s), {} source warning(s), {} plugin safety error(s)",
             report.errors,
-            report.warnings
+            report.warnings,
+            plugin_safety.errors.len()
         )
     }
 
     Ok(())
+}
+
+fn command_fmt(
+    root: &Path,
+    project: &Path,
+    path: Option<&Path>,
+    check: bool,
+    diff: bool,
+    cli: &Cli,
+) -> Result<()> {
+    let project_context = resolve_project_context(root, project, &cli.include)?;
+    let format_config = project_context
+        .vsync_config
+        .as_ref()
+        .map(|c| c.format.clone())
+        .unwrap_or_default();
+
+    // Collect files to format.
+    let files: Vec<std::path::PathBuf> = if let Some(p) = path {
+        let resolved = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            project_context.project_root.join(p)
+        };
+        if resolved.is_file() {
+            vec![resolved]
+        } else if resolved.is_dir() {
+            vertigo_sync::fmt::collect_lua_files(&resolved)?
+        } else {
+            anyhow::bail!("path does not exist: {}", resolved.display());
+        }
+    } else {
+        let mut all = Vec::new();
+        for inc in &project_context.includes {
+            let inc_path = project_context.project_root.join(inc);
+            if inc_path.is_dir() {
+                all.extend(vertigo_sync::fmt::collect_lua_files(&inc_path)?);
+            } else if inc_path.is_file()
+                && (inc.ends_with(".luau") || inc.ends_with(".lua"))
+            {
+                all.push(inc_path);
+            }
+        }
+        all
+    };
+
+    if files.is_empty() {
+        if !cli.json {
+            vertigo_sync::output::header("Fmt");
+            eprintln!("  No .luau/.lua files found.");
+        }
+        return Ok(());
+    }
+
+    let mut changed_count: usize = 0;
+    let mut checked_count: usize = 0;
+    let mut errors: Vec<String> = Vec::new();
+
+    for file_path in &files {
+        checked_count += 1;
+        let source = std::fs::read_to_string(file_path)
+            .with_context(|| format!("failed to read {}", file_path.display()))?;
+        let formatted = match vertigo_sync::fmt::format_source(&source, &format_config) {
+            Ok(f) => f,
+            Err(e) => {
+                let rel = file_path
+                    .strip_prefix(&project_context.project_root)
+                    .unwrap_or(file_path)
+                    .display();
+                errors.push(format!("{rel}: {e}"));
+                continue;
+            }
+        };
+        if formatted != source {
+            changed_count += 1;
+            let rel = file_path
+                .strip_prefix(&project_context.project_root)
+                .unwrap_or(file_path)
+                .display()
+                .to_string();
+
+            if diff {
+                // Print unified diff to stdout.
+                println!("--- a/{rel}");
+                println!("+++ b/{rel}");
+                for line in simple_diff(&source, &formatted) {
+                    println!("{line}");
+                }
+            }
+
+            if !check && !diff {
+                std::fs::write(file_path, &formatted)
+                    .with_context(|| format!("failed to write {}", file_path.display()))?;
+            }
+        }
+    }
+
+    if cli.json {
+        let report = serde_json::json!({
+            "files_checked": checked_count,
+            "files_changed": changed_count,
+            "errors": errors,
+        });
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        vertigo_sync::output::header("Fmt");
+        eprintln!("  {checked_count} file(s) checked, {changed_count} file(s) {}.",
+            if check || diff { "would change" } else { "formatted" }
+        );
+        for err in &errors {
+            eprintln!("  error: {err}");
+        }
+    }
+
+    if check && changed_count > 0 {
+        anyhow::bail!("{changed_count} file(s) are not formatted — run `vsync fmt` to fix");
+    }
+
+    Ok(())
+}
+
+/// Produce a minimal unified-diff-style output between two strings.
+fn simple_diff(old: &str, new: &str) -> Vec<String> {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let mut out = Vec::new();
+    let max = old_lines.len().max(new_lines.len());
+    // Simple line-by-line comparison (not a true LCS diff, but good enough for formatting diffs).
+    let mut i = 0;
+    let mut j = 0;
+    while i < old_lines.len() || j < new_lines.len() {
+        if i < old_lines.len() && j < new_lines.len() && old_lines[i] == new_lines[j] {
+            out.push(format!(" {}", old_lines[i]));
+            i += 1;
+            j += 1;
+        } else if i < old_lines.len()
+            && (j >= new_lines.len()
+                || (i + 1 < old_lines.len()
+                    && j + 1 < new_lines.len()
+                    && old_lines[i] != new_lines[j]))
+        {
+            out.push(format!("-{}", old_lines[i]));
+            i += 1;
+        } else if j < new_lines.len() {
+            out.push(format!("+{}", new_lines[j]));
+            j += 1;
+        } else {
+            break;
+        }
+        const MAX_DIFF_LINES: usize = 200;
+        if out.len() >= MAX_DIFF_LINES {
+            out.push(format!("... ({} more lines truncated)", max.saturating_sub(MAX_DIFF_LINES)));
+            break;
+        }
+    }
+    out
+}
+
+fn command_plugin_smoke_log(
+    log: &Path,
+    allow_plugins: &[String],
+    ignore_cloud_plugins: bool,
+    cli: &Cli,
+) -> Result<()> {
+    let report =
+        plugin_smoke::scan_studio_log_file_with_options(log, allow_plugins, ignore_cloud_plugins)?;
+
+    if cli.json {
+        println!("{}", serde_json::to_string(&report)?);
+        if !report.clean {
+            plugin_smoke::ensure_clean_log(&report)?;
+        }
+        return Ok(());
+    }
+
+    if report.clean {
+        output::success(&format!(
+            "Studio plugin smoke passed for {}",
+            report.log_path
+        ));
+        return Ok(());
+    }
+
+    output::error_msg(&format!(
+        "Studio plugin smoke failed for {}",
+        report.log_path
+    ));
+    for fatal in &report.fatal_matches {
+        output::error_msg(&format!(
+            "[{}]: {}:{} {}",
+            fatal.rule, report.log_path, fatal.line, fatal.text
+        ));
+    }
+    plugin_smoke::ensure_clean_log(&report)
 }
 
 fn command_watch(root: &Path, state_dir: &Path, project: &Path, cli: &Cli) -> Result<()> {
@@ -1689,82 +2116,57 @@ fn command_init(root: &Path, name: Option<&str>) -> Result<()> {
     output::header(&format!("Initializing project: {project_name}"));
     eprintln!();
 
-    let project_path = root.join("default.project.json");
-    if project_path.exists() {
-        output::warn("default.project.json already exists, skipping project file creation");
-    } else {
-        output::step(1, 4, "Creating default.project.json");
-        let project_json = serde_json::json!({
-            "name": project_name,
-            "projectId": uuid::Uuid::new_v4().to_string(),
-            "tree": {
-                "$className": "DataModel",
-                "ServerScriptService": {
-                    "Server": {
-                        "$path": "src/Server"
-                    }
-                },
-                "StarterPlayer": {
-                    "StarterPlayerScripts": {
-                        "Client": {
-                            "$path": "src/Client"
-                        }
-                    }
-                },
-                "ReplicatedStorage": {
-                    "Shared": {
-                        "$path": "src/Shared"
-                    }
-                }
-            }
-        });
-        let formatted = serde_json::to_string_pretty(&project_json)?;
-        std::fs::write(&project_path, formatted.as_bytes())
-            .with_context(|| format!("failed to write {}", project_path.display()))?;
-        output::success("Created default.project.json");
-    }
-
-    // Create source directories and boilerplate files.
-    let dirs_and_files: &[(&str, &str, &str)] = &[
-        (
-            "src/Server",
-            "init.server.luau",
-            "--!strict\nprint(\"[Server] Hello from Vertigo Sync!\")\n",
-        ),
-        (
-            "src/Client",
-            "init.client.luau",
-            "--!strict\nprint(\"[Client] Hello from Vertigo Sync!\")\n",
-        ),
-        ("src/Shared", "init.luau", "--!strict\nreturn {}\n"),
-    ];
-
-    for (i, (dir, file, content)) in dirs_and_files.iter().enumerate() {
-        let dir_path = root.join(dir);
-        let file_path = dir_path.join(file);
-
-        output::step(i + 2, 4, &format!("Creating {dir}/{file}"));
-
-        std::fs::create_dir_all(&dir_path)
-            .with_context(|| format!("failed to create directory {}", dir_path.display()))?;
-
-        if file_path.exists() {
-            output::warn(&format!("{dir}/{file} already exists, skipping"));
-        } else {
-            std::fs::write(&file_path, content)
-                .with_context(|| format!("failed to write {}", file_path.display()))?;
-            output::success(&format!("Created {dir}/{file}"));
-        }
-    }
+    vertigo_sync::init::run_init(root, name)?;
 
     eprintln!();
     output::success(&format!("Project '{project_name}' initialized"));
     eprintln!();
     output::info("Next steps:");
+    output::info("  vsync install                   Install dependencies");
+    output::info("  vsync validate                  Check project health");
+    output::info("  vsync fmt                       Format source files");
     output::info("  vsync serve --turbo             Start syncing");
-    output::info("  vsync discover                  Print project/server identity");
     output::info("  vsync plugin-install            Install Studio plugin");
-    output::info("  vsync doctor                    Verify project health");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migrate command
+// ---------------------------------------------------------------------------
+
+fn command_migrate(root: &Path) -> Result<()> {
+    output::header("Migrating to vsync.toml");
+    eprintln!();
+
+    let report = vertigo_sync::migrate::run_migrate(root)?;
+
+    if !report.wally_migrated && !report.selene_migrated && !report.stylua_migrated {
+        if root.join("vsync.toml").exists() {
+            output::info("vsync.toml already exists — skipping migration");
+        } else {
+            output::info("No ecosystem configs found; wrote vsync.toml with defaults");
+        }
+        return Ok(());
+    }
+
+    if report.wally_migrated {
+        output::success("Migrated wally.toml (package metadata + dependencies)");
+    }
+    if report.selene_migrated {
+        output::success("Migrated selene.toml (lint configuration)");
+    }
+    if report.stylua_migrated {
+        output::success("Migrated stylua.toml (format configuration)");
+    }
+    if report.aftman_found {
+        eprintln!();
+        output::warn("aftman.toml / foreman.toml detected — tool versions are not migrated automatically");
+    }
+
+    eprintln!();
+    output::success("vsync.toml created");
+    output::info("Review the generated config and remove old ecosystem files when ready.");
 
     Ok(())
 }
@@ -1778,16 +2180,33 @@ const PLUGIN_SOURCE: &str = include_str!("../assets/VertigoSyncPlugin.lua");
 const TOOLBAR_ICON_LINE_PREFIX: &str = "DEFAULT_TOOLBAR_ICON_ASSET = ";
 
 fn command_plugin_install() -> Result<()> {
+    let plugin_safety =
+        validate::validate_plugin_source_text("embedded://VertigoSyncPlugin.lua", PLUGIN_SOURCE)?;
+    output::step(1, 3, "Validating generated plugin safety");
+    for warning in &plugin_safety.warnings {
+        output::warn(&format!("[{}]: {}", warning.rule, warning.message));
+    }
+    if !plugin_safety.errors.is_empty() {
+        for error in &plugin_safety.errors {
+            output::error_msg(&format!("[{}]: {}", error.rule, error.message));
+        }
+        bail!("refusing to install an unsafe generated plugin");
+    }
+    output::success(&format!(
+        "Plugin safety passed (top-level symbols: {} / {})",
+        plugin_safety.top_level_symbol_count, plugin_safety.top_level_symbol_budget
+    ));
+
     let plugins_dir = detect_plugins_dir()?;
 
-    output::step(1, 2, "Detecting Roblox Plugins directory");
+    output::step(2, 3, "Detecting Roblox Plugins directory");
     output::success(&format!("Found: {}", plugins_dir.display()));
 
     std::fs::create_dir_all(&plugins_dir)
         .with_context(|| format!("failed to create {}", plugins_dir.display()))?;
 
     let dest = plugins_dir.join("VertigoSyncPlugin.lua");
-    output::step(2, 2, "Installing VertigoSyncPlugin.lua");
+    output::step(3, 3, "Installing VertigoSyncPlugin.lua");
     std::fs::write(&dest, PLUGIN_SOURCE)
         .with_context(|| format!("failed to write {}", dest.display()))?;
 
@@ -2310,6 +2729,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use vertigo_sync::validate;
 
     fn write_project(path: &Path, name: &str, source_root: &str) {
         if let Some(parent) = path.parent() {
@@ -2704,6 +3124,7 @@ mod tests {
                 serve_address: Some("127.0.0.1".to_string()),
                 vertigo_sync: None,
             },
+            vsync_config: None,
         };
 
         assert_eq!(
@@ -2828,42 +3249,72 @@ mod tests {
         );
     }
 
-    fn rough_top_level_symbol_count(source: &str) -> usize {
-        let mut count = 0usize;
-        for line in source.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("type ") || trimmed.starts_with("local function ") {
-                count += 1;
-                continue;
-            }
-            if !line.starts_with("local ") {
-                continue;
-            }
+    #[test]
+    fn embedded_plugin_contains_edit_preview_runtime_contract() {
+        assert!(
+            PLUGIN_SOURCE.contains("editPreview"),
+            "embedded plugin should understand vertigoSync.editPreview config"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("builderMethod"),
+            "embedded plugin should support configurable preview builder entry methods"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoPreviewLastBuildError"),
+            "embedded plugin should expose preview build failure state"
+        );
+    }
 
-            let body = &trimmed["local ".len()..];
-            let stop = body
-                .find(':')
-                .or_else(|| body.find('='))
-                .unwrap_or(body.len());
-            let names = &body[..stop];
-            count += names
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .count();
-        }
-        count
+    #[test]
+    fn embedded_plugin_passes_plugin_safety_validation() {
+        let report = validate::validate_plugin_source_text(
+            "embedded://VertigoSyncPlugin.lua",
+            PLUGIN_SOURCE,
+        )
+        .expect("plugin safety validation should run");
+        assert_eq!(report.path, "embedded://VertigoSyncPlugin.lua");
+        assert!(
+            report.compile_ok,
+            "embedded plugin should compile with luau-compile"
+        );
+        assert!(
+            report.analyze_ok,
+            "embedded plugin should pass luau-analyze"
+        );
+        assert!(
+            report.errors.is_empty(),
+            "embedded plugin should not have plugin safety errors: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn embedded_plugin_does_not_use_removed_gotham_italic_enum() {
+        assert!(
+            !PLUGIN_SOURCE.contains("Enum.Font.GothamItalic"),
+            "embedded plugin must not use removed Enum.Font.GothamItalic"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("Font.new(\"rbxasset://fonts/families/Montserrat.json\", Enum.FontWeight.Regular, Enum.FontStyle.Italic)"),
+            "embedded plugin should use a modern FontFace italic fallback"
+        );
     }
 
     #[test]
     fn embedded_plugin_stays_under_roblox_top_level_symbol_budget() {
-        let symbol_count = rough_top_level_symbol_count(PLUGIN_SOURCE);
+        let report = validate::validate_plugin_source_text(
+            "embedded://VertigoSyncPlugin.lua",
+            PLUGIN_SOURCE,
+        )
+        .expect("plugin safety validation should run");
         assert!(
             PLUGIN_SOURCE.contains("local Runtime = {}"),
             "embedded plugin should namespace runtime helpers to keep the top-level scope small"
         );
         assert!(
-            PLUGIN_SOURCE.contains("pcall(Runtime.applyWrite, path, ready.source, ready.sha256 or op.expectedSha)"),
+            PLUGIN_SOURCE.contains(
+                "pcall(Runtime.applyWrite, path, ready.source, ready.sha256 or op.expectedSha)"
+            ),
             "embedded plugin should keep apply queue writes namespaced after the Runtime refactor"
         );
         assert!(
@@ -2875,8 +3326,9 @@ mod tests {
             "embedded plugin should defer the namespaced fetch queue pump after 413 fallback"
         );
         assert!(
-            symbol_count < 190,
-            "embedded plugin should stay under the Roblox plugin top-level symbol budget; got {symbol_count}"
+            report.top_level_symbol_count <= report.top_level_symbol_budget,
+            "embedded plugin should stay under the Roblox plugin top-level symbol budget; got {}",
+            report.top_level_symbol_count
         );
     }
 
