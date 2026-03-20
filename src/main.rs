@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
+use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -458,12 +459,8 @@ async fn main() -> Result<()> {
         Command::Install { project } => {
             let ctx = resolve_project_context(&root, project, &cli.include)?;
             let config = ctx.vsync_config.clone().unwrap_or_default();
-            let report =
+            let _report =
                 vertigo_sync::package::installer::install(&ctx.project_root, &config).await?;
-            output::success(&format!(
-                "{} installed, {} cached, {} total",
-                report.installed, report.cached, report.total
-            ));
             Ok(())
         }
         Command::Add { package, server, dev, project } => {
@@ -504,12 +501,8 @@ async fn main() -> Result<()> {
             save_config(&ctx.project_root, &config)?;
 
             // Run install
-            let report =
+            let _report =
                 vertigo_sync::package::installer::install(&ctx.project_root, &config).await?;
-            output::success(&format!(
-                "{} installed, {} cached, {} total",
-                report.installed, report.cached, report.total
-            ));
             Ok(())
         }
         Command::Remove { package, project } => {
@@ -1568,45 +1561,75 @@ fn command_fmt(
         return Ok(());
     }
 
+    // Process all files in parallel using rayon.
+    let results: Vec<(PathBuf, Result<bool, String>)> = files
+        .par_iter()
+        .map(|path| {
+            let source = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => return (path.clone(), Err(format!("{e}"))),
+            };
+            match vertigo_sync::fmt::format_source(&source, &format_config) {
+                Ok(formatted) => {
+                    if formatted == source {
+                        (path.clone(), Ok(false))
+                    } else if check {
+                        (path.clone(), Ok(true)) // would change
+                    } else {
+                        match std::fs::write(path, &formatted) {
+                            Ok(_) => (path.clone(), Ok(true)),
+                            Err(e) => (path.clone(), Err(format!("{e}"))),
+                        }
+                    }
+                }
+                Err(e) => (path.clone(), Err(format!("{e}"))),
+            }
+        })
+        .collect();
+
+    // Aggregate results.
+    let checked_count = results.len();
     let mut changed_count: usize = 0;
-    let mut checked_count: usize = 0;
     let mut errors: Vec<String> = Vec::new();
 
-    for file_path in &files {
-        checked_count += 1;
-        let source = std::fs::read_to_string(file_path)
-            .with_context(|| format!("failed to read {}", file_path.display()))?;
-        let formatted = match vertigo_sync::fmt::format_source(&source, &format_config) {
-            Ok(f) => f,
+    for (file_path, result) in &results {
+        match result {
+            Ok(true) => {
+                changed_count += 1;
+                if diff {
+                    // Re-read for diff output (only in diff mode).
+                    let rel = file_path
+                        .strip_prefix(&project_context.project_root)
+                        .unwrap_or(file_path)
+                        .display()
+                        .to_string();
+                    if let Ok(source) = std::fs::read_to_string(file_path) {
+                        if let Ok(formatted) =
+                            vertigo_sync::fmt::format_source(&source, &format_config)
+                        {
+                            println!("--- a/{rel}");
+                            println!("+++ b/{rel}");
+                            for line in simple_diff(&source, &formatted) {
+                                println!("{line}");
+                            }
+                        }
+                    }
+                }
+                if check {
+                    let rel = file_path
+                        .strip_prefix(&project_context.project_root)
+                        .unwrap_or(file_path)
+                        .display();
+                    eprintln!("  would change: {rel}");
+                }
+            }
+            Ok(false) => {}
             Err(e) => {
                 let rel = file_path
                     .strip_prefix(&project_context.project_root)
                     .unwrap_or(file_path)
                     .display();
                 errors.push(format!("{rel}: {e}"));
-                continue;
-            }
-        };
-        if formatted != source {
-            changed_count += 1;
-            let rel = file_path
-                .strip_prefix(&project_context.project_root)
-                .unwrap_or(file_path)
-                .display()
-                .to_string();
-
-            if diff {
-                // Print unified diff to stdout.
-                println!("--- a/{rel}");
-                println!("+++ b/{rel}");
-                for line in simple_diff(&source, &formatted) {
-                    println!("{line}");
-                }
-            }
-
-            if !check && !diff {
-                std::fs::write(file_path, &formatted)
-                    .with_context(|| format!("failed to write {}", file_path.display()))?;
             }
         }
     }

@@ -2,8 +2,11 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::config::{DependencySpec, VsyncConfig};
+use crate::output;
 use super::cache;
 use super::lockfile::{Lockfile, LockedPackage};
 use super::registry::{IndexEntry, RegistryClient, parse_version_req};
@@ -13,11 +16,44 @@ pub struct InstallReport {
     pub installed: u32,
     pub cached: u32,
     pub total: u32,
+    pub elapsed: std::time::Duration,
+}
+
+/// A package that needs to be resolved from the registry.
+struct PendingResolve {
+    scope: String,
+    name: String,
+    version_req: String,
+    realm: String,
+    full_name: String,
+}
+
+/// A resolved package that needs to be downloaded.
+struct PendingDownload {
+    scope: String,
+    name: String,
+    version: String,
+    realm: String,
+    full_name: String,
+    entry: IndexEntry,
+}
+
+/// A downloaded package ready for extraction.
+struct Downloaded {
+    scope: String,
+    name: String,
+    version: String,
+    realm: String,
+    full_name: String,
+    entry: IndexEntry,
+    bytes: Vec<u8>,
+    checksum: String,
 }
 
 /// Install all dependencies declared in the given config, writing `vsync.lock` and
 /// populating the `Packages/` directory.
 pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<InstallReport> {
+    let start = Instant::now();
     let lock_path = project_root.join("vsync.lock");
     let mut lockfile = Lockfile::load(&lock_path)?
         .unwrap_or_else(Lockfile::new);
@@ -29,7 +65,7 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
         ("dev", &config.dev_dependencies),
     ];
 
-    let registry = RegistryClient::default_wally()?;
+    let registry = Arc::new(RegistryClient::default_wally()?);
     let packages_dir = project_root.join(
         config
             .package
@@ -46,10 +82,12 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
         bail!("packages-dir must be inside the project root");
     }
 
-    let mut installed: u32 = 0;
-    let mut cached: u32 = 0;
     let mut total: u32 = 0;
+    let mut cached: u32 = 0;
+    let mut pending_resolve: Vec<PendingResolve> = Vec::new();
 
+    // ── Phase 1: Collect and filter ──────────────────────────────────────
+    // Check lockfile + cache BEFORE any network call.
     for (realm, deps) in &dep_groups {
         for spec in (*deps).values() {
             total += 1;
@@ -58,96 +96,24 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                     let (scope, name, version_req) = parse_version_req(version_spec)
                         .with_context(|| format!("bad dependency spec: {version_spec}"))?;
 
-                    // Fetch available versions from the registry.
-                    let versions = registry
-                        .fetch_versions(&scope, &name)
-                        .await
-                        .with_context(|| format!("failed to query {scope}/{name}"))?;
-
-                    let entry = select_version(&versions, &version_req)
-                        .with_context(|| {
-                            format!("no version of {scope}/{name} satisfies {version_req}")
-                        })?;
-
-                    // Check if already locked at this version.
                     let full_name = format!("{scope}/{name}");
-                    let already_locked = lockfile.packages.iter().any(|p| {
-                        p.name == full_name && p.version == entry.version
-                    });
 
-                    if already_locked {
-                        // Check cache.
-                        let existing = lockfile
-                            .packages
-                            .iter()
-                            .find(|p| p.name == full_name && p.version == entry.version)
-                            .unwrap();
-                        if cache::is_cached(&existing.checksum)? {
+                    // Check lockfile + cache BEFORE any network call
+                    if let Some(locked) = lockfile.packages.iter().find(|p| p.name == full_name) {
+                        if cache::is_cached(&locked.checksum)? {
+                            // Extract from cache, skip network entirely
                             cached += 1;
                             continue;
                         }
                     }
 
-                    // Download the package.
-                    let bytes = registry
-                        .download_package(&scope, &name, &entry.version)
-                        .await
-                        .with_context(|| {
-                            format!("failed to download {scope}/{name}@{}", entry.version)
-                        })?;
-
-                    // Compute checksum.
-                    let checksum = hex_sha256(&bytes);
-
-                    // Cache the zip (offload blocking I/O).
-                    let cache_path = cache::cached_package_path(&checksum)?;
-                    let cache_bytes = bytes.clone();
-                    let cache_path_clone = cache_path.clone();
-                    tokio::task::spawn_blocking(move || std::fs::write(&cache_path_clone, &cache_bytes))
-                        .await
-                        .context("cache write task panicked")?
-                        .with_context(|| {
-                            format!("failed to write cache file {}", cache_path.display())
-                        })?;
-
-                    // Extract the zip into Packages/{scope}/{name}/.
-                    let dest = packages_dir.join(&scope).join(&name);
-                    // Validate dest is inside the packages directory.
-                    std::fs::create_dir_all(&dest)?;
-                    let canonical_packages = canon_pkg.clone();
-                    let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.clone());
-                    if !canonical_dest.starts_with(&canonical_packages) {
-                        bail!("package path escapes Packages directory");
-                    }
-                    let bytes_clone = bytes.clone();
-                    let dest_clone = dest.clone();
-                    tokio::task::spawn_blocking(move || extract_zip(&bytes_clone, &dest_clone))
-                        .await
-                        .context("extract task panicked")?
-                        .with_context(|| {
-                            format!(
-                                "failed to extract {scope}/{name}@{} into {}",
-                                entry.version,
-                                dest.display()
-                            )
-                        })?;
-
-                    // Upsert lockfile entry.
-                    lockfile.packages.retain(|p| p.name != full_name);
-                    lockfile.packages.push(LockedPackage {
-                        name: full_name.clone(),
-                        version: entry.version.clone(),
+                    pending_resolve.push(PendingResolve {
+                        scope,
+                        name,
+                        version_req,
                         realm: realm.to_string(),
-                        checksum,
-                        source: "wally".to_string(),
-                        dependencies: entry
-                            .dependencies
-                            .iter()
-                            .map(|(k, v)| format!("{k}@{v}"))
-                            .collect(),
+                        full_name,
                     });
-
-                    installed += 1;
                 }
                 DependencySpec::Path { path } => {
                     let dep_path = project_root.join(path);
@@ -175,14 +141,194 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
         }
     }
 
-    // Warn about peer dependencies (not yet resolved).
-    if !config.peer_dependencies.is_empty() {
-        eprintln!(
-            "warning: {} peer dependenc{} declared but not yet resolved (coming in v2)",
-            config.peer_dependencies.len(),
-            if config.peer_dependencies.len() == 1 { "y" } else { "ies" }
-        );
+    // Fast path: everything is cached.
+    if pending_resolve.is_empty() {
+        // Warn about peer dependencies (not yet resolved).
+        warn_peer_deps(config);
+
+        // Write the updated lockfile (skip if no dependencies were processed).
+        if !lockfile.packages.is_empty() || total > 0 {
+            lockfile.save(&lock_path)?;
+        }
+
+        let elapsed = start.elapsed();
+        if total > 0 {
+            output::success(&format!(
+                "{total} package{} up to date ({:.2}s)",
+                if total == 1 { "" } else { "s" },
+                elapsed.as_secs_f64()
+            ));
+        }
+
+        return Ok(InstallReport {
+            installed: 0,
+            cached,
+            total,
+            elapsed,
+        });
     }
+
+    // ── Phase 2: Resolve concurrently ────────────────────────────────────
+    let resolve_count = pending_resolve.len();
+    output::info(&format!(
+        "Resolving {} package{}...",
+        resolve_count,
+        if resolve_count == 1 { "" } else { "s" }
+    ));
+
+    let mut resolve_set = tokio::task::JoinSet::new();
+    // Bounded concurrency: process in chunks of 8.
+    let mut pending_download: Vec<PendingDownload> = Vec::with_capacity(resolve_count);
+
+    for chunk in pending_resolve.chunks(8) {
+        for pending in chunk {
+            let reg = Arc::clone(&registry);
+            let scope = pending.scope.clone();
+            let name = pending.name.clone();
+            let version_req = pending.version_req.clone();
+            let realm = pending.realm.clone();
+            let full_name = pending.full_name.clone();
+            resolve_set.spawn(async move {
+                let versions = reg
+                    .fetch_versions(&scope, &name)
+                    .await
+                    .with_context(|| format!("failed to query {scope}/{name}"))?;
+
+                let entry = select_version(&versions, &version_req)
+                    .with_context(|| {
+                        format!("no version of {scope}/{name} satisfies {version_req}")
+                    })?
+                    .clone();
+
+                Ok::<PendingDownload, anyhow::Error>(PendingDownload {
+                    scope,
+                    name,
+                    version: entry.version.clone(),
+                    realm,
+                    full_name,
+                    entry,
+                })
+            });
+        }
+        while let Some(result) = resolve_set.join_next().await {
+            let resolved = result.context("resolve task panicked")??;
+            pending_download.push(resolved);
+        }
+    }
+
+    // ── Phase 3: Download concurrently ───────────────────────────────────
+    let mut download_set = tokio::task::JoinSet::new();
+    let mut downloaded: Vec<Downloaded> = Vec::with_capacity(pending_download.len());
+
+    for chunk in pending_download.chunks(8) {
+        for pd in chunk {
+            let reg = Arc::clone(&registry);
+            let scope = pd.scope.clone();
+            let name = pd.name.clone();
+            let version = pd.version.clone();
+            let realm = pd.realm.clone();
+            let full_name = pd.full_name.clone();
+            let entry = pd.entry.clone();
+            download_set.spawn(async move {
+                let bytes = reg
+                    .download_package(&scope, &name, &version)
+                    .await
+                    .with_context(|| {
+                        format!("failed to download {scope}/{name}@{version}")
+                    })?;
+
+                let checksum = hex_sha256(&bytes);
+                let size_kb = bytes.len() / 1024;
+                eprintln!("  \u{2193} {scope}/{name}@{version} ({size_kb} KB)");
+
+                Ok::<Downloaded, anyhow::Error>(Downloaded {
+                    scope,
+                    name,
+                    version,
+                    realm,
+                    full_name,
+                    entry,
+                    bytes,
+                    checksum,
+                })
+            });
+        }
+        while let Some(result) = download_set.join_next().await {
+            let dl = result.context("download task panicked")??;
+            downloaded.push(dl);
+        }
+    }
+
+    // ── Phase 4: Extract ─────────────────────────────────────────────────
+    let mut installed: u32 = 0;
+
+    for dl in downloaded {
+        // Cache the zip — pass ownership of bytes to avoid cloning.
+        let cache_path = cache::cached_package_path(&dl.checksum)?;
+        let cache_path_for_err = cache_path.clone();
+        let bytes = dl.bytes; // take ownership
+
+        // Write to cache, then read back for extraction to avoid double clone.
+        // Actually, we can write and extract from the same bytes by splitting:
+        // 1) write cache (needs &[u8])
+        // 2) extract (needs &[u8])
+        // Both only need a reference, no clone needed.
+        let dest = packages_dir.join(&dl.scope).join(&dl.name);
+        // Validate dest is inside the packages directory.
+        std::fs::create_dir_all(&dest)?;
+        let canonical_packages = canon_pkg.clone();
+        let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.clone());
+        if !canonical_dest.starts_with(&canonical_packages) {
+            bail!("package path escapes Packages directory");
+        }
+
+        let dest_clone = dest.clone();
+        let scope = dl.scope.clone();
+        let name = dl.name.clone();
+        let version = dl.version.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            // Write to cache
+            std::fs::write(&cache_path, &bytes)
+                .with_context(|| {
+                    format!("failed to write cache file {}", cache_path_for_err.display())
+                })?;
+            // Extract from same bytes — no extra clone
+            extract_zip(&bytes, &dest_clone)
+                .with_context(|| {
+                    format!(
+                        "failed to extract {scope}/{name}@{version} into {}",
+                        dest_clone.display()
+                    )
+                })?;
+            Ok(())
+        })
+        .await
+        .context("extract task panicked")??;
+
+        // Upsert lockfile entry.
+        let full_name = dl.full_name;
+        lockfile.packages.retain(|p| p.name != full_name);
+        lockfile.packages.push(LockedPackage {
+            name: full_name,
+            version: dl.version.clone(),
+            realm: dl.realm,
+            checksum: dl.checksum,
+            source: "wally".to_string(),
+            dependencies: dl
+                .entry
+                .dependencies
+                .iter()
+                .map(|(k, v)| format!("{k}@{v}"))
+                .collect(),
+        });
+
+        installed += 1;
+    }
+
+    // ── Phase 5: Write lockfile ──────────────────────────────────────────
+    // Warn about peer dependencies (not yet resolved).
+    warn_peer_deps(config);
 
     // Write the updated lockfile (skip if no dependencies were processed).
     if !lockfile.packages.is_empty() || total > 0 {
@@ -199,11 +345,30 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
         })?;
     }
 
+    let elapsed = start.elapsed();
+    output::success(&format!(
+        "{} package{} installed in {:.1}s",
+        installed,
+        if installed == 1 { "" } else { "s" },
+        elapsed.as_secs_f64()
+    ));
+
     Ok(InstallReport {
         installed,
         cached,
         total,
+        elapsed,
     })
+}
+
+fn warn_peer_deps(config: &VsyncConfig) {
+    if !config.peer_dependencies.is_empty() {
+        eprintln!(
+            "warning: {} peer dependenc{} declared but not yet resolved (coming in v2)",
+            config.peer_dependencies.len(),
+            if config.peer_dependencies.len() == 1 { "y" } else { "ies" }
+        );
+    }
 }
 
 fn hex_sha256(data: &[u8]) -> String {
