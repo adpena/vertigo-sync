@@ -6,7 +6,9 @@
 pub mod rules;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -43,7 +45,7 @@ impl std::fmt::Display for LintSeverity {
 // Rule registry
 // ---------------------------------------------------------------------------
 
-type RuleFn = fn(&str, &str) -> Vec<LintIssue>;
+type RuleFn = fn(&str, &str, &[bool]) -> Vec<LintIssue>;
 
 /// All built-in rules with their identifiers and check functions.
 const BUILTIN_RULES: &[(&str, RuleFn)] = &[
@@ -69,6 +71,7 @@ pub fn lint_source(
     file: &str,
     rule_config: &BTreeMap<String, String>,
 ) -> Vec<LintIssue> {
+    let comment_map = rules::build_comment_map(source);
     let mut issues = Vec::new();
 
     for &(name, check_fn) in BUILTIN_RULES {
@@ -87,7 +90,7 @@ pub fn lint_source(
             _ => None, // unknown config value — keep rule default
         };
 
-        let mut rule_issues = check_fn(source, file);
+        let mut rule_issues = check_fn(source, file, &comment_map);
 
         if let Some(sev) = severity_override {
             for issue in &mut rule_issues {
@@ -105,31 +108,46 @@ pub fn lint_source(
 ///
 /// `root` is the project root directory. `includes` are relative directory
 /// names within the root (e.g. `["src"]`).
+///
+/// File I/O and linting are parallelised across files using rayon.
 pub fn lint_source_tree(
     root: &Path,
     includes: &[String],
     rule_config: &BTreeMap<String, String>,
 ) -> Vec<LintIssue> {
-    let mut issues = Vec::new();
-
+    // 1. Collect all file paths sequentially.
+    let mut all_files: Vec<PathBuf> = Vec::new();
     for include in includes {
         let dir = root.join(include);
-        if !dir.is_dir() {
-            continue;
+        if dir.is_dir() {
+            collect_file_paths(&dir, &mut all_files);
         }
-        collect_lint_issues(&dir, root, rule_config, &mut issues);
     }
 
-    issues
+    // 2. Read + lint each file in parallel.
+    all_files
+        .par_iter()
+        .flat_map(|path| {
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            let display_path = rel.display().to_string();
+            match std::fs::read_to_string(path) {
+                Ok(source) => lint_source(&source, &display_path, rule_config),
+                Err(e) => vec![LintIssue {
+                    rule: "io-error".to_string(),
+                    severity: LintSeverity::Warning,
+                    message: format!("could not read file: {e}"),
+                    line: 0,
+                    column: 0,
+                    file: display_path,
+                }],
+            }
+        })
+        .collect()
 }
 
-// TODO: extract shared walk_lua_files utility (see also fmt.rs)
-fn collect_lint_issues(
-    dir: &Path,
-    root: &Path,
-    rule_config: &BTreeMap<String, String>,
-    issues: &mut Vec<LintIssue>,
-) {
+/// Recursively collect `.lua` and `.luau` file paths, skipping common
+/// non-source directories.
+fn collect_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -138,29 +156,19 @@ fn collect_lint_issues(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_lint_issues(&path, root, rule_config, issues);
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if matches!(
+                name,
+                ".git" | "node_modules" | "Packages" | "target" | "dist" | "build"
+            ) || name.starts_with('.')
+            {
+                continue;
+            }
+            collect_file_paths(&path, out);
         } else if path.is_file() {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if ext == "lua" || ext == "luau" {
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path);
-                match std::fs::read_to_string(&path) {
-                    Ok(source) => {
-                        let display_path = rel.display().to_string();
-                        issues.extend(lint_source(&source, &display_path, rule_config));
-                    }
-                    Err(e) => {
-                        issues.push(LintIssue {
-                            rule: "io-error".to_string(),
-                            severity: LintSeverity::Warning,
-                            message: format!("could not read file: {e}"),
-                            line: 0,
-                            column: 0,
-                            file: rel.to_string_lossy().to_string(),
-                        });
-                    }
-                }
+                out.push(path);
             }
         }
     }

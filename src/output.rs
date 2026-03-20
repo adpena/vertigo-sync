@@ -7,10 +7,14 @@ use std::io::Write;
 
 /// Returns `true` when color output is enabled (TTY stderr + no `NO_COLOR`).
 fn color_enabled() -> bool {
-    if std::env::var_os("NO_COLOR").is_some() {
-        return false;
-    }
-    supports_color::on(supports_color::Stream::Stderr).is_some()
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        if std::env::var_os("NO_COLOR").is_some() {
+            return false;
+        }
+        supports_color::on(supports_color::Stream::Stderr).is_some()
+    })
 }
 
 /// Print a success line: green checkmark prefix.

@@ -153,35 +153,39 @@ fn line_col_at(source: &str, byte_offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// Returns `true` if the byte offset falls inside a `--` line comment or
-/// a `--[[ ... ]]` block comment.
-///
-/// # Known limitations
-///
-/// - Block comment detection is approximate: it counts `--[[` / `--[=[` opens
-///   and `]]` / `]=]` closes before the offset. Nested or unbalanced delimiters
-///   may produce incorrect results.
-/// - String contents containing `--` may cause false positives for the
-///   line-comment heuristic (e.g. `local s = "foo -- bar"`).
-/// - These are accepted trade-offs of the regex/heuristic-based approach used
-///   throughout this module.
-fn is_in_comment(source: &str, byte_offset: usize) -> bool {
-    // Check if the line containing this offset is a line comment.
-    let line_start = source[..byte_offset]
-        .rfind('\n')
-        .map(|p| p + 1)
-        .unwrap_or(0);
-    let line_prefix = &source[line_start..byte_offset];
-    if line_prefix.contains("--") {
-        // The `--` appears before our match on the same line.
-        return true;
-    }
+// ---------------------------------------------------------------------------
+// Pre-computed comment map
+// ---------------------------------------------------------------------------
 
-    // Rough block-comment check: count `--[[` and `]]` pairs before offset.
-    let before = &source[..byte_offset];
-    let opens = before.matches("--[[").count() + before.matches("--[=[").count();
-    let closes = before.matches("]]").count() + before.matches("]=]").count();
-    opens > closes
+/// Pre-compute a per-line boolean map indicating whether each line is inside
+/// a comment (line comment or block comment). This avoids re-scanning from the
+/// beginning of the source on every comment check.
+pub fn build_comment_map(source: &str) -> Vec<bool> {
+    let mut in_block = false;
+    source
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if in_block {
+                if trimmed.contains("]]") || trimmed.contains("]=]") {
+                    in_block = false;
+                }
+                true
+            } else if trimmed.starts_with("--[[") || trimmed.starts_with("--[=[") {
+                in_block = true;
+                true
+            } else {
+                trimmed.starts_with("--")
+            }
+        })
+        .collect()
+}
+
+/// Check whether a byte offset falls on a comment line according to the
+/// pre-computed comment map.
+fn is_comment_line(source: &str, byte_offset: usize, comment_map: &[bool]) -> bool {
+    let line_idx = source[..byte_offset].matches('\n').count();
+    comment_map.get(line_idx).copied().unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +194,7 @@ fn is_in_comment(source: &str, byte_offset: usize) -> bool {
 
 /// **unused-variable** -- `local x = ...` where `x` never appears again.
 /// Skips `_`-prefixed names and function declarations (`local function`).
-pub fn check_unused_variable(source: &str, file: &str) -> Vec<LintIssue> {
+pub fn check_unused_variable(source: &str, file: &str, comment_map: &[bool]) -> Vec<LintIssue> {
     let mut issues = Vec::new();
 
     for cap in RE_LOCAL_ASSIGN.captures_iter(source) {
@@ -210,7 +214,7 @@ pub fn check_unused_variable(source: &str, file: &str) -> Vec<LintIssue> {
         }
 
         // Skip if inside a comment.
-        if is_in_comment(source, full_match.start()) {
+        if is_comment_line(source, full_match.start(), comment_map) {
             continue;
         }
 
@@ -234,14 +238,14 @@ pub fn check_unused_variable(source: &str, file: &str) -> Vec<LintIssue> {
 }
 
 /// **global-shadow** -- `local game = ...` where `game` is a Roblox global.
-pub fn check_global_shadow(source: &str, file: &str) -> Vec<LintIssue> {
+pub fn check_global_shadow(source: &str, file: &str, comment_map: &[bool]) -> Vec<LintIssue> {
     let mut issues = Vec::new();
 
     for cap in RE_LOCAL_ASSIGN.captures_iter(source) {
         let name = cap.get(1).unwrap();
         let var = name.as_str();
 
-        if is_in_comment(source, cap.get(0).unwrap().start()) {
+        if is_comment_line(source, cap.get(0).unwrap().start(), comment_map) {
             continue;
         }
 
@@ -262,18 +266,39 @@ pub fn check_global_shadow(source: &str, file: &str) -> Vec<LintIssue> {
 }
 
 /// **wait-deprecated** -- bare `wait(` not preceded by `.` or word char.
-pub fn check_wait_deprecated(source: &str, file: &str) -> Vec<LintIssue> {
-    check_deprecated_call(source, file, &RE_WAIT_DEPRECATED, "wait", "wait-deprecated")
+pub fn check_wait_deprecated(source: &str, file: &str, comment_map: &[bool]) -> Vec<LintIssue> {
+    check_deprecated_call(
+        source,
+        file,
+        &RE_WAIT_DEPRECATED,
+        "wait",
+        "wait-deprecated",
+        comment_map,
+    )
 }
 
 /// **spawn-deprecated** -- bare `spawn(` pattern.
-pub fn check_spawn_deprecated(source: &str, file: &str) -> Vec<LintIssue> {
-    check_deprecated_call(source, file, &RE_SPAWN_DEPRECATED, "spawn", "spawn-deprecated")
+pub fn check_spawn_deprecated(source: &str, file: &str, comment_map: &[bool]) -> Vec<LintIssue> {
+    check_deprecated_call(
+        source,
+        file,
+        &RE_SPAWN_DEPRECATED,
+        "spawn",
+        "spawn-deprecated",
+        comment_map,
+    )
 }
 
 /// **delay-deprecated** -- bare `delay(` pattern.
-pub fn check_delay_deprecated(source: &str, file: &str) -> Vec<LintIssue> {
-    check_deprecated_call(source, file, &RE_DELAY_DEPRECATED, "delay", "delay-deprecated")
+pub fn check_delay_deprecated(source: &str, file: &str, comment_map: &[bool]) -> Vec<LintIssue> {
+    check_deprecated_call(
+        source,
+        file,
+        &RE_DELAY_DEPRECATED,
+        "delay",
+        "delay-deprecated",
+        comment_map,
+    )
 }
 
 fn check_deprecated_call(
@@ -282,11 +307,12 @@ fn check_deprecated_call(
     re: &Regex,
     func_name: &str,
     rule_name: &str,
+    comment_map: &[bool],
 ) -> Vec<LintIssue> {
     let mut issues = Vec::new();
 
     for m in re.find_iter(source) {
-        if is_in_comment(source, m.start()) {
+        if is_comment_line(source, m.start(), comment_map) {
             continue;
         }
         let (line, col) = line_col_at(source, m.start());
@@ -306,12 +332,12 @@ fn check_deprecated_call(
 }
 
 /// **empty-block** -- `then\n\s*end` or `do\n\s*end` patterns.
-pub fn check_empty_block(source: &str, file: &str) -> Vec<LintIssue> {
+pub fn check_empty_block(source: &str, file: &str, comment_map: &[bool]) -> Vec<LintIssue> {
     let mut issues = Vec::new();
 
     for re in [&*RE_EMPTY_THEN_END, &*RE_EMPTY_DO_END] {
         for m in re.find_iter(source) {
-            if is_in_comment(source, m.start()) {
+            if is_comment_line(source, m.start(), comment_map) {
                 continue;
             }
             let (line, col) = line_col_at(source, m.start());
@@ -335,11 +361,15 @@ pub fn check_empty_block(source: &str, file: &str) -> Vec<LintIssue> {
 /// as unreachable if it has the **same or deeper** indentation as the terminal
 /// statement. Lines with less indentation are assumed to belong to an outer
 /// scope (e.g. code after `end` closing an `if` block).
-pub fn check_unreachable_code(source: &str, file: &str) -> Vec<LintIssue> {
+pub fn check_unreachable_code(
+    source: &str,
+    file: &str,
+    comment_map: &[bool],
+) -> Vec<LintIssue> {
     let mut issues = Vec::new();
     let lines: Vec<&str> = source.lines().collect();
 
-    // Pre-compute byte offsets for each line start (I11 fix: avoids O(n²)).
+    // Pre-compute byte offsets for each line start (I11 fix: avoids O(n^2)).
     let line_offsets = build_line_offsets(source);
 
     let mut i = 0;
@@ -350,7 +380,9 @@ pub fn check_unreachable_code(source: &str, file: &str) -> Vec<LintIssue> {
             i += 1;
             continue;
         }
-        if RE_RETURN_BREAK.is_match(line) && !is_in_comment(source, line_offsets[i]) {
+        if RE_RETURN_BREAK.is_match(line)
+            && !comment_map.get(i).copied().unwrap_or(false)
+        {
             let terminal_indent = indent_level(line);
 
             // Look at the next non-empty, non-comment line.
