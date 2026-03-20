@@ -159,6 +159,16 @@ pub fn load_config(project_root: &Path) -> Result<Option<VsyncConfig>> {
     Ok(Some(config))
 }
 
+/// Serialize and write a `VsyncConfig` back to `vsync.toml` in the given project root.
+pub fn save_config(project_root: &Path, config: &VsyncConfig) -> Result<()> {
+    let config_path = project_root.join("vsync.toml");
+    let content = toml::to_string_pretty(config)
+        .context("failed to serialize vsync.toml")?;
+    std::fs::write(&config_path, content)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    Ok(())
+}
+
 /// Load vsync.toml, falling back to wally.toml, falling back to defaults.
 /// For now, only vsync.toml is supported; wally.toml fallback will be added in Task 3.
 pub fn load_config_with_fallback(project_root: &Path) -> Result<VsyncConfig> {

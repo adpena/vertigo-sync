@@ -301,18 +301,26 @@ enum Command {
         project: PathBuf,
     },
     /// Add a dependency to vsync.toml.
-    #[command(display_order = 45, hide = true)]
+    #[command(display_order = 45)]
     Add {
-        /// Package spec (e.g., "roblox/roact@^17.0.0")
-        package: String,
+        /// Package spec (e.g., "roblox/roact@^17.0.0") or alias followed by spec
+        package: Vec<String>,
+        /// Add to server-dependencies instead of shared dependencies
+        #[arg(long)]
+        server: bool,
+        /// Add to dev-dependencies instead of shared dependencies
+        #[arg(long)]
+        dev: bool,
         #[arg(long, default_value = "default.project.json")]
         project: PathBuf,
     },
     /// Remove a dependency from vsync.toml.
-    #[command(display_order = 46, hide = true)]
+    #[command(display_order = 46)]
     Remove {
-        /// Package name
+        /// Package alias name to remove
         package: String,
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
     },
     /// Update dependencies.
     #[command(display_order = 47, hide = true)]
@@ -458,12 +466,98 @@ async fn main() -> Result<()> {
             ));
             Ok(())
         }
-        Command::Add { package: _, project: _ } => {
-            output::success("vsync add is coming soon");
+        Command::Add { package, server, dev, project } => {
+            use vertigo_sync::config::{DependencySpec, save_config};
+            use vertigo_sync::package::registry::parse_version_req;
+
+            // Parse positional args: either `<spec>` or `<alias> <spec>`
+            let (alias, spec) = match package.len() {
+                1 => {
+                    let spec = &package[0];
+                    let (_scope, name, _ver) = parse_version_req(spec)
+                        .with_context(|| format!("invalid package spec: {spec}"))?;
+                    (name, spec.clone())
+                }
+                2 => (package[0].clone(), package[1].clone()),
+                _ => bail!("usage: vsync add [<alias>] <spec>  (e.g. vsync add roblox/roact@^17.0.0)"),
+            };
+
+            // Validate the spec parses correctly
+            let (_scope, _name, _ver) = parse_version_req(&spec)
+                .with_context(|| format!("invalid package spec: {spec}"))?;
+
+            let ctx = resolve_project_context(&root, project, &cli.include)?;
+            let mut config = ctx.vsync_config.clone().unwrap_or_default();
+
+            // Add to the appropriate dependency map
+            if *server {
+                config.server_dependencies.insert(alias.clone(), DependencySpec::Simple(spec.clone()));
+                output::success(&format!("added {alias} = \"{spec}\" to [server-dependencies]"));
+            } else if *dev {
+                config.dev_dependencies.insert(alias.clone(), DependencySpec::Simple(spec.clone()));
+                output::success(&format!("added {alias} = \"{spec}\" to [dev-dependencies]"));
+            } else {
+                config.dependencies.insert(alias.clone(), DependencySpec::Simple(spec.clone()));
+                output::success(&format!("added {alias} = \"{spec}\" to [dependencies]"));
+            }
+
+            save_config(&ctx.project_root, &config)?;
+
+            // Run install
+            let report =
+                vertigo_sync::package::installer::install(&ctx.project_root, &config).await?;
+            output::success(&format!(
+                "{} installed, {} cached, {} total",
+                report.installed, report.cached, report.total
+            ));
             Ok(())
         }
-        Command::Remove { package: _ } => {
-            output::success("vsync remove is coming soon");
+        Command::Remove { package, project } => {
+            use vertigo_sync::config::save_config;
+            use vertigo_sync::package::lockfile::Lockfile;
+
+            let ctx = resolve_project_context(&root, project, &cli.include)?;
+            let mut config = ctx.vsync_config.clone().unwrap_or_default();
+
+            let had_shared = config.dependencies.remove(package).is_some();
+            let had_server = config.server_dependencies.remove(package).is_some();
+            let had_dev = config.dev_dependencies.remove(package).is_some();
+
+            if !had_shared && !had_server && !had_dev {
+                bail!("dependency '{package}' not found in vsync.toml");
+            }
+
+            save_config(&ctx.project_root, &config)?;
+
+            // Remove from Packages/ directory
+            let packages_dir = ctx.project_root.join(
+                config.package.packages_dir.as_deref().unwrap_or("Packages"),
+            );
+            // The package could be under any scope, so search for directories named `package`
+            if packages_dir.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&packages_dir) {
+                    for entry in entries.flatten() {
+                        let pkg_path = entry.path().join(package);
+                        if pkg_path.is_dir() {
+                            std::fs::remove_dir_all(&pkg_path).with_context(|| {
+                                format!("failed to remove {}", pkg_path.display())
+                            })?;
+                        }
+                    }
+                }
+            }
+
+            // Update vsync.lock — remove entries whose name ends with /{package}
+            let lock_path = ctx.project_root.join("vsync.lock");
+            if let Some(mut lockfile) = Lockfile::load(&lock_path)? {
+                let suffix = format!("/{package}");
+                lockfile.packages.retain(|p| {
+                    !p.name.ends_with(&suffix) && p.name != *package
+                });
+                lockfile.save(&lock_path)?;
+            }
+
+            output::success(&format!("removed {package}"));
             Ok(())
         }
         Command::Update { package: _, project: _ } => {
