@@ -28,6 +28,6 @@ fn parse_index_entry() {
     assert_eq!(entry.name, "roblox/roact");
     assert_eq!(entry.version, "17.0.1");
     assert_eq!(entry.realm, "shared");
-    assert_eq!(entry.description, "A declarative UI library for Roblox");
+    assert_eq!(entry.description, Some("A declarative UI library for Roblox".to_string()));
     assert_eq!(entry.dependencies.get("roblox/react-lua").unwrap(), "^0.1.0");
 }
