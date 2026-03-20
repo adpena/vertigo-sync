@@ -3165,6 +3165,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "similar",
  "stylua",
  "supports-color",
  "tempfile",

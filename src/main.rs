@@ -1629,12 +1629,10 @@ fn command_fmt(
 fn unified_diff(old: &str, new: &str, file_name: &str) -> String {
     use similar::TextDiff;
     let diff = TextDiff::from_lines(old, new);
-    let udiff = diff
-        .unified_diff()
+    diff.unified_diff()
         .header(&format!("a/{file_name}"), &format!("b/{file_name}"))
         .context_radius(3)
-        .to_string();
-    udiff
+        .to_string()
 }
 
 fn command_plugin_smoke_log(

@@ -156,11 +156,28 @@ Include:
 3. Include tests for new functionality
 4. Run `cargo test` and `cargo clippy` before submitting
 
+## Vision
+
+vsync is designed around the assumption that Roblox projects will continue to grow in scale and complexity. The architecture targets several capabilities that address pain points in large codebases:
+
+- **Streaming edit preview** — Changes are delivered to Studio as incremental diffs over WebSocket, not full-file refreshes. The plugin applies updates within a frame-budgeted loop (4 ms/frame) with instance pooling, so even large batch changes do not cause Studio to hang or drop frames.
+- **Time travel** — The sync server maintains a rolling history of snapshot states. The Studio plugin provides a scrubber UI for stepping backward and forward through recent changes, making it possible to visualize how a change propagated and revert to a prior state without leaving Studio.
+- **Deterministic snapshots** — The same source tree always produces the same SHA-256 fingerprint. This is the foundation for reliable diffing, caching, and CI reproducibility.
+
+These features are built on the same content-addressed snapshot system that powers `vsync serve`, `vsync build`, and `vsync doctor`.
+
 ## Acknowledgments
 
-- [Rojo](https://github.com/rojo-rbx/rojo) for establishing the external-editor workflow for Roblox and defining the project file conventions
-- [rbx-dom](https://github.com/rojo-rbx/rbx-dom) for the Roblox binary format libraries
-- [Selene](https://github.com/Kampfkarren/selene), [StyLua](https://github.com/JohnnyMorganz/StyLua), and [Luau LSP](https://github.com/JohnnyMorganz/luau-lsp) for the broader Roblox tooling ecosystem
+vsync builds on the work and ideas of the Roblox open-source community. This project would not exist without the foundations laid by others.
+
+- **[Rojo](https://github.com/rojo-rbx/rojo)** pioneered the external-editor workflow for Roblox and defined the `default.project.json` conventions that vsync is fully compatible with. The Rojo project and its contributors fundamentally changed how Roblox developers work.
+- **[rbx-dom](https://github.com/rojo-rbx/rbx-dom)** provides the binary and XML serialization libraries that vsync uses for `.rbxl`/`.rbxlx` and `.rbxm` file handling.
+- **[Wally](https://github.com/UpliftGames/wally)** established the package registry and dependency model for the Roblox ecosystem. vsync's package manager is designed for full registry compatibility with Wally.
+- **[Selene](https://github.com/Kampfkarren/selene)** and **[StyLua](https://github.com/JohnnyMorganz/StyLua)** set the standard for Luau linting and formatting. vsync embeds StyLua directly and draws from Selene's rule design.
+- **[Luau LSP](https://github.com/JohnnyMorganz/luau-lsp)** provides the language server experience that vsync supports through sourcemap generation.
+- **[Aftman](https://github.com/LPGhatguy/aftman)** and **[Foreman](https://github.com/Roblox/foreman)** demonstrated the value of toolchain management for Roblox projects.
+
+The Roblox developer community — through open-source frameworks, shared packages, and honest feedback — continues to push these tools forward. vsync aims to contribute to that ecosystem, not replace it.
 
 ## License
 
