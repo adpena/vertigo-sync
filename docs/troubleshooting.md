@@ -203,7 +203,108 @@ The command fails closed on patterns such as:
 - `Write apply permanently failed`
 - `Snapshot sync failed` (excluding known benign localhost connect-fail noise)
 
-## Diagnostic Commands
+## 13. `vsync install` fails with registry error
+
+**Symptom:** `vsync install` exits with a network or registry error.
+
+**Cause:** The Wally registry is unreachable, or the package specification in `vsync.toml` is malformed.
+
+**Fix:**
+
+1. Verify network connectivity to the registry:
+
+```bash
+curl -s https://api.wally.run/v1/package-search?query=roact | head -c 200
+```
+
+2. Check that dependency specs in `vsync.toml` use the correct `scope/name@version-req` format:
+
+```toml
+# Correct
+[dependencies]
+roact = "roblox/roact@^17.0.0"
+
+# Wrong -- missing version requirement
+[dependencies]
+roact = "roblox/roact"
+```
+
+3. If using a custom registry, verify the URL in `[registries]`:
+
+```toml
+[registries]
+custom = "https://packages.example.com"
+```
+
+4. Delete `vsync.lock` and retry to force a clean resolution:
+
+```bash
+rm vsync.lock
+vsync install
+```
+
+## 14. `vsync fmt` produces different output than standalone StyLua
+
+**Symptom:** Running `vsync fmt` and `stylua .` on the same files produces different formatting.
+
+**Cause:** vsync reads formatting options from `[format]` in `vsync.toml`, while standalone StyLua reads from `.stylua.toml` or `stylua.toml`. The two config files may specify different settings.
+
+**Fix:**
+
+1. Compare the effective settings. Check `vsync.toml`:
+
+```bash
+grep -A 10 '\[format\]' vsync.toml
+```
+
+And the StyLua config:
+
+```bash
+cat .stylua.toml 2>/dev/null || cat stylua.toml
+```
+
+2. Align the settings. The mapping between StyLua and vsync config keys:
+
+| StyLua key | vsync.toml key |
+|------------|----------------|
+| `indent_type` | `indent-type` |
+| `indent_width` | `indent-width` |
+| `column_width` | `line-width` |
+| `quote_style` | `quote-style` |
+| `call_parentheses` | `call-parentheses` |
+| `collapse_simple_statement` | `collapse-simple-statement` |
+
+3. If migrating, run `vsync migrate` to auto-convert `stylua.toml` settings into `vsync.toml`.
+
+Note: vsync always formats with Luau syntax mode enabled. If standalone StyLua is configured for a different Lua version, output may differ.
+
+## 15. `vsync validate` reports issues in the Packages/ directory
+
+**Symptom:** `vsync validate` reports lint errors in files under `Packages/`.
+
+**Cause:** The `Packages/` directory is listed as a `$path` in `default.project.json`, so vsync includes it in the validation scan.
+
+**Fix:**
+
+1. Add `Packages/` to `globIgnorePaths` in `default.project.json`:
+
+```json
+{
+  "name": "MyProject",
+  "globIgnorePaths": ["Packages/**"],
+  "tree": { ... }
+}
+```
+
+2. Alternatively, exclude `Packages/` from the include roots by specifying includes explicitly:
+
+```bash
+vsync --include src validate
+```
+
+Third-party package code typically does not conform to the same lint rules as project code. Excluding `Packages/` from validation is the recommended approach.
+
+## Diagnostic commands
 
 ```bash
 # Server health

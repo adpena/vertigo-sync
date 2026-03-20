@@ -1,393 +1,166 @@
-# Vertigo Sync
+# vertigo-sync
 
-Fast, deterministic source sync for Roblox Studio.
+Fast, deterministic source sync and toolchain for Roblox Studio.
 
 ![version](https://img.shields.io/badge/version-0.1.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 
-## Background
-
-[Rojo](https://github.com/rojo-rbx/rojo) pioneered the external-editor workflow for Roblox development. Created by Lucien Greathouse in 2018, it introduced the concept of syncing a filesystem source tree into Roblox Studio via a project file and a companion plugin. Before Rojo, professional Roblox development with version control, external editors, and CI/CD pipelines was impractical. The patterns Rojo established -- `default.project.json`, `init.server.luau` conventions, `.meta.json` sidecars -- are now the de facto standard for the community, and Vertigo Sync adopts them directly.
-
-Vertigo Sync builds on that foundation with a different set of architectural choices. Where Rojo maintains an instance-level DOM tree on the server side, Vertigo Sync uses content-addressed file hashes with SHA-256 fingerprinting. Where Rojo applies all changes in a single Studio frame, Vertigo Sync distributes them across frames within an adaptive budget. These are engineering tradeoffs, not value judgments -- the right tool depends on your project and workflow.
-
-The comparison below is factual. Rojo's numbers are community-reported estimates (Rojo does not publish official benchmarks). Vertigo Sync's numbers are from Criterion benchmark runs on Apple Silicon.
-
-| Dimension | Rojo | Vertigo Sync | Notes |
-|-----------|------|--------------|-------|
-| Cold snapshot (529 files) | ~50-150 ms | 13.5 ms | Different architectures: DOM construction vs file hashing |
-| Cached snapshot (0 changes) | N/A | 9.2 ms | Vertigo Sync caches by mtime/size |
-| Diff computation | Instance-level | 194 us (file-level) | Different granularity |
-| Transport | WebSocket (v7.5+) | WebSocket + SSE + HTTP | Vertigo Sync adds SSE and polling fallbacks |
-| Built-in validation | None (use selene) | Built-in Luau linter | Vertigo Sync includes validation; Rojo defers to external tools |
-| MCP tools | None | Agent-native tools | Vertigo Sync is designed for AI-agent consumption |
-| Time-travel | No | Yes | Navigate sync history |
-| Prometheus metrics | No | Yes | Production observability |
-
-## Behavioral Differences from Rojo
-
-If you are switching from Rojo, be aware of these differences in how the tools behave:
-
-- **Port:** Rojo defaults to 34872; Vertigo Sync defaults to 7575. Both are configurable.
-- **Apply timing:** Rojo applies all pending changes in a single frame. Vertigo Sync spreads them across frames within a 4ms budget. Large changesets feel smoother but may take slightly longer to fully apply.
-- **Rename handling:** When you rename or move a file, Rojo deletes the old instance and creates a new one. Vertigo Sync detects renames via content hash matching and moves the instance in place, preserving references.
-- **Validation:** Vertigo Sync runs its built-in linter on every `validate` call and during `doctor`. It also validates the generated Studio plugin with Luau tooling plus local plugin-safety budgets before install. Rojo does not lint your source -- use selene alongside either tool for comprehensive coverage.
-- **Plugin UI:** Vertigo Sync's DockWidget shows connection state, throughput metrics, time-travel controls, and feature toggles. Rojo's plugin shows a simpler connection panel with a patch visualizer.
-- **Snapshot model:** Rojo tracks instance-level changes in a DOM tree. Vertigo Sync tracks file-level changes via content-addressed hashes. This means Vertigo Sync's diffs are at file granularity, not property granularity.
-
-If you encounter a behavioral difference not listed here, please [file an issue](#contributing) so we can document it.
-
-## Quickstart
-
-```bash
-# Install from this checkout
-cargo install --path .
-
-# Start syncing
-vsync serve
-
-# Serve a nested Roblox project from a monorepo root
-vsync --root . --turbo serve --project roblox/default.project.json
-
-# Install the Studio plugin
-vsync plugin-install
-
-# Scan a Studio log for fatal plugin/runtime smoke failures
-vsync plugin-smoke-log --log ~/Library/Logs/Roblox/latest_Studio_last.log
-
-# Fail if any unexpected user_/cloud_ plugin executed during a hermetic harness run
-vsync plugin-smoke-log --log studio.log \
-  --allow-plugin user_VertigoSyncPlugin.lua \
-  --allow-plugin user_MCPStudioPlugin.rbxm
-
-# Ignore Roblox-managed cloud_ plugin loads but still fail on foreign local user_ plugins
-vsync plugin-smoke-log --log studio.log \
-  --ignore-cloud-plugins \
-  --allow-plugin user_VertigoSyncPlugin.lua \
-  --allow-plugin user_MCPStudioPlugin.rbxm
-```
-
-Open Roblox Studio. On first use, click `Check Connection` once to trust a local `vsync` server. After that, the plugin remembers the last good project identity, reconnects automatically, and refuses ambiguous matches. If multiple local sync servers are running, set `workspace:SetAttribute("VertigoSyncServerUrl", "http://127.0.0.1:<port>")` explicitly.
-
-Use `vsync discover` to print the active project identity and the currently reachable server identity from the CLI. By default it probes the server URL implied by the selected project file's `serveAddress` and `servePort`.
-
 ## Features
 
-- **Low-latency sync** -- 13.5 ms cold snapshot, 9.2 ms cached, 194 us diff
-- **Frame-budgeted Studio plugin** -- never stalls Studio, 4 ms/frame budget with adaptive scaling
-- **Built-in Luau validation** -- catches NCG deopt, strict mode violations, deprecated APIs, and hot-path allocations
-- **Generated plugin safety gate** -- checks compileability, top-level symbol budget, and function-level register-pressure risk before plugin install
-- **Studio smoke log scan** -- catches fatal plugin/runtime signatures like `Out of local registers`, and can optionally enforce a strict external-plugin allowlist for hermetic harness runs
-- **WebSocket + SSE + HTTP** -- triple-transport with automatic fallback and lag recovery
-- **Time-travel** -- rewind and fast-forward through your sync history with a scrubber UI
-- **Agent-native MCP tools** -- full read/write/validate surface for AI-assisted development
-- **Prometheus metrics** -- production observability at `/metrics`
-- **Instance pooling** -- pre-allocated instance pool eliminates GC pressure during sync
-- **Rojo-compatible** -- works with existing `default.project.json` files, no migration required
+- **Source sync** -- Sub-millisecond filesystem-to-Studio synchronization via WebSocket, SSE, or HTTP polling
+- **Package management** -- Wally-compatible registry with lockfile, local cache, and `vsync add`/`remove`/`install`
+- **Built-in linting** -- Configurable Luau lint rules (unused variables, deprecated APIs, NCG deopt, and more), no external tools needed
+- **Built-in formatting** -- Powered by StyLua, integrated into the CLI with `vsync fmt`
+- **Project scaffolding** -- `vsync init` creates a complete, ready-to-go project with `default.project.json` and `vsync.toml`
+- **Migration** -- `vsync migrate` converts existing Rojo + Wally + Selene + StyLua configs into a single `vsync.toml`
+- **Rojo compatible** -- Reads `default.project.json` directly; existing Rojo projects work without changes
 
-## Installation
-
-### From source
+## Quick start
 
 ```bash
+# Install
 cargo install --path .
-```
 
-## Studio Plugin
+# Create a new project
+vsync init --name my-project
+cd my-project
 
-```bash
+# Start the sync server
+vsync serve --turbo
+
+# In Roblox Studio, install the companion plugin
 vsync plugin-install
 ```
 
-The plugin provides:
+Open Roblox Studio. On first use, click **Check Connection** once to trust the local `vsync` server. After that, the plugin reconnects automatically.
 
-- **Real-time sync status** with connection health, transport mode, and throughput metrics
-- **Welcome screen** with setup instructions for first-time users
-- **Toast notifications** for sync events (file counts, errors, reconnections)
-- **Connection state machine** with clear visual states (waiting, connecting, connected, reconnecting, error)
-- **Time-travel scrubber** for navigating sync history with step/jump controls
-- **Feature toggles** for binary models, builders, and time-travel UI
-- **Integrated edit-preview orchestration** via `vertigoSync.editPreview` project config
-- **Persistent settings** across Studio sessions via `plugin:GetSetting()`
-- **Instance pooling** -- 128 pre-allocated instances per class, zero `Instance.new()` in the hot path
-- **Adaptive frame budget** -- dynamically scales apply rate and fetch concurrency based on Studio frame time
-
-Builder execution is disabled by default for safety. Enable the Builders toggle in the plugin only when you explicitly want edit-mode procedural geometry execution.
-
-The canonical Studio plugin source lives in `assets/plugin_src/`. `assets/VertigoSyncPlugin.lua` is generated during Cargo builds and is the single-file artifact installed into Studio.
-Marketplace/source icon assets live in `branding/marketplace/`.
-
-The local Studio plugin deliberately ships with no hardcoded Roblox asset ID for the toolbar icon. For marketplace packaging or local verification with an uploaded asset, set either:
-
-- `workspace:SetAttribute("VertigoSyncToolbarIconAssetId", "rbxassetid://<your-asset-id>")`
-- `plugin:SetSetting("VertigoSyncToolbarIconAssetId", "rbxassetid://<your-asset-id>")`
-
-That keeps OSS installs deterministic and prevents broken toolbar icon fetches from stale asset IDs.
-
-### Plugin Architecture
-
-The plugin runs a 4-stage pipeline on every Heartbeat:
-
-1. **Sync Manager** -- health checks, snapshot reconciliation, WebSocket/poll transport
-2. **Fetch Queue** -- concurrent source fetching with batch requests and retry logic
-3. **Apply Queue** -- frame-budgeted instance creation/update/deletion with coalescing
-4. **Metrics Flush** -- workspace attribute telemetry for external monitoring
-
-## Commands
+## CLI reference
 
 | Command | Description |
 |---------|-------------|
-| `vsync serve` | Start the sync server and auto-discover a unique nested `default.project.json` when needed |
-| `vsync --root path --turbo serve --project path/to/default.project.json` | Serve a project file that lives below the current workspace root |
-| `vsync --turbo serve` | Start with 10 ms FSEvents coalescing (faster sync) |
-| `vsync snapshot` | Print deterministic source tree snapshot |
-| `vsync doctor` | Run determinism and health validation |
-| `vsync validate` | Run Luau source validation |
-| `vsync build -o place.rbxl` | Build a place file from source |
+| `vsync serve` | Start the sync server (HTTP + WebSocket + SSE) |
+| `vsync init` | Create a new project with standard directory structure |
+| `vsync build -o place.rbxl` | Build a `.rbxl` place file from source |
+| `vsync syncback --input place.rbxl` | Extract scripts from a place file back to the filesystem |
+| `vsync sourcemap` | Generate a Rojo-compatible `sourcemap.json` for luau-lsp |
+| `vsync validate` | Run built-in Luau source validation |
+| `vsync fmt` | Format Luau source files (StyLua) |
+| `vsync doctor` | Run determinism and health checks |
+| `vsync install` | Install packages from `vsync.toml` |
+| `vsync add <spec>` | Add a dependency to `vsync.toml` and install it |
+| `vsync remove <name>` | Remove a dependency from `vsync.toml` |
+| `vsync run <name>` | Run a project script defined in `vsync.toml` |
+| `vsync migrate` | Convert Rojo ecosystem configs to `vsync.toml` |
+| `vsync discover` | Print active project and server identity |
 | `vsync plugin-install` | Install the Studio plugin |
-| `vsync plugin-smoke-log --log studio.log` | Fail fast on fatal Studio plugin smoke signatures in a log file |
-| `vsync plugin-smoke-log --log studio.log --allow-plugin user_VertigoSyncPlugin.lua` | Also fail on unexpected `user_` / `cloud_` plugins |
-| `vsync plugin-smoke-log --log studio.log --ignore-cloud-plugins --allow-plugin user_VertigoSyncPlugin.lua` | Fail on unexpected local `user_` plugins while tolerating Roblox-managed `cloud_` plugin loads |
+| `vsync plugin-set-icon <id>` | Set the toolbar icon asset on the installed plugin |
+| `vsync snapshot` | Print deterministic source tree snapshot |
+| `vsync plugin-smoke-log` | Scan a Studio log for fatal plugin failures |
 
-## Migrating from Rojo
-
-Your existing `default.project.json` works as-is. Just change the command:
-
-```bash
-# Before (Rojo)
-rojo serve default.project.json
-
-# After (Vertigo Sync)
-vsync serve
-```
-
-See [Migration Guide](docs/migration-from-rojo.md) for the full walkthrough.
+See [docs/cli.md](docs/cli.md) for the full CLI reference with flags and examples.
 
 ## Configuration
 
-### CLI Flags
+vsync uses two configuration files:
 
-Global options are provided before the subcommand.
+- **`default.project.json`** -- Rojo-compatible DataModel tree structure defining how source directories map to Studio services
+- **`vsync.toml`** -- Package dependencies, lint rules, formatting options, and project scripts
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--root <path>` | `.` | Workspace root used to resolve relative paths |
-| `--state-dir <path>` | `.vertigo-sync-state` | Directory for default snapshot, diff, and event files |
-| `--include <path>` | auto-detected or `src` | Additional include roots (comma-separated or repeated) |
-| `--interval-seconds <n>` | `2` | Polling interval for watch and serve modes |
-| `--port <port>` | `7575` | HTTP/WebSocket port for `serve` |
-| `--address <addr>` | `127.0.0.1` | HTTP bind address for `serve` |
-| `--channel-capacity <n>` | `1024` | Broadcast channel capacity for `serve` and `event` |
-| `--coalesce-ms <n>` | `50` | Event coalescing window in milliseconds |
-| `--turbo` | `false` | Shortcut for 10 ms coalescing and native filesystem watch |
-| `--json` | `false` | Emit machine-readable JSON |
+```toml
+# vsync.toml
+[package]
+name = "my-project"
+version = "0.1.0"
 
-### Project Configuration
+[dependencies]
+roact = "roblox/roact@^17.0.0"
 
-Vertigo Sync reads `default.project.json` in Rojo-compatible format:
+[lint]
+unused-variable = "warn"
+global-shadow = "error"
 
-```json
-{
-  "name": "MyProject",
-  "tree": {
-    "$className": "DataModel",
-    "ServerScriptService": {
-      "$className": "ServerScriptService",
-      "Server": {
-        "$path": "src/Server"
-      }
-    },
-    "StarterPlayer": {
-      "$className": "StarterPlayer",
-      "StarterPlayerScripts": {
-        "$className": "StarterPlayerScripts",
-        "Client": {
-          "$path": "src/Client"
-        }
-      }
-    },
-    "ReplicatedStorage": {
-      "$className": "ReplicatedStorage",
-      "Shared": {
-        "$path": "src/Shared"
-      },
-      "Packages": {
-        "$path": "Packages"
-      }
-    }
-  }
-}
+[format]
+indent-type = "tabs"
+line-width = 120
+
+[scripts]
+test = "lune run tests"
 ```
+
+See [docs/configuration.md](docs/configuration.md) for the full reference.
+
+## Migration from Rojo
+
+Existing `default.project.json` files work as-is:
+
+```bash
+# Before (Rojo + Wally + Selene + StyLua + Aftman)
+rojo serve default.project.json
+
+# After (vsync only)
+vsync serve
+```
+
+To consolidate `wally.toml`, `selene.toml`, and `stylua.toml` into a single `vsync.toml`:
+
+```bash
+vsync migrate
+```
+
+See [docs/migration.md](docs/migration.md) for the full migration guide.
 
 ## Architecture
 
 ```
-filesystem ──► vsync server ──► Studio plugin
-                   │
-                   ├── GET /health
-                   ├── GET /snapshot
-                   ├── GET /diff?since=<hash>
-                   ├── GET /source/<path>
-                   ├── GET /sources
-                   ├── GET /sources/content?paths=<csv>
-                   ├── GET /events (SSE)
-                   ├── GET /ws (WebSocket)
-                   ├── GET /validate
-                   ├── GET /metrics
-                   ├── GET /history?limit=N
-                   ├── GET /snapshot?at=<hash>
-                   ├── GET /config
-                   └── POST /sync/patch
+filesystem --> vsync server --> Studio plugin
+                   |
+                   +-- GET  /health
+                   +-- GET  /snapshot
+                   +-- GET  /diff?since=<hash>
+                   +-- GET  /source/<path>
+                   +-- GET  /sources/content?paths=<csv>
+                   +-- GET  /events         (SSE)
+                   +-- GET  /ws             (WebSocket)
+                   +-- GET  /validate
+                   +-- GET  /metrics        (Prometheus)
+                   +-- GET  /history?limit=N
+                   +-- GET  /config
+                   +-- POST /sync/patch
 ```
 
-**How it works:**
-
-1. `vsync` watches your source tree using native FSEvents (macOS) or inotify (Linux) with configurable coalescing
-2. On each change, it rebuilds a content-addressed snapshot using SHA-256 hashes and mtime/size caching
-3. The Studio plugin connects via WebSocket (primary), SSE (secondary), or HTTP polling (tertiary)
-4. File changes are delivered as diffs, fetched concurrently, and applied within a frame-budgeted loop
-5. The snapshot is deterministic: same source tree always produces the same fingerprint
-
-## Performance
-
-All benchmarks on Apple Silicon, 529-file synthetic Vertigo project:
-
-| Operation | Time |
-|-----------|------|
-| Cold snapshot (529 files) | 13.5 ms |
-| Cached snapshot (0 changes) | 9.2 ms |
-| Cached snapshot (1 change) | 9.9 ms |
-| Cached snapshot (10 changes) | 14.9 ms |
-| Diff computation (20 modified) | 194 us |
-| JSON serialization (529 entries) | 50 us |
-| Source validation (529 files) | 30.6 ms |
-| Health doctor (determinism check) | 60.3 ms |
-
-### Scaling
-
-| Files | Cold Snapshot |
-|-------|---------------|
-| 100 | 3.6 ms |
-| 250 | 6.4 ms |
-| 529 | 10.6 ms |
-| 1000 | 290 ms |
-
-Scaling is roughly linear at ~20 us/file up to the ~500 file range.
-
-## API Reference
-
-### HTTP Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Server health probe |
-| `/snapshot` | GET | Full deterministic snapshot with file hashes; supports exact historical lookup via `?at=<hash>` |
-| `/diff?since=<hash>` | GET | Incremental diff since a previous snapshot |
-| `/source/<path>` | GET | Raw source file content (SHA-256 in `X-SHA256` header) |
-| `/sources` | GET | File listing with paths and hashes |
-| `/sources/content?paths=<csv>` | GET | Batch source content fetch |
-| `/events` | GET | SSE stream of sync events |
-| `/ws` | GET | WebSocket (bidirectional, lag recovery) |
-| `/validate` | GET | Luau lint report |
-| `/metrics` | GET | Prometheus metrics |
-| `/history?limit=N` | GET | Recent sync history entries |
-| `/config` | GET | Server configuration |
-| `/sync/patch` | POST | Apply patches (Studio to disk) |
-
-### WebSocket Messages
-
-| Type | Direction | Description |
-|------|-----------|-------------|
-| `connected` | Server to Client | Initial connection with current fingerprint |
-| `sync_diff` | Server to Client | File changes with paths and hashes |
-| `lagged` | Server to Client | Client fell behind; triggers snapshot resync |
-
-### Patch Ack/Reject
-
-All patch operations return deterministic ack/reject envelopes with structured reason codes:
-
-`ok`, `hash_mismatch`, `sequence_gap`, `path_out_of_scope`, `class_mismatch`, `missing_source`, `apply_budget_exceeded`, `stale_snapshot`, `auth_failed`, `transport_unavailable`, `internal_error`
-
-## MCP Tools
-
-Vertigo Sync exposes agent-native MCP tools for source manipulation. See the [Agent DSL Reference](../../docs/vertigo-sync-agent-dsl.md) for the full catalog.
-
-### Categories
-
-| Category | Tools | Description |
-|----------|-------|-------------|
-| **Read** | 14 | `vsync_health`, `vsync_snapshot`, `sync_snapshot`, `vsync_diff`, `vsync_source`, `vsync_grep`, ... |
-| **Write** | 5 | `vsync_write`, `vsync_patch`, `vsync_delete`, `vsync_move`, `vsync_mkdir` |
-| **Validate** | 3 | `vsync_validate`, `vsync_validate_content`, `vsync_check_conflict` |
-| **Pipeline** | 3 | `vsync_safe_write`, `vsync_describe_changes`, `vsync_pipeline` |
-| **Observe** | 4 | `vsync_metrics`, `vsync_doctor`, `vsync_status`, `vsync_events` |
-| **Bridge** | 3 | `vsync_bridge_manifest`, `vsync_bridge_execute`, `vsync_bridge_batch` |
-
-### Example: Agent Workflow
-
-```
-vsync_source("src/Server/Services/DataService.luau")   # Read
-  -> vsync_validate_content(path, new_content)          # Lint in-memory
-  -> vsync_safe_write(path, new_content)                # Atomic write
-  -> vsync_describe_changes(since_hash)                 # Summary
-```
-
-## Validation Rules
-
-The built-in Luau validator checks rules across these categories:
-
-- **Strict mode** -- missing `--!strict` directive
-- **NCG optimization** -- missing `@native` on hot-path functions, closures in loops
-- **Deprecated APIs** -- usage of deprecated Roblox APIs
-- **Hot-path allocations** -- `Instance.new()` in Heartbeat/RenderStepped callbacks
-- **Cross-boundary requires** -- invalid require paths across service boundaries
-- **Performance patterns** -- `gmatch`/`gsub` in hot paths, non-SIMD vector math
+1. `vsync` watches the source tree using native FSEvents (macOS) or inotify (Linux) with configurable coalescing.
+2. On each change, it rebuilds a content-addressed snapshot using SHA-256 hashes and mtime/size caching.
+3. The Studio plugin connects via WebSocket (primary), SSE (secondary), or HTTP polling (tertiary).
+4. File changes are delivered as diffs, fetched concurrently, and applied within a frame-budgeted loop (4 ms/frame).
+5. The snapshot is deterministic: the same source tree always produces the same fingerprint.
 
 ## Contributing
 
-Feedback and contributions are welcome. This project is early and benefits enormously from real-world usage reports.
+Feedback and contributions are welcome.
 
-### Filing Bug Reports
+### Filing bug reports
 
-Good bug reports help us fix issues quickly. Please include:
+Include:
 
-1. **What you expected to happen** and **what actually happened**
-2. **Steps to reproduce** -- the exact commands you ran, the project structure, and the Studio version
-3. **Your environment** -- OS, `vsync --version`, Roblox Studio version
-4. **Logs** -- Studio Output window (filter by `[VertigoSync]`) and terminal output from `vsync serve`
-5. **Your `default.project.json`** (or a minimal version that reproduces the issue)
+1. What you expected and what actually happened
+2. Steps to reproduce -- exact commands, project structure, Studio version
+3. Environment -- OS, `vsync --version`, Studio version
+4. Logs -- Studio Output (filter by `[VertigoSync]`) and terminal output from `vsync serve`
+5. Output of `vsync doctor`
 
-If the issue involves sync behavior, running `vsync doctor` and including the output is very helpful.
-
-### Requesting Features
-
-Feature requests should describe the **problem you are trying to solve**, not just the solution you have in mind. We may already have a different approach planned, or the feature may interact with other parts of the system in ways that aren't obvious. Include:
-
-1. **The use case** -- what are you building and what's blocking you?
-2. **Current workaround** -- how do you handle this today?
-3. **Proposed behavior** -- what would the ideal outcome look like?
-
-### Pull Requests
-
-If you want to contribute code:
+### Pull requests
 
 1. Open an issue first to discuss the approach
 2. Keep changes focused -- one feature or fix per PR
 3. Include tests for new functionality
 4. Run `cargo test` and `cargo clippy` before submitting
-5. Follow existing code patterns (doc comments, error handling style)
-
-### Code of Conduct
-
-Be kind. This is a community project. Treat other contributors with respect.
 
 ## Acknowledgments
 
-- [Rojo](https://github.com/rojo-rbx/rojo) and Lucien Greathouse for establishing the external-editor workflow for Roblox and defining the project file conventions that Vertigo Sync builds on
-- The [rbx-dom](https://github.com/rojo-rbx/rbx-dom) ecosystem (rbx_binary, rbx_xml, rbx_dom_weak) for the Roblox binary format libraries
-- [Selene](https://github.com/Kampfkarren/selene), [StyLua](https://github.com/JohnnyMorganz/StyLua), and [Luau LSP](https://github.com/JohnnyMorganz/luau-lsp) for the broader Roblox developer tooling ecosystem
-- The Roblox open-source community for patterns, conventions, and feedback
+- [Rojo](https://github.com/rojo-rbx/rojo) for establishing the external-editor workflow for Roblox and defining the project file conventions
+- [rbx-dom](https://github.com/rojo-rbx/rbx-dom) for the Roblox binary format libraries
+- [Selene](https://github.com/Kampfkarren/selene), [StyLua](https://github.com/JohnnyMorganz/StyLua), and [Luau LSP](https://github.com/JohnnyMorganz/luau-lsp) for the broader Roblox tooling ecosystem
 
 ## License
 
