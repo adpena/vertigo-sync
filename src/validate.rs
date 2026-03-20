@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
 
+use crate::GlobIgnoreSet;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -30,6 +32,41 @@ pub struct ValidationReport {
     pub clean: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginSafetyIssue {
+    pub severity: String,
+    pub rule: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginFunctionRiskFinding {
+    pub name: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub parameter_count: usize,
+    pub local_binding_count: usize,
+    pub nested_closure_count: usize,
+    pub line_span: usize,
+    pub risk_score: usize,
+    pub hard_fail: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginSafetyReport {
+    pub path: String,
+    pub compile_tool_available: bool,
+    pub compile_ok: bool,
+    pub analyze_tool_available: bool,
+    pub analyze_ok: bool,
+    pub top_level_symbol_count: usize,
+    pub top_level_symbol_budget: usize,
+    pub function_risk_findings: Vec<PluginFunctionRiskFinding>,
+    pub warnings: Vec<PluginSafetyIssue>,
+    pub errors: Vec<PluginSafetyIssue>,
+    pub clean: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Rule names
 // ---------------------------------------------------------------------------
@@ -47,9 +84,16 @@ const RULE_PERF_DYNAMIC_ARRAY: &str = "perf-dynamic-array";
 const RULE_PERF_UNFROZEN_CONSTANT: &str = "perf-unfrozen-constant";
 const RULE_PERF_MISSING_NATIVE: &str = "perf-missing-native";
 const RULE_PERF_PCALL_IN_NATIVE: &str = "perf-pcall-in-native";
+const RULE_PLUGIN_COMPILE: &str = "plugin-compile";
+const RULE_PLUGIN_ANALYZE: &str = "plugin-analyze";
+const RULE_PLUGIN_TOOL_MISSING: &str = "plugin-tool-missing";
+const RULE_PLUGIN_TOP_LEVEL_BUDGET: &str = "plugin-top-level-budget";
+const RULE_PLUGIN_FUNCTION_RISK: &str = "plugin-function-risk";
 
 /// Large file threshold (lines).
 const LARGE_FILE_LINES: usize = 500;
+const PLUGIN_TOP_LEVEL_SYMBOL_BUDGET: usize = 189;
+const PLUGIN_FUNCTION_RISK_HARD_FAIL: usize = 90;
 
 /// Function name fragments that indicate a hot-path context.
 const HOT_PATH_FN_NAMES: &[&str] = &[
@@ -68,16 +112,25 @@ const HOT_PATH_FN_NAMES: &[&str] = &[
 
 /// Validate all `.luau` files under the given include roots.
 pub fn validate_source(root: &Path, includes: &[String]) -> Result<ValidationReport> {
+    validate_source_with_ignores(root, includes, &[])
+}
+
+pub fn validate_source_with_ignores(
+    root: &Path,
+    includes: &[String],
+    ignore_globs: &[String],
+) -> Result<ValidationReport> {
     let resolved = crate::resolve_includes(includes);
     let mut issues: Vec<ValidationIssue> = Vec::new();
     let mut files_checked: usize = 0;
+    let ignores = GlobIgnoreSet::new(ignore_globs);
 
     for inc in &resolved {
         let inc_path = root.join(inc);
         if !inc_path.exists() {
             continue;
         }
-        walk_and_validate(&inc_path, root, &mut files_checked, &mut issues)?;
+        walk_and_validate(&inc_path, root, &ignores, &mut files_checked, &mut issues)?;
     }
 
     let errors = issues.iter().filter(|i| i.severity == "error").count();
@@ -166,11 +219,103 @@ pub fn run_selene(root: &Path, includes: &[String]) -> Option<Vec<String>> {
     Some(lines)
 }
 
+pub fn validate_plugin_source_text(path: &str, content: &str) -> Result<PluginSafetyReport> {
+    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
+
+    let compile = run_luau_tool("luau-compile", &[], content)?;
+    if !compile.available {
+        warnings.push(PluginSafetyIssue {
+            severity: "warning".to_string(),
+            rule: RULE_PLUGIN_TOOL_MISSING.to_string(),
+            message: "luau-compile is not available on PATH; compile validation skipped"
+                .to_string(),
+        });
+    } else if !compile.success {
+        errors.push(PluginSafetyIssue {
+            severity: "error".to_string(),
+            rule: RULE_PLUGIN_COMPILE.to_string(),
+            message: format!(
+                "luau-compile failed for generated plugin: {}",
+                first_non_empty_line(&compile.output).unwrap_or("unknown compiler failure")
+            ),
+        });
+    }
+
+    let analyze = run_luau_tool("luau-analyze", &["--formatter=plain"], content)?;
+    if !analyze.available {
+        warnings.push(PluginSafetyIssue {
+            severity: "warning".to_string(),
+            rule: RULE_PLUGIN_TOOL_MISSING.to_string(),
+            message: "luau-analyze is not available on PATH; analyzer validation skipped"
+                .to_string(),
+        });
+    } else if !analyze.success {
+        errors.push(PluginSafetyIssue {
+            severity: "error".to_string(),
+            rule: RULE_PLUGIN_ANALYZE.to_string(),
+            message: format!(
+                "luau-analyze failed for generated plugin: {}",
+                first_non_empty_line(&analyze.output).unwrap_or("unknown analyzer failure")
+            ),
+        });
+    }
+
+    let top_level_symbol_count = count_plugin_top_level_symbols(content);
+    if top_level_symbol_count > PLUGIN_TOP_LEVEL_SYMBOL_BUDGET {
+        errors.push(PluginSafetyIssue {
+            severity: "error".to_string(),
+            rule: RULE_PLUGIN_TOP_LEVEL_BUDGET.to_string(),
+            message: format!(
+                "generated plugin has {top_level_symbol_count} top-level symbols; budget is {}",
+                PLUGIN_TOP_LEVEL_SYMBOL_BUDGET
+            ),
+        });
+    }
+
+    let function_risk_findings = plugin_function_risk_findings(content);
+    for finding in &function_risk_findings {
+        if finding.hard_fail {
+            errors.push(PluginSafetyIssue {
+                severity: "error".to_string(),
+                rule: RULE_PLUGIN_FUNCTION_RISK.to_string(),
+                message: format!(
+                    "function `{}` lines {}-{} risk score {} exceeds plugin safety threshold {}",
+                    finding.name,
+                    finding.start_line,
+                    finding.end_line,
+                    finding.risk_score,
+                    PLUGIN_FUNCTION_RISK_HARD_FAIL
+                ),
+            });
+        }
+    }
+
+    let clean = errors.is_empty();
+
+    Ok(PluginSafetyReport {
+        path: path.to_string(),
+        compile_tool_available: compile.available,
+        compile_ok: compile.available && compile.success,
+        analyze_tool_available: analyze.available,
+        analyze_ok: analyze.available && analyze.success,
+        top_level_symbol_count,
+        top_level_symbol_budget: PLUGIN_TOP_LEVEL_SYMBOL_BUDGET,
+        function_risk_findings,
+        warnings,
+        errors,
+        clean,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Individual checks
 // ---------------------------------------------------------------------------
 
 fn check_strict_mode(path: &str, lines: &[&str], issues: &mut Vec<ValidationIssue>) {
+    if !path.ends_with(".luau") {
+        return;
+    }
     if lines.is_empty() || lines[0].trim() != "--!strict" {
         issues.push(ValidationIssue {
             path: path.to_string(),
@@ -870,6 +1015,81 @@ fn is_hot_path_function(line: &str) -> bool {
     HOT_PATH_FN_NAMES.iter().any(|name| line.contains(name))
 }
 
+#[derive(Debug)]
+struct ToolRunResult {
+    available: bool,
+    success: bool,
+    output: String,
+}
+
+#[derive(Debug, Clone)]
+struct FunctionFrame {
+    name: String,
+    start_line: usize,
+    depth: isize,
+    parameter_count: usize,
+    local_binding_count: usize,
+    nested_closure_count: usize,
+}
+
+fn which_tool(name: &str) -> Option<String> {
+    Command::new("which").arg(name).output().ok().and_then(|o| {
+        if o.status.success() {
+            let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !path.is_empty() { Some(path) } else { None }
+        } else {
+            None
+        }
+    })
+}
+
+fn run_luau_tool(tool_name: &str, args: &[&str], content: &str) -> Result<ToolRunResult> {
+    let Some(tool_path) = which_tool(tool_name) else {
+        return Ok(ToolRunResult {
+            available: false,
+            success: false,
+            output: String::new(),
+        });
+    };
+
+    let temp_path = std::env::temp_dir().join(format!(
+        "vertigo-sync-plugin-{}-{}.luau",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&temp_path, content)
+        .with_context(|| format!("failed to write temp file for {tool_name}"))?;
+
+    let output = Command::new(&tool_path)
+        .args(args)
+        .arg(&temp_path)
+        .output()
+        .with_context(|| format!("failed to run {tool_name}"))?;
+
+    let _ = std::fs::remove_file(&temp_path);
+
+    let combined = format!(
+        "{}{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        if output.stdout.is_empty() || output.stderr.is_empty() {
+            ""
+        } else {
+            "\n"
+        },
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    Ok(ToolRunResult {
+        available: true,
+        success: output.status.success(),
+        output: combined.trim().to_string(),
+    })
+}
+
+fn first_non_empty_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
 /// Find selene on PATH.
 fn which_selene() -> Option<String> {
     // Check common locations first.
@@ -897,6 +1117,249 @@ fn which_selene() -> Option<String> {
         })
 }
 
+fn count_plugin_top_level_symbols(source: &str) -> usize {
+    let mut count = 0usize;
+    let mut depth = 0isize;
+
+    for line in source.lines() {
+        let trimmed = strip_line_comment(line).trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let is_top_level = depth == 0;
+        if is_top_level {
+            if trimmed.starts_with("type ") || trimmed.starts_with("local function ") {
+                count += 1;
+            } else if let Some(local_count) = top_level_local_binding_count(trimmed) {
+                count += local_count;
+            }
+        }
+
+        depth += block_depth_delta(trimmed);
+        if depth < 0 {
+            depth = 0;
+        }
+    }
+
+    count
+}
+
+fn plugin_function_risk_findings(source: &str) -> Vec<PluginFunctionRiskFinding> {
+    let mut findings = Vec::new();
+    let mut stack: Vec<FunctionFrame> = Vec::new();
+
+    for (index, raw_line) in source.lines().enumerate() {
+        let line_no = index + 1;
+        let trimmed = strip_line_comment(raw_line).trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some((name, parameter_count)) = parse_function_start(trimmed, line_no) {
+            if let Some(parent) = stack.last_mut() {
+                parent.nested_closure_count += 1;
+            }
+
+            let mut frame = FunctionFrame {
+                name,
+                start_line: line_no,
+                depth: 0,
+                parameter_count,
+                local_binding_count: 0,
+                nested_closure_count: 0,
+            };
+            frame.depth += block_depth_delta(trimmed);
+            if frame.depth <= 0 {
+                frame.depth = 1;
+            }
+            stack.push(frame);
+            continue;
+        }
+
+        if let Some(frame) = stack.last_mut() {
+            frame.local_binding_count += local_binding_count(trimmed);
+            frame.depth += block_depth_delta(trimmed);
+        }
+
+        while stack.last().is_some_and(|frame| frame.depth <= 0) {
+            let frame = stack.pop().expect("frame exists");
+            let line_span = line_no.saturating_sub(frame.start_line) + 1;
+            let risk_score = frame.parameter_count
+                + frame.local_binding_count
+                + (frame.nested_closure_count * 12)
+                + (line_span / 20);
+            findings.push(PluginFunctionRiskFinding {
+                name: frame.name,
+                start_line: frame.start_line,
+                end_line: line_no,
+                parameter_count: frame.parameter_count,
+                local_binding_count: frame.local_binding_count,
+                nested_closure_count: frame.nested_closure_count,
+                line_span,
+                risk_score,
+                hard_fail: risk_score >= PLUGIN_FUNCTION_RISK_HARD_FAIL,
+            });
+        }
+    }
+
+    findings.sort_by(|a, b| b.risk_score.cmp(&a.risk_score));
+    findings
+}
+
+fn parse_function_start(line: &str, line_no: usize) -> Option<(String, usize)> {
+    let name = if let Some(rest) = line.strip_prefix("local function ") {
+        rest.split('(').next()?.trim().to_string()
+    } else if let Some(rest) = line.strip_prefix("function ") {
+        rest.split('(').next()?.trim().to_string()
+    } else if let Some((lhs, rhs)) = line.split_once('=') {
+        let rhs_trimmed = rhs.trim_start();
+        if rhs_trimmed.starts_with("function(") || rhs_trimmed.starts_with("function (") {
+            lhs.trim()
+                .strip_prefix("local ")
+                .unwrap_or(lhs.trim())
+                .to_string()
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let parameter_count = line
+        .split_once('(')
+        .and_then(|(_, tail)| tail.split_once(')'))
+        .map(|(params, _)| count_parameters(params))
+        .unwrap_or(0);
+
+    Some((
+        if name.is_empty() {
+            format!("<anonymous@{line_no}>")
+        } else {
+            name
+        },
+        parameter_count,
+    ))
+}
+
+fn count_parameters(params: &str) -> usize {
+    params
+        .split(',')
+        .map(str::trim)
+        .filter(|param| !param.is_empty())
+        .count()
+}
+
+fn local_binding_count(line: &str) -> usize {
+    if line.starts_with("local function ") {
+        return 0;
+    }
+    top_level_local_binding_count(line).unwrap_or(0)
+}
+
+fn top_level_local_binding_count(line: &str) -> Option<usize> {
+    if !line.starts_with("local ") || line.starts_with("local function ") {
+        return None;
+    }
+
+    let body = &line["local ".len()..];
+    let stop = body.find('=').unwrap_or(body.len());
+    let names = &body[..stop];
+    Some(
+        names
+            .split(',')
+            .map(str::trim)
+            .map(|name| name.split(':').next().unwrap_or("").trim())
+            .filter(|name| !name.is_empty())
+            .count(),
+    )
+}
+
+fn strip_line_comment(line: &str) -> &str {
+    if let Some((prefix, _)) = line.split_once("--") {
+        prefix
+    } else {
+        line
+    }
+}
+
+fn block_depth_delta(line: &str) -> isize {
+    let mut delta = 0isize;
+
+    if contains_standalone_keyword(line, "function") {
+        delta += count_keyword_occurrences(line, "function") as isize;
+    }
+
+    if opens_if_block(line) {
+        delta += 1;
+    }
+    if opens_for_block(line) {
+        delta += 1;
+    }
+    if opens_while_block(line) {
+        delta += 1;
+    }
+    if opens_repeat_block(line) {
+        delta += 1;
+    }
+    if opens_do_block(line) {
+        delta += 1;
+    }
+
+    delta -= count_keyword_occurrences(line, "end") as isize;
+    delta -= count_keyword_occurrences(line, "until") as isize;
+    delta
+}
+
+fn count_keyword_occurrences(line: &str, keyword: &str) -> usize {
+    let mut count = 0usize;
+    let mut start = 0usize;
+    while let Some(pos) = line[start..].find(keyword) {
+        let abs = start + pos;
+        if is_keyword_boundary(line, abs, keyword.len()) {
+            count += 1;
+        }
+        start = abs + keyword.len();
+    }
+    count
+}
+
+fn contains_standalone_keyword(line: &str, keyword: &str) -> bool {
+    count_keyword_occurrences(line, keyword) > 0
+}
+
+fn is_keyword_boundary(line: &str, start: usize, len: usize) -> bool {
+    let before = line[..start].chars().next_back();
+    let after = line[start + len..].chars().next();
+    let before_ok = before.is_none_or(|c| !is_identifier_char(c));
+    let after_ok = after.is_none_or(|c| !is_identifier_char(c));
+    before_ok && after_ok
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn opens_if_block(line: &str) -> bool {
+    line.starts_with("if ") && line.contains(" then")
+}
+
+fn opens_for_block(line: &str) -> bool {
+    line.starts_with("for ") && line.contains(" do")
+}
+
+fn opens_while_block(line: &str) -> bool {
+    line.starts_with("while ") && line.contains(" do")
+}
+
+fn opens_repeat_block(line: &str) -> bool {
+    line.starts_with("repeat")
+}
+
+fn opens_do_block(line: &str) -> bool {
+    line == "do"
+}
+
 fn should_skip_selene_include(include: &str) -> bool {
     let normalized = include.replace('\\', "/");
     let normalized = normalized.trim_start_matches("./");
@@ -910,6 +1373,7 @@ fn selene_skip_note() -> String {
 fn walk_and_validate(
     dir: &Path,
     root: &Path,
+    ignores: &GlobIgnoreSet,
     files_checked: &mut usize,
     issues: &mut Vec<ValidationIssue>,
 ) -> Result<()> {
@@ -933,7 +1397,7 @@ fn walk_and_validate(
             ) {
                 continue;
             }
-            walk_and_validate(&entry.path(), root, files_checked, issues)?;
+            walk_and_validate(&entry.path(), root, ignores, files_checked, issues)?;
             continue;
         }
 
@@ -952,6 +1416,9 @@ fn walk_and_validate(
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
+        if ignores.is_ignored(&rel) {
+            continue;
+        }
 
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
@@ -1172,6 +1639,33 @@ mod tests {
     }
 
     #[test]
+    fn strict_mode_not_required_for_lua_files() {
+        let issues = validate_file_content("src/Server/Foo.lua", "local x = 1\nreturn x\n");
+        assert!(
+            !issues.iter().any(|i| i.rule == RULE_STRICT_MODE),
+            "plain .lua files should not be forced into --!strict"
+        );
+    }
+
+    #[test]
+    fn validate_source_honors_ignore_globs() {
+        let root = tempdir().expect("tempdir");
+        let src = root.path().join("src");
+        fs::create_dir_all(src.join("generated")).expect("mkdir generated");
+        fs::write(src.join("Good.luau"), "--!strict\nreturn {}\n").expect("write good");
+        fs::write(src.join("generated/Legacy.lua"), "return 1\n").expect("write ignored");
+
+        let includes = vec!["src".to_string()];
+        let ignores = vec!["src/generated/**".to_string()];
+        let report =
+            validate_source_with_ignores(root.path(), &includes, &ignores).expect("validate");
+        assert!(
+            report.clean,
+            "ignored generated paths should not contribute errors"
+        );
+    }
+
+    #[test]
     fn validate_file_content_returns_empty_for_clean() {
         let content = "--!strict\nlocal x = os.clock()\ntask.wait(0.1)\nreturn x\n";
         let issues = validate_file_content("src/Server/Clean.luau", content);
@@ -1384,6 +1878,82 @@ mod tests {
         assert!(
             issues.iter().any(|i| i.rule == RULE_PERF_PCALL_IN_NATIVE),
             "should flag xpcall in native function"
+        );
+    }
+
+    #[test]
+    fn plugin_safety_counts_top_level_symbols() {
+        let content = "\
+--!strict
+local A = 1
+local B, C = 2, 3
+local function helper()
+\treturn A + B + C
+end
+
+return helper
+";
+        assert_eq!(count_plugin_top_level_symbols(content), 4);
+    }
+
+    #[test]
+    fn plugin_safety_flags_register_heavy_function() {
+        let content = "\
+--!strict
+local function tooHeavy(a, b, c, d, e, f, g, h)
+\tlocal l01, l02, l03, l04, l05 = 1, 2, 3, 4, 5
+\tlocal l06, l07, l08, l09, l10 = 6, 7, 8, 9, 10
+\tlocal l11, l12, l13, l14, l15 = 11, 12, 13, 14, 15
+\tlocal l16, l17, l18, l19, l20 = 16, 17, 18, 19, 20
+\tlocal l21, l22, l23, l24, l25 = 21, 22, 23, 24, 25
+\tlocal l26, l27, l28, l29, l30 = 26, 27, 28, 29, 30
+\tlocal l31, l32, l33, l34, l35 = 31, 32, 33, 34, 35
+\tlocal l36, l37, l38, l39, l40 = 36, 37, 38, 39, 40
+\tlocal l41, l42, l43, l44, l45 = 41, 42, 43, 44, 45
+\tlocal l46, l47, l48, l49, l50 = 46, 47, 48, 49, 50
+\tlocal l51, l52, l53, l54, l55 = 51, 52, 53, 54, 55
+\tlocal l56, l57, l58, l59, l60 = 56, 57, 58, 59, 60
+\tlocal function nestedOne()
+\t\treturn l01 + l02 + l03
+\tend
+\tlocal function nestedTwo()
+\t\treturn nestedOne() + l20
+\tend
+\treturn nestedTwo() + a + b + c + d + e + f + g + h
+end
+
+return tooHeavy
+";
+        let findings = plugin_function_risk_findings(content);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.name == "tooHeavy" && finding.risk_score > 0),
+            "expected heavy function to produce a non-zero risk score"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.name == "tooHeavy" && finding.hard_fail),
+            "expected heavy function to exceed the hard-fail threshold"
+        );
+    }
+
+    #[test]
+    fn plugin_safety_accepts_small_function() {
+        let content = "\
+--!strict
+local function small(x)
+\tlocal doubled = x * 2
+\treturn doubled + 1
+end
+
+return small
+";
+        let findings = plugin_function_risk_findings(content);
+        assert!(
+            findings.iter().all(|finding| !finding.hard_fail),
+            "small helper functions should stay below the hard-fail threshold"
         );
     }
 }

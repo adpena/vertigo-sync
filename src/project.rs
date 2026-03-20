@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 // ---------------------------------------------------------------------------
 
 /// Parsed project tree with resolved filesystem-to-instance mappings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectTree {
     pub name: String,
     pub project_id: String,
@@ -46,7 +46,7 @@ fn default_true() -> bool {
 }
 
 /// A single filesystem path mapped to a Roblox DataModel instance path.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PathMapping {
     /// Filesystem path relative to project root, e.g. `"src/Server"`.
     pub fs_path: String,
@@ -64,18 +64,54 @@ pub struct PathMapping {
     pub attributes: Option<BTreeMap<String, serde_json::Value>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct VertigoSyncConfig {
     #[serde(default)]
     pub builders: VertigoSyncBuildersConfig,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "editPreview"
+    )]
+    pub edit_preview: Option<VertigoSyncEditPreviewConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct VertigoSyncBuildersConfig {
     #[serde(default)]
     pub roots: Vec<String>,
     #[serde(rename = "dependencyRoots", default)]
     pub dependency_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct VertigoSyncEditPreviewConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(rename = "builderModulePath")]
+    pub builder_module_path: String,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "builderMethod"
+    )]
+    pub builder_method: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default, rename = "watchRoots")]
+    pub watch_roots: Vec<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "debounceSeconds"
+    )]
+    pub debounce_seconds: Option<f64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "rootRefreshSeconds"
+    )]
+    pub root_refresh_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mode: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +158,8 @@ struct RawTreeNode {
 struct RawVertigoSyncConfig {
     #[serde(default)]
     builders: RawVertigoSyncBuildersConfig,
+    #[serde(rename = "editPreview", default)]
+    edit_preview: Option<RawVertigoSyncEditPreviewConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -130,6 +168,24 @@ struct RawVertigoSyncBuildersConfig {
     roots: Vec<String>,
     #[serde(rename = "dependencyRoots", default)]
     dependency_roots: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawVertigoSyncEditPreviewConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(rename = "builderModulePath", default)]
+    builder_module_path: Option<String>,
+    #[serde(rename = "builderMethod", default)]
+    builder_method: Option<String>,
+    #[serde(rename = "watchRoots", default)]
+    watch_roots: Vec<String>,
+    #[serde(rename = "debounceSeconds", default)]
+    debounce_seconds: Option<f64>,
+    #[serde(rename = "rootRefreshSeconds", default)]
+    root_refresh_seconds: Option<f64>,
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +261,33 @@ fn parse_project_str(content: &str, source_path: &Path) -> Result<ProjectTree> {
                     .map(|path| normalize_fs_path(&path))
                     .collect(),
             },
+            edit_preview: config.edit_preview.and_then(|edit_preview| {
+                match edit_preview.builder_module_path {
+                    Some(builder_module_path) if !builder_module_path.trim().is_empty() => {
+                        Some(VertigoSyncEditPreviewConfig {
+                            enabled: edit_preview.enabled,
+                            builder_module_path: builder_module_path.trim().to_string(),
+                            builder_method: edit_preview
+                                .builder_method
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty()),
+                            watch_roots: edit_preview
+                                .watch_roots
+                                .into_iter()
+                                .map(|path| path.trim().replace('\\', "/"))
+                                .filter(|path| !path.is_empty())
+                                .collect(),
+                            debounce_seconds: edit_preview.debounce_seconds,
+                            root_refresh_seconds: edit_preview.root_refresh_seconds,
+                            mode: edit_preview
+                                .mode
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty()),
+                        })
+                    }
+                    _ => None,
+                }
+            }),
         }),
     })
 }
@@ -596,6 +679,60 @@ mod tests {
                 "src/ReplicatedStorage/Shared"
             ]
         );
+    }
+
+    #[test]
+    fn parse_project_extracts_edit_preview_config() {
+        let tree = parse_project_str(
+            r#"{
+                "name": "ArnisRoblox",
+                "vertigoSync": {
+                    "builders": {
+                        "roots": ["src/ServerScriptService/StudioPreview/AustinPreviewBuilder.lua"],
+                        "dependencyRoots": ["src/ServerScriptService/StudioPreview"]
+                    },
+                    "editPreview": {
+                        "enabled": true,
+                        "builderModulePath": "ServerScriptService.StudioPreview.AustinPreviewBuilder",
+                        "builderMethod": "Build",
+                        "watchRoots": [
+                            "ServerScriptService.StudioPreview",
+                            "ReplicatedStorage.Shared"
+                        ],
+                        "debounceSeconds": 0.25,
+                        "rootRefreshSeconds": 1.0,
+                        "mode": "edit_only"
+                    }
+                },
+                "tree": {
+                    "$className": "DataModel",
+                    "ServerScriptService": {
+                        "$path": "src/ServerScriptService"
+                    }
+                }
+            }"#,
+            &PathBuf::from("test.project.json"),
+        )
+        .unwrap();
+
+        let config = tree.vertigo_sync.expect("vertigo sync config");
+        let edit_preview = config.edit_preview.expect("edit preview config");
+        assert!(edit_preview.enabled);
+        assert_eq!(
+            edit_preview.builder_module_path,
+            "ServerScriptService.StudioPreview.AustinPreviewBuilder"
+        );
+        assert_eq!(edit_preview.builder_method.as_deref(), Some("Build"));
+        assert_eq!(
+            edit_preview.watch_roots,
+            vec![
+                "ServerScriptService.StudioPreview",
+                "ReplicatedStorage.Shared"
+            ]
+        );
+        assert_eq!(edit_preview.debounce_seconds, Some(0.25));
+        assert_eq!(edit_preview.root_refresh_seconds, Some(1.0));
+        assert_eq!(edit_preview.mode.as_deref(), Some("edit_only"));
     }
 
     #[test]

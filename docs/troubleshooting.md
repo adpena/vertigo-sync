@@ -154,6 +154,55 @@ src/Server/Services/MyService.luau:1: error: missing --!strict directive [strict
 src/Client/Controllers/Input.luau:42: warning: Instance.new in hot path [hot-path-alloc]
 ```
 
+## 11. `plugin-install` refuses to install the generated plugin
+
+**Symptom:** `vsync plugin-install` exits with plugin safety errors.
+
+**Cause:** Vertigo Sync now validates the generated Studio plugin before install. It fails closed when the bundle exceeds the top-level symbol budget, a function looks likely to hit Studio's local/register limits, or Luau compiler checks fail.
+
+**Fix:**
+
+1. Run `vsync validate` and inspect the `plugin safety` section
+2. Reduce top-level declarations by namespacing helpers or consolidating constants
+3. Split or simplify the highest-risk function reported by the validator
+4. Retry `vsync plugin-install` once the safety report is clean
+
+## 12. Scan a Studio log for fatal plugin/runtime failures
+
+**Symptom:** You want a fast local check for the exact Studio failure signatures that static validation can miss.
+
+**Fix:**
+
+```bash
+vsync plugin-smoke-log --log ~/Library/Logs/Roblox/<your-log>.log
+```
+
+For hermetic CI or local harness runs, pass the exact external plugins you expect:
+
+```bash
+vsync plugin-smoke-log --log ~/Library/Logs/Roblox/<your-log>.log \
+  --allow-plugin user_VertigoSyncPlugin.lua \
+  --allow-plugin user_MCPStudioPlugin.rbxm
+```
+
+When any other `user_` or `cloud_` plugin appears in the log, the command fails closed.
+
+If Roblox injects a managed `cloud_` plugin that you do not control, keep the run hermetic for local plugins but ignore those cloud loads:
+
+```bash
+vsync plugin-smoke-log --log ~/Library/Logs/Roblox/<your-log>.log \
+  --ignore-cloud-plugins \
+  --allow-plugin user_VertigoSyncPlugin.lua \
+  --allow-plugin user_MCPStudioPlugin.rbxm
+```
+
+The command fails closed on patterns such as:
+
+- `Out of local registers`
+- `attempt to call a nil value`
+- `Write apply permanently failed`
+- `Snapshot sync failed` (excluding known benign localhost connect-fail noise)
+
 ## Diagnostic Commands
 
 ```bash

@@ -32,7 +32,7 @@ If you are switching from Rojo, be aware of these differences in how the tools b
 - **Port:** Rojo defaults to 34872; Vertigo Sync defaults to 7575. Both are configurable.
 - **Apply timing:** Rojo applies all pending changes in a single frame. Vertigo Sync spreads them across frames within a 4ms budget. Large changesets feel smoother but may take slightly longer to fully apply.
 - **Rename handling:** When you rename or move a file, Rojo deletes the old instance and creates a new one. Vertigo Sync detects renames via content hash matching and moves the instance in place, preserving references.
-- **Validation:** Vertigo Sync runs its built-in linter on every `validate` call and during `doctor`. Rojo does not lint your source -- use selene alongside either tool for comprehensive coverage.
+- **Validation:** Vertigo Sync runs its built-in linter on every `validate` call and during `doctor`. It also validates the generated Studio plugin with Luau tooling plus local plugin-safety budgets before install. Rojo does not lint your source -- use selene alongside either tool for comprehensive coverage.
 - **Plugin UI:** Vertigo Sync's DockWidget shows connection state, throughput metrics, time-travel controls, and feature toggles. Rojo's plugin shows a simpler connection panel with a patch visualizer.
 - **Snapshot model:** Rojo tracks instance-level changes in a DOM tree. Vertigo Sync tracks file-level changes via content-addressed hashes. This means Vertigo Sync's diffs are at file granularity, not property granularity.
 
@@ -52,6 +52,20 @@ vsync --root . --turbo serve --project roblox/default.project.json
 
 # Install the Studio plugin
 vsync plugin-install
+
+# Scan a Studio log for fatal plugin/runtime smoke failures
+vsync plugin-smoke-log --log ~/Library/Logs/Roblox/latest_Studio_last.log
+
+# Fail if any unexpected user_/cloud_ plugin executed during a hermetic harness run
+vsync plugin-smoke-log --log studio.log \
+  --allow-plugin user_VertigoSyncPlugin.lua \
+  --allow-plugin user_MCPStudioPlugin.rbxm
+
+# Ignore Roblox-managed cloud_ plugin loads but still fail on foreign local user_ plugins
+vsync plugin-smoke-log --log studio.log \
+  --ignore-cloud-plugins \
+  --allow-plugin user_VertigoSyncPlugin.lua \
+  --allow-plugin user_MCPStudioPlugin.rbxm
 ```
 
 Open Roblox Studio. On first use, click `Check Connection` once to trust a local `vsync` server. After that, the plugin remembers the last good project identity, reconnects automatically, and refuses ambiguous matches. If multiple local sync servers are running, set `workspace:SetAttribute("VertigoSyncServerUrl", "http://127.0.0.1:<port>")` explicitly.
@@ -63,6 +77,8 @@ Use `vsync discover` to print the active project identity and the currently reac
 - **Low-latency sync** -- 13.5 ms cold snapshot, 9.2 ms cached, 194 us diff
 - **Frame-budgeted Studio plugin** -- never stalls Studio, 4 ms/frame budget with adaptive scaling
 - **Built-in Luau validation** -- catches NCG deopt, strict mode violations, deprecated APIs, and hot-path allocations
+- **Generated plugin safety gate** -- checks compileability, top-level symbol budget, and function-level register-pressure risk before plugin install
+- **Studio smoke log scan** -- catches fatal plugin/runtime signatures like `Out of local registers`, and can optionally enforce a strict external-plugin allowlist for hermetic harness runs
 - **WebSocket + SSE + HTTP** -- triple-transport with automatic fallback and lag recovery
 - **Time-travel** -- rewind and fast-forward through your sync history with a scrubber UI
 - **Agent-native MCP tools** -- full read/write/validate surface for AI-assisted development
@@ -92,6 +108,7 @@ The plugin provides:
 - **Connection state machine** with clear visual states (waiting, connecting, connected, reconnecting, error)
 - **Time-travel scrubber** for navigating sync history with step/jump controls
 - **Feature toggles** for binary models, builders, and time-travel UI
+- **Integrated edit-preview orchestration** via `vertigoSync.editPreview` project config
 - **Persistent settings** across Studio sessions via `plugin:GetSetting()`
 - **Instance pooling** -- 128 pre-allocated instances per class, zero `Instance.new()` in the hot path
 - **Adaptive frame budget** -- dynamically scales apply rate and fetch concurrency based on Studio frame time
@@ -129,6 +146,9 @@ The plugin runs a 4-stage pipeline on every Heartbeat:
 | `vsync validate` | Run Luau source validation |
 | `vsync build -o place.rbxl` | Build a place file from source |
 | `vsync plugin-install` | Install the Studio plugin |
+| `vsync plugin-smoke-log --log studio.log` | Fail fast on fatal Studio plugin smoke signatures in a log file |
+| `vsync plugin-smoke-log --log studio.log --allow-plugin user_VertigoSyncPlugin.lua` | Also fail on unexpected `user_` / `cloud_` plugins |
+| `vsync plugin-smoke-log --log studio.log --ignore-cloud-plugins --allow-plugin user_VertigoSyncPlugin.lua` | Fail on unexpected local `user_` plugins while tolerating Roblox-managed `cloud_` plugin loads |
 
 ## Migrating from Rojo
 

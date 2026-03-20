@@ -1367,8 +1367,10 @@ async fn handle_source(
         StatusCode::BAD_REQUEST,
         "path traversal not allowed".to_string(),
     ))?;
-    let snapshot_entry = snapshot_metadata_for_path(&state, &normalized)?
-        .ok_or((StatusCode::NOT_FOUND, "file not found: path not present in active snapshot".to_string()))?;
+    let snapshot_entry = snapshot_metadata_for_path(&state, &normalized)?.ok_or((
+        StatusCode::NOT_FOUND,
+        "file not found: path not present in active snapshot".to_string(),
+    ))?;
     let resolved = resolve_source_file(&source_root, &normalized)?;
     let content = std::fs::read_to_string(&resolved)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1865,6 +1867,88 @@ mod tests {
 
         assert_eq!(value["name"], "NestedGame");
         assert!(value["project_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn handle_project_includes_edit_preview_config() {
+        let workspace = tempdir().expect("tempdir");
+        let project_path = workspace.path().join("default.project.json");
+        if let Some(parent) = project_path.parent() {
+            fs::create_dir_all(parent).expect("create project parent");
+        }
+        fs::write(
+            &project_path,
+            serde_json::to_vec_pretty(&json!({
+                "name": "ArnisRoblox",
+                "vertigoSync": {
+                    "builders": {
+                        "roots": ["src/ServerScriptService/StudioPreview/AustinPreviewBuilder.lua"],
+                        "dependencyRoots": ["src/ServerScriptService/StudioPreview"]
+                    },
+                    "editPreview": {
+                        "enabled": true,
+                        "builderModulePath": "ServerScriptService.StudioPreview.AustinPreviewBuilder",
+                        "builderMethod": "Build",
+                        "watchRoots": ["ServerScriptService.StudioPreview"],
+                        "debounceSeconds": 0.25,
+                        "rootRefreshSeconds": 1.0,
+                        "mode": "edit_only"
+                    }
+                },
+                "tree": {
+                    "$className": "DataModel",
+                    "ServerScriptService": {
+                        "StudioPreview": {
+                            "$path": "src/ServerScriptService/StudioPreview"
+                        }
+                    }
+                }
+            }))
+            .expect("serialize project"),
+        )
+        .expect("write project");
+
+        let state = crate::ServerState::with_full_config(
+            workspace.path().to_path_buf(),
+            vec!["src".to_string()],
+            empty_snapshot(vec!["src".to_string()]),
+            crate::ServerStateOptions {
+                channel_capacity: 32,
+                turbo: false,
+                coalesce_ms: 50,
+                binary_models: false,
+                glob_ignores: crate::GlobIgnoreSet::empty(),
+                project_path: Some(project_path),
+            },
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let Json(value) = runtime
+            .block_on(handle_project(State(state)))
+            .expect("project response");
+
+        assert_eq!(value["vertigoSync"]["editPreview"]["enabled"], true);
+        assert_eq!(
+            value["vertigoSync"]["editPreview"]["builderModulePath"],
+            "ServerScriptService.StudioPreview.AustinPreviewBuilder"
+        );
+        assert_eq!(
+            value["vertigoSync"]["editPreview"]["builderMethod"],
+            "Build"
+        );
+        assert_eq!(
+            value["vertigoSync"]["editPreview"]["watchRoots"][0],
+            "ServerScriptService.StudioPreview"
+        );
+        assert_eq!(value["vertigoSync"]["editPreview"]["debounceSeconds"], 0.25);
+        assert_eq!(
+            value["vertigoSync"]["editPreview"]["rootRefreshSeconds"],
+            1.0
+        );
+        assert_eq!(value["vertigoSync"]["editPreview"]["mode"], "edit_only");
     }
 
     #[test]

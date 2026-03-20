@@ -114,6 +114,8 @@ vsync plugin-install
 
 The command copies the plugin file to the Roblox user plugins directory for the current platform.
 
+Before writing the plugin file, Vertigo Sync runs generated-plugin safety validation. If the embedded plugin exceeds the top-level symbol budget or a function looks likely to trip Studio register limits, `plugin-install` fails closed instead of installing a bad artifact.
+
 For toolbar icon testing after you upload a Roblox image asset, set one of:
 
 ```lua
@@ -148,6 +150,19 @@ Vertigo Sync reads `default.project.json` in the Rojo-compatible format. The pro
         "src/ServerScriptService/ImportService",
         "src/ReplicatedStorage/Shared"
       ]
+    },
+    "editPreview": {
+      "enabled": true,
+      "builderModulePath": "ServerScriptService.StudioPreview.AustinPreviewBuilder",
+      "builderMethod": "Build",
+      "watchRoots": [
+        "ServerScriptService.StudioPreview",
+        "ServerScriptService.ImportService",
+        "ReplicatedStorage.Shared"
+      ],
+      "debounceSeconds": 0.25,
+      "rootRefreshSeconds": 1.0,
+      "mode": "edit_only"
     }
   },
   "tree": {
@@ -196,6 +211,45 @@ Use `vertigoSync.builders` to declare edit-mode preview entrypoints explicitly.
 | `dependencyRoots` | Filesystem prefixes that should trigger builder re-execution when synced files change |
 
 Each builder module should expose a `Build()` function. If `Build()` returns an `Instance` or an array of `Instance`s, Vertigo Sync treats those roots as the authoritative preview output for cleanup and rebuild tracking.
+
+### `vertigoSync.editPreview`
+
+Use `vertigoSync.editPreview` to run a single project-specific preview builder from the
+Studio plugin without a separate companion plugin.
+
+```json
+{
+  "vertigoSync": {
+    "editPreview": {
+      "enabled": true,
+      "builderModulePath": "ServerScriptService.StudioPreview.AustinPreviewBuilder",
+      "builderMethod": "Build",
+      "watchRoots": [
+        "ServerScriptService.StudioPreview",
+        "ServerScriptService.ImportService",
+        "ReplicatedStorage.Shared"
+      ],
+      "debounceSeconds": 0.25,
+      "rootRefreshSeconds": 1.0,
+      "mode": "edit_only"
+    }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `enabled` | Enables the integrated edit-preview watcher and builder runner |
+| `builderModulePath` | DataModel path to the preview builder `ModuleScript` |
+| `builderMethod` | Builder entry method name, for example `Build` or `BuildNow` |
+| `watchRoots` | DataModel roots watched for `LuaSourceContainer` edits/removals/additions |
+| `debounceSeconds` | Debounce window before a preview rebuild is triggered |
+| `rootRefreshSeconds` | How often the plugin re-resolves configured watch roots |
+| `mode` | Preview execution mode. Supported values: `edit_only`, `studio_server` |
+
+The configured module must return a table with the configured entry method. The plugin
+surfaces rebuild state via `VertigoPreviewLastBuild*` and `VertigoPreviewBuild*`
+Workspace attributes.
 
 ### File Type Mapping
 
