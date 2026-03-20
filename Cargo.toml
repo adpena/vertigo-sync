@@ -51,6 +51,7 @@ reqwest = { version = "0.12", features = ["json"] }
 zip = "2"
 dirs = "6"
 semver = "1"
+similar = "2"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

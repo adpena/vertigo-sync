@@ -1607,11 +1607,7 @@ fn command_fmt(
                         if let Ok(formatted) =
                             vertigo_sync::fmt::format_source(&source, &format_config)
                         {
-                            println!("--- a/{rel}");
-                            println!("+++ b/{rel}");
-                            for line in simple_diff(&source, &formatted) {
-                                println!("{line}");
-                            }
+                            print!("{}", unified_diff(&source, &formatted, &rel));
                         }
                     }
                 }
@@ -1658,41 +1654,15 @@ fn command_fmt(
     Ok(())
 }
 
-/// Produce a minimal unified-diff-style output between two strings.
-fn simple_diff(old: &str, new: &str) -> Vec<String> {
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
-    let mut out = Vec::new();
-    let max = old_lines.len().max(new_lines.len());
-    // Simple line-by-line comparison (not a true LCS diff, but good enough for formatting diffs).
-    let mut i = 0;
-    let mut j = 0;
-    while i < old_lines.len() || j < new_lines.len() {
-        if i < old_lines.len() && j < new_lines.len() && old_lines[i] == new_lines[j] {
-            out.push(format!(" {}", old_lines[i]));
-            i += 1;
-            j += 1;
-        } else if i < old_lines.len()
-            && (j >= new_lines.len()
-                || (i + 1 < old_lines.len()
-                    && j + 1 < new_lines.len()
-                    && old_lines[i] != new_lines[j]))
-        {
-            out.push(format!("-{}", old_lines[i]));
-            i += 1;
-        } else if j < new_lines.len() {
-            out.push(format!("+{}", new_lines[j]));
-            j += 1;
-        } else {
-            break;
-        }
-        const MAX_DIFF_LINES: usize = 200;
-        if out.len() >= MAX_DIFF_LINES {
-            out.push(format!("... ({} more lines truncated)", max.saturating_sub(MAX_DIFF_LINES)));
-            break;
-        }
-    }
-    out
+fn unified_diff(old: &str, new: &str, file_name: &str) -> String {
+    use similar::TextDiff;
+    let diff = TextDiff::from_lines(old, new);
+    let udiff = diff
+        .unified_diff()
+        .header(&format!("a/{file_name}"), &format!("b/{file_name}"))
+        .context_radius(3)
+        .to_string();
+    udiff
 }
 
 fn command_plugin_smoke_log(
