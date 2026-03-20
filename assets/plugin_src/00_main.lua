@@ -53,6 +53,7 @@ local CORE = table.freeze({
 	HEALTH_POLL_SECONDS = 15,
 	POLL_INTERVAL_FAST = 0.10,
 	POLL_INTERVAL_MAX = 1.50,
+	PROJECT_BOOTSTRAP_RETRY_SECONDS = 5.0,
 	APPLY_FRAME_BUDGET_SECONDS = 0.002,
 	MAX_APPLIES_PER_TICK = 16,
 	MAX_FETCH_CONCURRENCY = 8,
@@ -184,8 +185,19 @@ type ProjectBuilderConfig = {
 	dependencyRoots: { string }?,
 }
 
+type ProjectEditPreviewConfig = {
+	enabled: boolean?,
+	builderModulePath: string?,
+	builderMethod: string?,
+	watchRoots: { string }?,
+	debounceSeconds: number?,
+	rootRefreshSeconds: number?,
+	mode: string?,
+}
+
 type ProjectVertigoSyncConfig = {
 	builders: ProjectBuilderConfig?,
+	editPreview: ProjectEditPreviewConfig?,
 }
 
 type PendingOp = {
@@ -362,6 +374,7 @@ local transportMode: TransportMode = "idle"
 local lastHash: string? = nil
 local lastHealthCheckAt = 0.0
 local nextPollAt = 0.0
+local nextProjectBootstrapAttemptAt = 0.0
 local pollInterval = CORE.POLL_INTERVAL_FAST
 
 local consecutiveErrors = 0
@@ -552,6 +565,25 @@ local PROJECT = {
 	builderDependencyRoots = {} :: { string },
 	lastStatusToastKey = "",
 	attachedRootGuards = {} :: { [Instance]: boolean },
+	editPreview = {
+		enabled = false,
+		builderModulePath = "",
+		builderMethod = "Build",
+		watchRoots = {} :: { string },
+		debounceSeconds = BUILD.DEBOUNCE_SECONDS,
+		rootRefreshSeconds = 1.0,
+		mode = "edit_only",
+		rootConnections = {} :: { [string]: { root: Instance, connections: { RBXScriptConnection } } },
+		sourceConnections = {} :: { [Instance]: RBXScriptConnection },
+		pendingReason = nil :: string?,
+		buildScheduled = false,
+		buildInProgress = false,
+		consecutiveFailures = 0,
+		lastSkipAt = 0.0,
+		lastSkipSignature = nil :: string?,
+		nextRootRefreshAt = 0.0,
+		initialBuildQueued = false,
+	},
 }
 local SERVER = {
 	activeBaseUrl = nil :: string?,
@@ -560,6 +592,7 @@ local SERVER = {
 	allowUntrustedDiscovery = false,
 	discoveryError = "",
 }
+local Runtime = {}
 local resolveMapping: (filePath: string) -> (PathMapping?, string?)
 local bootstrapManagedIndex: () -> ()
 local closeWebSocket: (reason: string) -> ()
@@ -1284,12 +1317,62 @@ local function applyProjectPayload(payload: any): boolean
 	PROJECT.projectId = projectId
 	local vertigoSyncConfig: any = payload.vertigoSync
 	local builderConfig: any = if type(vertigoSyncConfig) == "table" then vertigoSyncConfig.builders else nil
+	local editPreviewConfig: any = if type(vertigoSyncConfig) == "table" then vertigoSyncConfig.editPreview else nil
+	local function normalizeInstancePath(rawPath: any): string
+		if type(rawPath) ~= "string" then
+			return ""
+		end
+		local normalizedPath = string.gsub(rawPath, "\\", ".")
+		normalizedPath = string.gsub(normalizedPath, "/", ".")
+		normalizedPath = string.gsub(normalizedPath, "%.%.+", ".")
+		normalizedPath = string.gsub(normalizedPath, "^%.+", "")
+		normalizedPath = string.gsub(normalizedPath, "%.+$", "")
+		return normalizedPath
+	end
 	PROJECT.builderRoots = normalizeProjectPathList(if type(builderConfig) == "table" then builderConfig.roots else nil)
 	PROJECT.builderDependencyRoots =
 		normalizeProjectPathList(if type(builderConfig) == "table" then builderConfig.dependencyRoots else nil)
+	Runtime.clearEditPreviewWatchers()
+	PROJECT.editPreview.enabled = type(editPreviewConfig) == "table" and editPreviewConfig.enabled == true
+	PROJECT.editPreview.builderModulePath =
+		if type(editPreviewConfig) == "table" then normalizeInstancePath(editPreviewConfig.builderModulePath) else ""
+	PROJECT.editPreview.builderMethod =
+		if type(editPreviewConfig) == "table" and type(editPreviewConfig.builderMethod) == "string" and editPreviewConfig.builderMethod ~= ""
+			then editPreviewConfig.builderMethod
+			else "Build"
+	PROJECT.editPreview.watchRoots = {}
+	if type(editPreviewConfig) == "table" and type(editPreviewConfig.watchRoots) == "table" then
+		for _, rawRoot in ipairs(editPreviewConfig.watchRoots) do
+			local normalizedRoot = normalizeInstancePath(rawRoot)
+			if normalizedRoot ~= "" then
+				table.insert(PROJECT.editPreview.watchRoots, normalizedRoot)
+			end
+		end
+	end
+	PROJECT.editPreview.debounceSeconds =
+		if type(editPreviewConfig) == "table" and type(editPreviewConfig.debounceSeconds) == "number"
+			then math.max(0.05, editPreviewConfig.debounceSeconds)
+			else BUILD.DEBOUNCE_SECONDS
+	PROJECT.editPreview.rootRefreshSeconds =
+		if type(editPreviewConfig) == "table" and type(editPreviewConfig.rootRefreshSeconds) == "number"
+			then math.max(0.25, editPreviewConfig.rootRefreshSeconds)
+			else 1.0
+	PROJECT.editPreview.mode =
+		if type(editPreviewConfig) == "table" and type(editPreviewConfig.mode) == "string" and editPreviewConfig.mode ~= ""
+			then editPreviewConfig.mode
+			else "edit_only"
+	PROJECT.editPreview.pendingReason = nil
+	PROJECT.editPreview.buildScheduled = false
+	PROJECT.editPreview.buildInProgress = false
+	PROJECT.editPreview.consecutiveFailures = 0
+	PROJECT.editPreview.lastSkipAt = 0.0
+	PROJECT.editPreview.lastSkipSignature = nil
+	PROJECT.editPreview.nextRootRefreshAt = 0.0
+	PROJECT.editPreview.initialBuildQueued = false
 	activateDynamicPathMappings(runtimeMappings)
 	PROJECT.loaded = true
 	PROJECT.blocked = false
+	nextProjectBootstrapAttemptAt = 0.0
 	rememberProjectBinding(getServerBaseUrl(), projectId)
 	bootstrapManagedIndex()
 	attachActivePathGuards()
@@ -1297,18 +1380,20 @@ local function applyProjectPayload(payload: any): boolean
 	local statusMessage: string
 	if skippedMappings > 0 then
 		statusMessage = string.format(
-			"Loaded /project '%s' (%d mappings, %d skipped, %d builder roots)",
+			"Loaded /project '%s' (%d mappings, %d skipped, %d builder roots, editPreview=%s)",
 			projectName,
 			#runtimeMappings,
 			skippedMappings,
-			#PROJECT.builderRoots
+			#PROJECT.builderRoots,
+			tostring(PROJECT.editPreview.enabled)
 		)
 	else
 		statusMessage = string.format(
-			"Loaded /project '%s' (%d mappings, %d builder roots)",
+			"Loaded /project '%s' (%d mappings, %d builder roots, editPreview=%s)",
 			projectName,
 			#runtimeMappings,
-			#PROJECT.builderRoots
+			#PROJECT.builderRoots,
+			tostring(PROJECT.editPreview.enabled)
 		)
 	end
 
@@ -1319,6 +1404,11 @@ end
 local function ensureProjectBootstrap(force: boolean): boolean
 	if PROJECT.loaded and not force then
 		return not PROJECT.blocked
+	end
+
+	local now = os.clock()
+	if not force and now < nextProjectBootstrapAttemptAt then
+		return false
 	end
 
 	local activeBaseUrl = getServerBaseUrl()
@@ -1338,6 +1428,7 @@ local function ensureProjectBootstrap(force: boolean): boolean
 	if SERVER.discoveryError ~= "" then
 		PROJECT.loaded = false
 		PROJECT.blocked = true
+		nextProjectBootstrapAttemptAt = now + CORE.PROJECT_BOOTSTRAP_RETRY_SECONDS
 		setProjectStatus("mismatch", SERVER.discoveryError, PROJECT.name, true)
 		return false
 	end
@@ -1345,11 +1436,13 @@ local function ensureProjectBootstrap(force: boolean): boolean
 	if statusCode == 404 then
 		PROJECT.loaded = false
 		PROJECT.blocked = true
+		nextProjectBootstrapAttemptAt = now + CORE.PROJECT_BOOTSTRAP_RETRY_SECONDS
 		setProjectStatus("mismatch", string.format("Server at %s does not expose /project", getServerBaseUrl()), PROJECT.name, true)
 		return false
 	end
 
 	if statusCode == 0 then
+		nextProjectBootstrapAttemptAt = now + CORE.PROJECT_BOOTSTRAP_RETRY_SECONDS
 		if PROJECT.mode == "bootstrapping" then
 			setProjectStatus("bootstrapping", "Waiting for /project", PROJECT.name, false)
 		end
@@ -1358,14 +1451,17 @@ local function ensureProjectBootstrap(force: boolean): boolean
 
 	PROJECT.loaded = false
 	PROJECT.blocked = true
+	nextProjectBootstrapAttemptAt = now + CORE.PROJECT_BOOTSTRAP_RETRY_SECONDS
 	setProjectStatus("mismatch", string.format("Failed to load /project: %s", tostring(payloadOrErr)), PROJECT.name, true)
 	return false
 end
 
 local function handleServerUrlChanged()
+	Runtime.clearEditPreviewWatchers()
 	PROJECT.loaded = false
 	PROJECT.blocked = false
 	PROJECT.projectId = nil
+	nextProjectBootstrapAttemptAt = 0.0
 	SERVER.discoveryError = ""
 	resyncRequested = true
 	Runtime.closeWebSocket("server_url_changed")
@@ -1674,7 +1770,298 @@ end
 
 local lastStateReportAt: number = 0
 local lastManagedReportAt: number = 0
-local Runtime = {}
+
+function Runtime.clearEditPreviewWatchers()
+	local editPreview = PROJECT.editPreview
+	for instance: Instance, conn: RBXScriptConnection in pairs(editPreview.sourceConnections) do
+		conn:Disconnect()
+		editPreview.sourceConnections[instance] = nil
+	end
+	for key: string, watcher in pairs(editPreview.rootConnections) do
+		for _, conn: RBXScriptConnection in ipairs(watcher.connections) do
+			conn:Disconnect()
+		end
+		editPreview.rootConnections[key] = nil
+	end
+end
+
+function Runtime.findByInstancePath(instancePath: string): Instance?
+	if instancePath == "" then
+		return nil
+	end
+	local node: Instance = game
+	for segment in string.gmatch(instancePath, "[^%.]+") do
+		local nextNode = node:FindFirstChild(segment)
+		if nextNode == nil then
+			return nil
+		end
+		node = nextNode
+	end
+	return node
+end
+
+function Runtime.canRunEditPreview(): boolean
+	local mode: string = PROJECT.editPreview.mode
+	if mode == "edit_only" then
+		return isEditMode()
+	end
+	if mode == "studio_server" then
+		return isEditMode() or (RunService:IsRunning() and RunService:IsServer())
+	end
+	return false
+end
+
+function Runtime.recordEditPreviewSkip(reason: string, context: string)
+	local editPreview = PROJECT.editPreview
+	local mode = describeStudioMode()
+	Workspace:SetAttribute("VertigoPreviewLastSkippedReason", reason)
+	Workspace:SetAttribute("VertigoPreviewLastSkippedMode", mode)
+	local signature = string.format("%s|%s|%s", reason, context, mode)
+	local now = os.clock()
+	if editPreview.lastSkipSignature == signature and (now - editPreview.lastSkipAt) < 2.0 then
+		return
+	end
+	editPreview.lastSkipSignature = signature
+	editPreview.lastSkipAt = now
+	info(string.format("Skipping preview rebuild (%s, %s): mode=%s", reason, context, mode))
+end
+
+function Runtime.resolveEditPreviewBuilderModule(): (ModuleScript?, string?)
+	local builderPath: string = PROJECT.editPreview.builderModulePath
+	local node = Runtime.findByInstancePath(builderPath)
+	if node == nil then
+		return nil, string.format("missing %s", builderPath)
+	end
+	if not node:IsA("ModuleScript") then
+		return nil, string.format("%s is not a ModuleScript", builderPath)
+	end
+	return node, nil
+end
+
+function Runtime.untrackEditPreviewSource(instance: Instance)
+	local conn = PROJECT.editPreview.sourceConnections[instance]
+	if conn ~= nil then
+		conn:Disconnect()
+		PROJECT.editPreview.sourceConnections[instance] = nil
+	end
+end
+
+function Runtime.trackEditPreviewSource(instance: Instance)
+	local editPreview = PROJECT.editPreview
+	if not instance:IsA("LuaSourceContainer") then
+		return
+	end
+	if editPreview.sourceConnections[instance] ~= nil then
+		return
+	end
+	editPreview.sourceConnections[instance] = instance:GetPropertyChangedSignal("Source"):Connect(function()
+		if inSelfMutationGuard() or editPreview.buildInProgress then
+			Runtime.recordEditPreviewSkip(string.format("source_changed:%s", instance.Name), "self_mutation_guard")
+			return
+		end
+		Runtime.scheduleEditPreviewBuild(string.format("source_changed:%s", instance:GetFullName()))
+	end)
+end
+
+function Runtime.disconnectEditPreviewRoot(key: string)
+	local watcher = PROJECT.editPreview.rootConnections[key]
+	if watcher == nil then
+		return
+	end
+	for _, conn: RBXScriptConnection in ipairs(watcher.connections) do
+		conn:Disconnect()
+	end
+	for instance: Instance, _ in pairs(PROJECT.editPreview.sourceConnections) do
+		if instance == watcher.root or instance:IsDescendantOf(watcher.root) then
+			Runtime.untrackEditPreviewSource(instance)
+		end
+	end
+	PROJECT.editPreview.rootConnections[key] = nil
+end
+
+function Runtime.attachEditPreviewRoot(key: string, root: Instance)
+	if PROJECT.editPreview.rootConnections[key] ~= nil then
+		return
+	end
+	local connections: { RBXScriptConnection } = {}
+	for _, descendant: Instance in ipairs(root:GetDescendants()) do
+		Runtime.trackEditPreviewSource(descendant)
+	end
+	table.insert(connections, root.DescendantAdded:Connect(function(descendant: Instance)
+		Runtime.trackEditPreviewSource(descendant)
+		if descendant:IsA("LuaSourceContainer") then
+			if inSelfMutationGuard() or PROJECT.editPreview.buildInProgress then
+				Runtime.recordEditPreviewSkip(string.format("descendant_added:%s", descendant.Name), "self_mutation_guard")
+				return
+			end
+			Runtime.scheduleEditPreviewBuild(string.format("descendant_added:%s", descendant:GetFullName()))
+		end
+	end))
+	table.insert(connections, root.DescendantRemoving:Connect(function(descendant: Instance)
+		Runtime.untrackEditPreviewSource(descendant)
+		if descendant:IsA("LuaSourceContainer") then
+			if inSelfMutationGuard() or PROJECT.editPreview.buildInProgress then
+				Runtime.recordEditPreviewSkip(string.format("descendant_removed:%s", descendant.Name), "self_mutation_guard")
+				return
+			end
+			Runtime.scheduleEditPreviewBuild(string.format("descendant_removed:%s", descendant:GetFullName()))
+		end
+	end))
+	PROJECT.editPreview.rootConnections[key] = {
+		root = root,
+		connections = connections,
+	}
+	info(string.format("Watching editPreview root %s (%s)", key, root:GetFullName()))
+end
+
+function Runtime.refreshEditPreviewWatchRoots()
+	local editPreview = PROJECT.editPreview
+	if not editPreview.enabled then
+		Runtime.clearEditPreviewWatchers()
+		return
+	end
+	for _, rootPath: string in ipairs(editPreview.watchRoots) do
+		local root = Runtime.findByInstancePath(rootPath)
+		local existing = editPreview.rootConnections[rootPath]
+		if root == nil then
+			Runtime.disconnectEditPreviewRoot(rootPath)
+		elseif existing == nil or existing.root ~= root then
+			Runtime.disconnectEditPreviewRoot(rootPath)
+			Runtime.attachEditPreviewRoot(rootPath, root)
+		end
+	end
+	for rootPath: string, _ in pairs(editPreview.rootConnections) do
+		local keep = false
+		for _, configuredRoot: string in ipairs(editPreview.watchRoots) do
+			if configuredRoot == rootPath then
+				keep = true
+				break
+			end
+		end
+		if not keep then
+			Runtime.disconnectEditPreviewRoot(rootPath)
+		end
+	end
+end
+
+function Runtime.runEditPreviewBuild(reason: string)
+	local editPreview = PROJECT.editPreview
+	if not editPreview.enabled then
+		return
+	end
+	if not Runtime.canRunEditPreview() then
+		Runtime.recordEditPreviewSkip(reason, "mode")
+		return
+	end
+	if editPreview.builderModulePath == "" then
+		Workspace:SetAttribute("VertigoPreviewLastBuildError", "editPreview.builderModulePath is required")
+		warnMsg("editPreview enabled, but builderModulePath is missing")
+		return
+	end
+
+	editPreview.buildInProgress = true
+	refreshSelfMutationGuard()
+	Workspace:SetAttribute("VertigoPreviewBuildInProgress", true)
+	Workspace:SetAttribute("VertigoPreviewBuildReason", reason)
+	Workspace:SetAttribute("VertigoPreviewBuildMode", describeStudioMode())
+
+	local startedAt = os.clock()
+	local ok, resultOrErr = pcall(function()
+		local moduleScript, resolveErr = Runtime.resolveEditPreviewBuilderModule()
+		if moduleScript == nil then
+			error(resolveErr or "missing editPreview builder module")
+		end
+		local builder = require(moduleScript)
+		local builderMethod = editPreview.builderMethod
+		if type(builder) ~= "table" or type((builder :: any)[builderMethod]) ~= "function" then
+			error(string.format("%s.%s() is missing", editPreview.builderModulePath, builderMethod))
+		end
+		return ((builder :: any)[builderMethod])(builder)
+	end)
+	local elapsedMs = math.floor((os.clock() - startedAt) * 1000 + 0.5)
+
+	if ok then
+		editPreview.consecutiveFailures = 0
+		Workspace:SetAttribute("VertigoPreviewLastBuildError", "")
+		Workspace:SetAttribute("VertigoPreviewLastBuildDurationMs", elapsedMs)
+		Workspace:SetAttribute("VertigoPreviewLastBuildEpoch", os.time())
+		Workspace:SetAttribute("VertigoPreviewLastBuildReason", reason)
+		info(string.format("Preview rebuilt (%s) in %d ms (mode=%s)", reason, elapsedMs, describeStudioMode()))
+	else
+		editPreview.consecutiveFailures += 1
+		Workspace:SetAttribute("VertigoPreviewLastBuildError", tostring(resultOrErr))
+		warnMsg(string.format(
+			"Preview rebuild failed (%s) mode=%s failure=%d: %s",
+			reason,
+			describeStudioMode(),
+			editPreview.consecutiveFailures,
+			tostring(resultOrErr)
+		))
+		if editPreview.consecutiveFailures <= 10 then
+			local retryDelay = math.min(8, 1 + editPreview.consecutiveFailures)
+			task.delay(retryDelay, function()
+				Runtime.scheduleEditPreviewBuild(string.format("auto_retry_%d", editPreview.consecutiveFailures))
+			end)
+		end
+	end
+
+	Workspace:SetAttribute("VertigoPreviewBuildInProgress", false)
+	editPreview.buildInProgress = false
+	refreshSelfMutationGuard()
+
+	if editPreview.pendingReason ~= nil then
+		local pendingReason = editPreview.pendingReason
+		editPreview.pendingReason = nil
+		Runtime.scheduleEditPreviewBuild(string.format("queued:%s", pendingReason))
+	end
+end
+
+function Runtime.scheduleEditPreviewBuild(reason: string)
+	local editPreview = PROJECT.editPreview
+	if not editPreview.enabled then
+		return
+	end
+	if not Runtime.canRunEditPreview() then
+		editPreview.pendingReason = nil
+		Runtime.recordEditPreviewSkip(reason, "schedule")
+		return
+	end
+	editPreview.pendingReason = reason
+	if editPreview.buildScheduled then
+		return
+	end
+	editPreview.buildScheduled = true
+	task.delay(editPreview.debounceSeconds, function()
+		editPreview.buildScheduled = false
+		local buildReason = editPreview.pendingReason or reason
+		editPreview.pendingReason = nil
+		if not Runtime.canRunEditPreview() then
+			Runtime.recordEditPreviewSkip(buildReason, "debounced")
+			return
+		end
+		if editPreview.buildInProgress then
+			editPreview.pendingReason = buildReason
+			return
+		end
+		Runtime.runEditPreviewBuild(buildReason)
+	end)
+end
+
+function Runtime.tickEditPreview()
+	local editPreview = PROJECT.editPreview
+	if not editPreview.enabled or not PROJECT.loaded then
+		return
+	end
+	local now = os.clock()
+	if now >= editPreview.nextRootRefreshAt then
+		editPreview.nextRootRefreshAt = now + editPreview.rootRefreshSeconds
+		Runtime.refreshEditPreviewWatchRoots()
+	end
+	if not editPreview.initialBuildQueued then
+		editPreview.initialBuildQueued = true
+		Runtime.scheduleEditPreviewBuild("project_bootstrap")
+	end
+end
 
 function Runtime.reportPluginState()
 	local now: number = os.clock()
@@ -4349,6 +4736,7 @@ function UI.buildToastSystem()
 		local label: TextLabel = toastLabels[slot]
 
 		label.Text = message
+		label.TextTransparency = 0
 		frame.BackgroundColor3 = color
 		frame.BackgroundTransparency = 1
 		frame.Position = UDim2.new(0, 0, 1, 0)
@@ -4377,7 +4765,7 @@ function UI.buildToastSystem()
 					}):Play()
 					task.delay(0.35, function()
 						if not toastActive[i] then
-							toastLabels[i].TextTransparency = 0
+							toastLabels[i].Text = ""
 						end
 					end)
 				end
@@ -4460,14 +4848,14 @@ function UI.buildWelcomeSection(mainFrame: Frame)
 		layoutOrder = 6,
 		wrap = true,
 	})
-	UI.createLabel(welcomeFrame, "Step4", "   Click Check Connection once to trust the first server", {
+	local welcomeStep4: TextLabel = UI.createLabel(welcomeFrame, "Step4", "Click Check Connection once to trust the first server", {
 		size = UDim2.new(1, 0, 0, 14),
 		color = UI.THEME_TEXT_DIM,
 		fontSize = 11,
-		font = Enum.Font.Gotham,
 		layoutOrder = 7,
 		wrap = true,
 	})
+	welcomeStep4.FontFace = Font.new("rbxasset://fonts/families/Montserrat.json", Enum.FontWeight.Regular, Enum.FontStyle.Italic)
 
 	local welcomeCheckBtn: TextButton = UI.createSmallButton(welcomeFrame, "CheckConnection", "Check Connection", 130)
 	welcomeCheckBtn.LayoutOrder = 8
@@ -6148,6 +6536,15 @@ function Runtime.tickSyncManager()
 	end
 
 	local now = os.clock()
+	if not PROJECT.loaded or resyncRequested or lastHash == nil then
+		if not ensureProjectBootstrap(false) then
+			Runtime.closeWebSocket("project_bootstrap_pending")
+			setStatusAttributes(if PROJECT.blocked then "error" else "disconnected", lastHash)
+			Runtime.updateButtonAppearance()
+			return
+		end
+	end
+
 	if now - lastHealthCheckAt >= CORE.HEALTH_POLL_SECONDS then
 		lastHealthCheckAt = now
 		if not Runtime.checkHealth() then
@@ -6159,12 +6556,6 @@ function Runtime.tickSyncManager()
 	end
 
 	if resyncRequested or lastHash == nil then
-		if not ensureProjectBootstrap(false) then
-			Runtime.closeWebSocket("project_bootstrap_pending")
-			setStatusAttributes(if PROJECT.blocked then "error" else "disconnected", lastHash)
-			Runtime.updateButtonAppearance()
-			return
-		end
 		local synced = Runtime.syncFromSnapshot(resyncRequested and "requested" or "bootstrap")
 		Runtime.updateButtonAppearance()
 		if not synced then
@@ -6197,6 +6588,7 @@ Workspace:SetAttribute("VertigoSyncPluginVersion", CORE.PLUGIN_VERSION)
 Workspace:SetAttribute("VertigoSyncRealtimeDefault", true)
 Workspace:SetAttribute("VertigoSyncBinaryModels", SETTINGS.binaryModels)
 Workspace:SetAttribute("VertigoSyncBuildersEnabled", BUILDERS.enabled)
+Workspace:SetAttribute("VertigoPreviewBuildInProgress", false)
 updateBuilderPerfAttributes()
 setProjectStatus("bootstrapping", "Waiting for /project", nil, false)
 setStatusAttributes("disconnected", nil)
@@ -6215,6 +6607,13 @@ flushMetrics(true)
 
 task.defer(function()
 	ensureProjectBootstrap(false)
+end)
+
+Workspace:GetAttributeChangedSignal("VertigoPreviewForceRebuild"):Connect(function()
+	if Workspace:GetAttribute("VertigoPreviewForceRebuild") == true then
+		Workspace:SetAttribute("VertigoPreviewForceRebuild", false)
+		Runtime.scheduleEditPreviewBuild("workspace_attribute")
+	end
 end)
 
 -- ─── Heartbeat Loop ──────────────────────────────────────────────────────────
@@ -6239,6 +6638,7 @@ end)
 
 task.spawn(function()
 	while true do
+		Runtime.tickEditPreview()
 		if not HISTORY.active then
 			Runtime.tickSyncManager()
 		end
