@@ -74,33 +74,48 @@ pub fn run_init(root: &Path, name: Option<&str>) -> Result<()> {
 
     // -- vsync.toml ----------------------------------------------------------
     {
-        use crate::config::{VsyncConfig, PackageConfig, FormatConfig};
+        // Validate project_name for TOML safety
+        let safe_name: String = project_name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '/')
+            .collect();
 
-        let lint = std::collections::BTreeMap::from([
-            ("unused-variable".to_string(), "warn".to_string()),
-            ("deprecated-api".to_string(), "error".to_string()),
-            ("global-shadow".to_string(), "error".to_string()),
-            ("strict-mode".to_string(), "warn".to_string()),
-            ("wait-deprecated".to_string(), "warn".to_string()),
-        ]);
-        let config = VsyncConfig {
-            package: PackageConfig {
-                name: project_name.clone(),
-                version: "0.1.0".to_string(),
-                ..PackageConfig::default()
-            },
-            format: FormatConfig {
-                indent_type: Some("tabs".to_string()),
-                indent_width: Some(4),
-                line_width: Some(120),
-                quote_style: Some("double".to_string()),
-                ..FormatConfig::default()
-            },
-            lint,
-            ..VsyncConfig::default()
-        };
-        let vsync_toml = toml::to_string_pretty(&config)
-            .context("failed to serialize vsync.toml")?;
+        let vsync_toml = format!(r#"# vsync.toml — unified project configuration
+# Documentation: https://github.com/vertigo-sync/vertigo-sync/blob/main/docs/configuration.md
+
+[package]
+name = "{safe_name}"
+version = "0.1.0"
+# realm = "shared"  # shared | server
+
+[dependencies]
+# promise = "evaera/promise@^4.0.0"
+
+[server-dependencies]
+
+[dev-dependencies]
+
+# Lint rule configuration. Values: "error", "warn", "off"
+# Full rule list: https://github.com/vertigo-sync/vertigo-sync/blob/main/docs/configuration.md#lint
+[lint]
+unused-variable = "warn"
+deprecated-api = "error"
+global-shadow = "error"
+strict-mode = "warn"
+wait-deprecated = "warn"
+
+# Formatting options (powered by StyLua)
+# Full options: https://github.com/vertigo-sync/vertigo-sync/blob/main/docs/configuration.md#format
+[format]
+indent-type = "tabs"
+indent-width = 4
+line-width = 120
+quote-style = "double"
+
+# Project scripts — run with: vsync run <name>
+# [scripts]
+# test = "vsync build -o test.rbxl"
+"#);
         write_if_missing(&root.join("vsync.toml"), &vsync_toml)?;
     }
 

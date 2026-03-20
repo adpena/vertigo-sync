@@ -10,6 +10,10 @@ fn init_creates_vsync_toml() {
     assert!(content.contains("[package]"));
     assert!(content.contains("[lint]"));
     assert!(content.contains("[format]"));
+    // Verify inline comments are present for DX
+    assert!(content.contains("# vsync.toml"), "should have header comment");
+    assert!(content.contains("# Documentation:"), "should have docs link");
+    assert!(content.contains("name = \"test-project\""), "should contain project name");
 }
 
 #[test]
