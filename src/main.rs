@@ -202,7 +202,11 @@ enum Command {
     },
     /// Validate Luau source files for common issues.
     #[command(display_order = 13)]
-    Validate,
+    Validate {
+        /// Project file path (default: default.project.json).
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
+    },
     /// Scan a Roblox Studio log for fatal Vertigo Sync plugin smoke failures.
     #[command(display_order = 14)]
     PluginSmokeLog {
@@ -371,7 +375,7 @@ async fn main() -> Result<()> {
         } => command_discover(&root, project, server_url.as_deref(), &cli).await,
         Command::Watch { project } => command_watch(&root, &state_dir, project, &cli),
         Command::WatchNative { project } => command_watch_native(&root, &state_dir, project, &cli),
-        Command::Validate => command_validate(&root, &cli),
+        Command::Validate { project } => command_validate(&root, project, &cli),
         Command::PluginSmokeLog {
             log,
             allow_plugin,
@@ -1225,14 +1229,37 @@ async fn command_discover(
     Ok(())
 }
 
-fn command_validate(root: &Path, cli: &Cli) -> Result<()> {
+fn command_validate(root: &Path, project: &Path, cli: &Cli) -> Result<()> {
     let project_context =
-        resolve_project_context(root, Path::new("default.project.json"), &cli.include)?;
-    let report = validate::validate_source_with_ignores(
+        resolve_project_context(root, project, &cli.include)?;
+    let mut report = validate::validate_source_with_ignores(
         &project_context.project_root,
         &project_context.includes,
         &project_context.tree.glob_ignore_paths,
     )?;
+
+    // Wire existing validate.rs rules into the configurable [lint] config from
+    // vsync.toml.  Rules set to "off" are dropped; severity can be escalated
+    // or downgraded via "error" / "warn".
+    if let Some(ref config) = project_context.vsync_config {
+        report.issues.retain(|issue| {
+            config.lint.get(&issue.rule).map(|s| s.as_str()) != Some("off")
+        });
+        for issue in &mut report.issues {
+            if let Some(configured) = config.lint.get(&issue.rule) {
+                match configured.as_str() {
+                    "error" => issue.severity = "error".to_string(),
+                    "warn" => issue.severity = "warning".to_string(),
+                    _ => {}
+                }
+            }
+        }
+        // Recompute summary counts after filtering and severity changes.
+        report.errors = report.issues.iter().filter(|i| i.severity == "error").count();
+        report.warnings = report.issues.iter().filter(|i| i.severity == "warning").count();
+        report.clean = report.errors == 0 && report.warnings == 0;
+    }
+
     let plugin_safety =
         validate::validate_plugin_source_text("embedded://VertigoSyncPlugin.lua", PLUGIN_SOURCE)?;
     let combined = ValidateCommandReport {
