@@ -21,6 +21,9 @@ pub struct MigrateReport {
     pub selene_migrated: bool,
     pub stylua_migrated: bool,
     pub aftman_found: bool,
+    pub dep_count: usize,
+    pub server_dep_count: usize,
+    pub dev_dep_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +240,9 @@ pub fn run_migrate(root: &Path) -> Result<MigrateReport> {
             selene_migrated: false,
             stylua_migrated: false,
             aftman_found: false,
+            dep_count: 0,
+            server_dep_count: 0,
+            dev_dep_count: 0,
         });
     }
 
@@ -246,6 +252,9 @@ pub fn run_migrate(root: &Path) -> Result<MigrateReport> {
         selene_migrated: false,
         stylua_migrated: false,
         aftman_found: false,
+        dep_count: 0,
+        server_dep_count: 0,
+        dev_dep_count: 0,
     };
 
     // 1. Wally
@@ -253,6 +262,9 @@ pub fn run_migrate(root: &Path) -> Result<MigrateReport> {
     if wally_path.exists() {
         let wally_config = parse_wally_toml(&wally_path)?;
         config.package = wally_config.package;
+        report.dep_count = wally_config.dependencies.len();
+        report.server_dep_count = wally_config.server_dependencies.len();
+        report.dev_dep_count = wally_config.dev_dependencies.len();
         config.dependencies = wally_config.dependencies;
         config.server_dependencies = wally_config.server_dependencies;
         config.dev_dependencies = wally_config.dev_dependencies;
@@ -302,6 +314,9 @@ pub fn run_migrate(root: &Path) -> Result<MigrateReport> {
                 selene_migrated: false,
                 stylua_migrated: false,
                 aftman_found: false,
+                dep_count: 0,
+                server_dep_count: 0,
+                dev_dep_count: 0,
             });
         }
         Err(e) => {

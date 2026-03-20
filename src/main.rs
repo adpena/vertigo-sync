@@ -704,8 +704,6 @@ fn parse_http_url(raw: &str) -> Result<HttpTarget> {
 }
 
 async fn fetch_json_http(base_url: &str, endpoint: &str) -> Result<serde_json::Value> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let target = parse_http_url(base_url)?;
     let endpoint = endpoint.trim_start_matches('/');
     let path = if target.path_prefix.is_empty() {
@@ -713,47 +711,21 @@ async fn fetch_json_http(base_url: &str, endpoint: &str) -> Result<serde_json::V
     } else {
         format!("{}/{}", target.path_prefix, endpoint)
     };
+    let url = format!("http://{}:{}{}", target.host, target.port, path);
 
-    let mut stream = tokio::net::TcpStream::connect((target.host.as_str(), target.port))
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("failed to build HTTP client")?;
+    let resp = client
+        .get(&url)
+        .send()
         .await
-        .with_context(|| format!("failed to connect to {}:{}", target.host, target.port))?;
-
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-        target.host
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .with_context(|| format!("failed to write request to {}:{}", target.host, target.port))?;
-
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.with_context(|| {
-        format!(
-            "failed to read response from {}:{}",
-            target.host, target.port
-        )
-    })?;
-    let response = String::from_utf8(response).context("discovery response was not UTF-8")?;
-
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .context("malformed HTTP response from discovery server")?;
-    let status_line = headers
-        .lines()
-        .next()
-        .context("missing HTTP status line from discovery server")?;
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .context("missing HTTP status code from discovery server")?
-        .parse::<u16>()
-        .context("invalid HTTP status code from discovery server")?;
-    if !(200..300).contains(&status_code) {
-        bail!("discovery request failed with HTTP {status_code}");
+        .with_context(|| format!("failed to fetch {url}"))?;
+    if !resp.status().is_success() {
+        bail!("HTTP {} from {url}", resp.status());
     }
-
-    serde_json::from_str(body).context("failed to decode discovery JSON")
+    resp.json().await.context("failed to parse JSON response")
 }
 
 fn resolve_project_context(
@@ -2265,13 +2237,42 @@ fn command_migrate(root: &Path) -> Result<()> {
     }
 
     if report.wally_migrated {
-        output::success("Migrated wally.toml (package metadata + dependencies)");
+        let mut parts = Vec::new();
+        if report.dep_count > 0 {
+            parts.push(format!(
+                "{} {}",
+                report.dep_count,
+                if report.dep_count == 1 { "dependency" } else { "dependencies" }
+            ));
+        }
+        if report.server_dep_count > 0 {
+            parts.push(format!(
+                "{} server {}",
+                report.server_dep_count,
+                if report.server_dep_count == 1 { "dependency" } else { "dependencies" }
+            ));
+        }
+        if report.dev_dep_count > 0 {
+            parts.push(format!(
+                "{} dev {}",
+                report.dev_dep_count,
+                if report.dev_dep_count == 1 { "dependency" } else { "dependencies" }
+            ));
+        }
+        let suffix = if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join(", "))
+        };
+        output::success(&format!(
+            "Migrated wally.toml \u{2192} vsync.toml{suffix}"
+        ));
     }
     if report.selene_migrated {
-        output::success("Migrated selene.toml (lint configuration)");
+        output::success("Migrated selene.toml \u{2192} vsync.toml [lint]");
     }
     if report.stylua_migrated {
-        output::success("Migrated stylua.toml (format configuration)");
+        output::success("Migrated stylua.toml \u{2192} vsync.toml [format]");
     }
     if report.aftman_found {
         eprintln!();
