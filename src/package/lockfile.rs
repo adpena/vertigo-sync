@@ -64,6 +64,10 @@ impl Lockfile {
         let tmp = path.with_extension("lock.tmp");
         std::fs::write(&tmp, content.as_bytes())
             .with_context(|| format!("failed to write {}", tmp.display()))?;
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::fs::remove_file(path); // remove target if held by another process
+        }
         std::fs::rename(&tmp, path)
             .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))
     }

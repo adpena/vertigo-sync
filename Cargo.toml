@@ -6,8 +6,8 @@ rust-version = "1.85"
 build = "build.rs"
 description = "Fast, deterministic source sync for Roblox Studio"
 license = "MIT"
-repository = "https://github.com/adpena/vertigo-sync"
-homepage = "https://github.com/adpena/vertigo-sync"
+repository = "https://github.com/vertigo-sync/vertigo-sync"
+homepage = "https://github.com/vertigo-sync/vertigo-sync"
 documentation = "https://docs.rs/vertigo-sync"
 readme = "README.md"
 keywords = ["roblox", "studio", "sync", "luau", "cli"]
@@ -35,7 +35,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
-notify = { version = "8", features = ["macos_fsevent"] }
+notify = "8"
 tokio-stream = { version = "0.1", features = ["sync"] }
 rbx_binary = "2.0.1"
 rbx_xml = "2.0.1"

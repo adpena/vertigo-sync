@@ -132,6 +132,9 @@ impl RegistryClient {
 
     /// Create a client pointed at an arbitrary registry API URL.
     pub fn new(api_url: String) -> Result<Self> {
+        if !api_url.starts_with("https://") && !api_url.starts_with("http://127.0.0.1") && !api_url.starts_with("http://localhost") {
+            bail!("registry URL must use HTTPS to protect credentials: {api_url}");
+        }
         Ok(Self {
             api_url,
             client: reqwest::Client::builder()

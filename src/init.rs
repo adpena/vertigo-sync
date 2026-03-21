@@ -191,7 +191,7 @@ jobs:
     let readme = format!(
         r#"# {project_name}
 
-Built with [Vertigo Sync](https://github.com/adpena/vertigo-sync).
+Built with [Vertigo Sync](https://github.com/vertigo-sync/vertigo-sync).
 
 ## Getting Started
 

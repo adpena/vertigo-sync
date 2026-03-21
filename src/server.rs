@@ -392,7 +392,7 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> Json<serde_json
     let project = crate::project::parse_project(&state.project_path).ok();
     Json(serde_json::json!({
         "status": "ok",
-        "version": "0.1.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "server_boot_time": boot_elapsed,
         "server_id": state.server_id,
         "project_name": project.as_ref().map(|tree| tree.name.clone()),
@@ -1587,7 +1587,16 @@ fn resolve_patch_target(source_root: &Path, raw_path: &str) -> anyhow::Result<Pa
         }
     }
 
-    Ok(source_root.join(candidate))
+    let target = source_root.join(candidate);
+
+    let canon_root = source_root.canonicalize().unwrap_or_else(|_| source_root.to_path_buf());
+    if let Some(canon_target) = target.parent().and_then(|p| p.canonicalize().ok()).or_else(|| target.canonicalize().ok()) {
+        if !canon_target.starts_with(&canon_root) {
+            anyhow::bail!("patch target escapes source root");
+        }
+    }
+
+    Ok(target)
 }
 
 #[cfg(test)]

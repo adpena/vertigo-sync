@@ -195,8 +195,10 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                         .or(branch.as_deref())
                         .unwrap_or("HEAD");
 
+                    validate_git_ref(checkout_ref)?;
+
                     let status = std::process::Command::new("git")
-                        .args(["checkout", checkout_ref])
+                        .args(["checkout", "--", checkout_ref])
                         .current_dir(&clone_dir)
                         .status()
                         .with_context(|| format!("failed to checkout {checkout_ref} in {}", clone_dir.display()))?;
@@ -217,7 +219,7 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                 DependencySpec::Registry { registry, name: dep_name } => {
                     let registry_url = config.registries.get(registry)
                         .with_context(|| format!("registry '{registry}' not defined in [registries] of vsync.toml"))?;
-                    let _custom_registry = RegistryClient::new(registry_url.clone())?;
+                    let custom_client = RegistryClient::new(registry_url.clone())?;
 
                     // Parse name as scope/name@version
                     let (scope, pkg_name, version_req) = parse_version_req(dep_name)
@@ -232,14 +234,48 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                         }
                     }
 
-                    // Enqueue for resolution via the standard pipeline
-                    pending_resolve.push(PendingResolve {
-                        scope,
-                        name: pkg_name,
-                        version_req,
+                    // Resolve and download using the custom registry client
+                    let versions = retry_async(3, &format!("{scope}/{pkg_name}"), || {
+                        custom_client.fetch_versions(&scope, &pkg_name)
+                    }).await?;
+                    let entry = select_version(&versions, &version_req)
+                        .with_context(|| format!("no version of {scope}/{pkg_name} satisfies {version_req}"))?
+                        .clone();
+                    let version = entry.version.clone();
+                    let bytes = retry_async(3, &format!("download {scope}/{pkg_name}@{version}"), || {
+                        custom_client.download_package(&scope, &pkg_name, &version)
+                    }).await?;
+                    let checksum = hex_sha256(&bytes);
+
+                    let dest = packages_dir.join(&scope).join(&pkg_name);
+                    std::fs::create_dir_all(&dest)?;
+                    let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.clone());
+                    if !canonical_dest.starts_with(&canon_pkg) {
+                        bail!("package path escapes Packages directory");
+                    }
+
+                    let cache_path = cache::cached_package_path(&checksum)?;
+                    let dest_clone = dest.clone();
+                    let scope_clone = scope.clone();
+                    let name_clone = pkg_name.clone();
+                    let version_clone = version.clone();
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        std::fs::write(&cache_path, &bytes)?;
+                        extract_zip(&bytes, &dest_clone)
+                            .with_context(|| format!("failed to extract {scope_clone}/{name_clone}@{version_clone}"))?;
+                        Ok(())
+                    }).await.context("extract task panicked")??;
+
+                    lockfile.packages.retain(|p| p.name != full_name);
+                    lockfile.packages.push(LockedPackage {
+                        name: full_name,
+                        version: version.clone(),
                         realm: realm.to_string(),
-                        full_name,
+                        checksum,
+                        source: format!("registry:{registry}"),
+                        dependencies: entry.dependencies.iter().map(|(k, v)| format!("{k}@{v}")).collect(),
                     });
+                    lockfile.save(&lock_path)?;
                 }
             }
         }
@@ -566,6 +602,14 @@ fn select_version<'a>(versions: &'a [IndexEntry], req_str: &str) -> Result<&'a I
         .with_context(|| format!("no version satisfies {req_str}"))
 }
 
+/// Validate that a git ref string contains only safe characters.
+fn validate_git_ref(s: &str) -> Result<()> {
+    if s.is_empty() || s.starts_with('-') || !s.chars().all(|c| c.is_ascii_alphanumeric() || ".-_/".contains(c)) {
+        bail!("invalid git ref: {s}");
+    }
+    Ok(())
+}
+
 /// Recursively copy a directory tree from `src` to `dst`, skipping `.git` metadata.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
@@ -640,11 +684,6 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
                 MAX_FILE_BYTES
             );
         }
-        total_written += file_size;
-        if total_written > MAX_TOTAL_BYTES {
-            bail!("zip total uncompressed size exceeds {} byte limit", MAX_TOTAL_BYTES);
-        }
-
         let Some(enclosed_name) = file.enclosed_name() else {
             // Skip entries with unsafe paths (path traversal, absolute paths, etc.)
             continue;
@@ -667,9 +706,13 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
                 format!("failed to create file {}", out_path.display())
             })?;
             let mut limited = (&mut file).take(MAX_FILE_BYTES);
-            std::io::copy(&mut limited, &mut outfile).with_context(|| {
+            let written = std::io::copy(&mut limited, &mut outfile).with_context(|| {
                 format!("failed to write file {}", out_path.display())
             })?;
+            total_written += written;
+            if total_written > MAX_TOTAL_BYTES {
+                bail!("zip total uncompressed size exceeds {} byte limit", MAX_TOTAL_BYTES);
+            }
         }
     }
 

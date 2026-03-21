@@ -37,7 +37,7 @@ use vertigo_sync::{
                   vsync init                                                Create a new project\n  \
                   vsync plugin-install                                      Install Studio plugin\n  \
                   vsync plugin-set-icon rbxassetid://1234567890             Stamp installed plugin with a toolbar icon asset\n\n\
-                  Learn more: https://github.com/pena/vertigo-sync",
+                  Learn more: https://github.com/vertigo-sync/vertigo-sync",
     term_width = 100
 )]
 struct Cli {
@@ -2467,6 +2467,11 @@ fn command_init(root: &Path, name: Option<&str>, template: &str) -> Result<()> {
 }
 
 fn command_login(token: Option<&str>, registry: &str) -> Result<()> {
+    // Enforce HTTPS for registry tokens (localhost exempt for dev)
+    if !registry.starts_with("https://") && !registry.starts_with("http://127.0.0.1") && !registry.starts_with("http://localhost") {
+        bail!("registry URL must use HTTPS to protect credentials: {registry}");
+    }
+
     let api_token = if let Some(t) = token {
         t.to_string()
     } else {
@@ -2766,9 +2771,9 @@ fn detect_plugins_dir() -> Result<PathBuf> {
     Err(SyncError::PluginDirNotFound.into())
 }
 
-/// Get the user home directory without pulling in the `dirs` crate.
+/// Get the user home directory.
 fn dirs_or_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    dirs::home_dir()
 }
 
 // ---------------------------------------------------------------------------

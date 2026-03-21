@@ -130,6 +130,11 @@ pub async fn publish_package(
     config: &VsyncConfig,
     registry_url: &str,
 ) -> Result<String> {
+    // Enforce HTTPS for registry tokens (localhost exempt for dev)
+    if !registry_url.starts_with("https://") && !registry_url.starts_with("http://127.0.0.1") && !registry_url.starts_with("http://localhost") {
+        bail!("registry URL must use HTTPS to protect credentials: {registry_url}");
+    }
+
     // Get auth token
     let token = credentials::get_token(registry_url)?
         .with_context(|| {
