@@ -3,8 +3,11 @@
 Fast, deterministic source sync and toolchain for Roblox Studio.
 
 ![version](https://img.shields.io/badge/version-0.1.0-blue)
+![status](https://img.shields.io/badge/status-early%20release-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
+
+> **Early release.** vsync is under active development. The core sync engine, formatter, and package installer are functional and tested against the real Wally registry. Some features are incomplete — see [Status](#status) below. APIs and config formats may change before 1.0. Bug reports and feedback are welcome.
 
 ## Features
 
@@ -155,6 +158,44 @@ Include:
 2. Keep changes focused -- one feature or fix per PR
 3. Include tests for new functionality
 4. Run `cargo test` and `cargo clippy` before submitting
+
+## Status
+
+vsync 0.1 is an early release. Here is what works today and what is planned.
+
+### Stable (tested, used in real projects)
+
+- Live sync to Studio (WebSocket + SSE + HTTP polling)
+- `vsync build` / `vsync syncback` / `vsync sourcemap`
+- Two-way sync (Studio writes back to disk via `POST /sync/patch`)
+- Rojo-compatible `default.project.json` (all standard features)
+- Studio plugin with reconnection, frame budgeting, time travel, settings UI
+
+### Functional (new in 0.1, tested against real Wally registry)
+
+- `vsync install` / `vsync add` / `vsync remove` with transitive dependency resolution
+- `vsync fmt` (StyLua-powered, parallel via rayon)
+- `vsync validate` with 20 built-in lint rules (parallel via rayon)
+- `vsync init` / `vsync migrate` / `vsync run`
+- `vsync.toml` unified config, `vsync.lock` lockfile
+
+### Not yet implemented
+
+- `vsync publish` / `vsync login` (registry auth and package upload)
+- `vsync update` (re-resolve dependencies to latest matching versions)
+- Git and private registry dependencies
+- Workspace / monorepo support
+- `.styluaignore` equivalent
+- Shell completion generation (`vsync completions <shell>`)
+- Type checking integration (`luau-analyze`)
+- Sourcemap auto-regeneration during `vsync serve`
+
+### Out of scope (use alongside vsync)
+
+- **darklua** -- Luau preprocessing/bundling. Use `vsync run` to orchestrate.
+- **run-in-roblox** -- Headless test execution. Use `vsync run test` to orchestrate.
+- **Tarmac** -- Asset pipeline (image uploads). Use `vsync run` to orchestrate.
+- **luau-lsp** -- Language server. vsync generates sourcemaps for it; install separately.
 
 ## Vision
 
