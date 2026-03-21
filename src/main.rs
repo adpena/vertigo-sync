@@ -1966,7 +1966,7 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
                                         );
                                     }
                                 }
-                                // TODO: support array/object property types (e.g. Color3, Vector3)
+                                // Complex property types (Color3, Vector3, CFrame, UDim2) are not supported in build mode
                                 _ => {}
                             }
                         }

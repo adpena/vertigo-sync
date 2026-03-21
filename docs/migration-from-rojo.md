@@ -45,6 +45,58 @@ If you had the Rojo plugin installed, disable it in Studio to avoid conflicts.
 
 The Vertigo Sync plugin connects automatically. You should see a green "Connected" status within seconds.
 
+## Automatic Migration
+
+Run `vsync migrate` in a project directory that has Rojo ecosystem config files:
+
+```bash
+vsync migrate
+```
+
+This reads the following files (if present) and merges them into a single `vsync.toml`:
+
+| Source file | Migrated to |
+|-------------|-------------|
+| `wally.toml` | `[package]`, `[dependencies]`, `[server-dependencies]`, `[dev-dependencies]` |
+| `selene.toml` | `[lint]` (carries over the `std` hint and default rule severities) |
+| `stylua.toml` | `[format]` (indent type, width, line width, quote style, call parentheses) |
+
+If `aftman.toml` or `foreman.toml` is detected, vsync reports their presence. Those files can be removed since vsync bundles all the tools they managed.
+
+`vsync migrate` does not overwrite an existing `vsync.toml`. It is safe to run repeatedly.
+
+## Tool Replacement Reference
+
+| Before | After |
+|--------|-------|
+| `rojo serve` | `vsync serve` |
+| `rojo build -o game.rbxl` | `vsync build -o game.rbxl` |
+| `rojo sourcemap` | `vsync sourcemap` |
+| `selene src/` | `vsync validate` |
+| `stylua src/` | `vsync fmt` |
+| `stylua --check src/` | `vsync fmt --check` |
+| `wally install` | `vsync install` |
+
+## Update CI Scripts
+
+A typical CI pipeline migration:
+
+```yaml
+# Before
+- run: aftman install
+- run: wally install
+- run: selene src/
+- run: stylua --check src/
+- run: rojo build -o game.rbxl
+
+# After
+- run: cargo install vertigo-sync
+- run: vsync install
+- run: vsync validate
+- run: vsync fmt --check
+- run: vsync build -o game.rbxl
+```
+
 ## What Works Identically
 
 - **`default.project.json` format** -- same schema, same `$path`/`$className` directives, same `$ignoreUnknownInstances`
@@ -133,3 +185,17 @@ If you need to go back to Rojo:
 4. Start `rojo serve`
 
 No source files are modified. The migration is fully reversible.
+
+## Clean Up Old Config Files
+
+Once migration is confirmed working, remove the files that vsync replaces:
+
+```bash
+rm -f wally.toml wally.lock selene.toml stylua.toml aftman.toml foreman.toml
+```
+
+Keep `default.project.json` -- vsync uses it directly.
+
+## Keeping Selene Alongside vsync
+
+vsync's built-in linter covers a different set of rules than selene. If a project uses selene rules that vsync does not implement, both tools can be used together. vsync runs selene automatically during `vsync validate` when selene is found on `PATH`.

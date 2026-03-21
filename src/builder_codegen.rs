@@ -65,7 +65,7 @@ pub fn scaffold_builder(
     writeln!(code, "\tlocal root = Instance.new(\"Model\")").unwrap();
     writeln!(code, "\troot.Name = \"{zone}\"").unwrap();
     writeln!(code).unwrap();
-    writeln!(code, "\t-- TODO: Add geometry here").unwrap();
+    writeln!(code, "\t-- Add geometry below").unwrap();
     writeln!(code, "\t-- Example:").unwrap();
     writeln!(code, "\t-- local part = Instance.new(\"Part\")").unwrap();
     writeln!(code, "\t-- part.Size = Vector3.new(100, 2, 100)").unwrap();

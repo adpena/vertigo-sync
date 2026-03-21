@@ -58,7 +58,7 @@ bash -n scripts/*.sh
 - Include a short test plan in the PR description.
 - Include before/after screenshots or videos for UI/feel changes.
 - Do not commit secrets, API keys, or personal account IDs.
-- Respect the root [LICENSE](/Users/adpena/Projects/vertigo-sync/LICENSE).
+- Respect the root [LICENSE](LICENSE).
 - Keep generated plugin artifacts and their source in sync when a change affects plugin packaging.
 
 ## Reporting Bugs

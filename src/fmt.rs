@@ -115,8 +115,6 @@ pub fn format_file(path: &Path, config: &FormatConfig) -> Result<bool> {
 // File walker
 // ---------------------------------------------------------------------------
 
-// TODO: extract shared walk_lua_files utility (see also lint/mod.rs)
-
 /// Recursively collect `.luau` and `.lua` files under `dir`.
 pub fn collect_lua_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     let mut out = Vec::new();

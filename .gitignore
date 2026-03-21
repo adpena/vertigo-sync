@@ -1,4 +1,29 @@
+# Build
 target/
 benchmark-results/
+
+# Editor files
+*.swp
+*~
+*.bak
+*.orig
+*.rej
+.vscode/
+.idea/
+*.iml
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# Logs
 *.log
+
+# vsync state
+.vertigo-sync-state/
+sourcemap.json

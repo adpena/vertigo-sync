@@ -13,9 +13,9 @@
 ### Task 1: Add `editPreview` project schema support in `vertigo-sync`
 
 **Files:**
-- Modify: `/Users/adpena/Projects/vertigo-sync/src/project.rs`
-- Test: `/Users/adpena/Projects/vertigo-sync/src/project.rs`
-- Modify: `/Users/adpena/Projects/vertigo-sync/docs/configuration.md`
+- Modify: `<project-root>/src/project.rs`
+- Test: `<project-root>/src/project.rs`
+- Modify: `<project-root>/docs/configuration.md`
 
 - [ ] **Step 1: Write the failing parser test**
 
@@ -80,8 +80,8 @@ Document the new `vertigoSync.editPreview` block in `docs/configuration.md` with
 ### Task 2: Expose `editPreview` in the `/project` payload
 
 **Files:**
-- Modify: `/Users/adpena/Projects/vertigo-sync/src/server.rs`
-- Test: `/Users/adpena/Projects/vertigo-sync/src/server.rs` or existing server tests if present
+- Modify: `<project-root>/src/server.rs`
+- Test: `<project-root>/src/server.rs` or existing server tests if present
 
 - [ ] **Step 1: Write the failing server payload test**
 
@@ -113,9 +113,9 @@ Expected: PASS.
 ### Task 3: Move generic edit-preview orchestration into `VertigoSyncPlugin`
 
 **Files:**
-- Modify: `/Users/adpena/Projects/vertigo-sync/assets/plugin_src/00_main.lua`
-- Modify: `/Users/adpena/Projects/vertigo-sync/assets/VertigoSyncPlugin.lua`
-- Reference: `/Users/adpena/Projects/vertigo/studio-plugin/VertigoEditSync.lua`
+- Modify: `<project-root>/assets/plugin_src/00_main.lua`
+- Modify: `<project-root>/assets/VertigoSyncPlugin.lua`
+- Reference: `<vertigo-repo>/studio-plugin/VertigoEditSync.lua`
 
 - [ ] **Step 1: Add a focused plugin regression first**
 
@@ -158,9 +158,9 @@ Expected: PASS.
 ### Task 4: Remove the standalone `VertigoEditSync` dependency from `vertigo`
 
 **Files:**
-- Modify: `/Users/adpena/Projects/vertigo/default.project.json`
-- Delete: `/Users/adpena/Projects/vertigo/studio-plugin/VertigoEditSync.lua`
-- Docs/update if needed in `/Users/adpena/Projects/vertigo/README.md` or dev docs that reference the old plugin
+- Modify: `<vertigo-repo>/default.project.json`
+- Delete: `<vertigo-repo>/studio-plugin/VertigoEditSync.lua`
+- Docs/update if needed in `<vertigo-repo>/README.md` or dev docs that reference the old plugin
 
 - [ ] **Step 1: Add project config for the shared contract**
 
@@ -174,7 +174,7 @@ Use:
 
 - [ ] **Step 2: Remove the old standalone plugin file**
 
-Delete `/Users/adpena/Projects/vertigo/studio-plugin/VertigoEditSync.lua`.
+Delete `<vertigo-repo>/studio-plugin/VertigoEditSync.lua`.
 
 - [ ] **Step 3: Update any docs/scripts that still tell users to install or expect `VertigoEditSync`**
 
@@ -182,15 +182,15 @@ Replace them with `VertigoSyncPlugin` / `vsync plugin-install`.
 
 - [ ] **Step 4: Verify no stale references remain**
 
-Run: `rg -n "VertigoEditSync" /Users/adpena/Projects/vertigo -S`
+Run: `rg -n "VertigoEditSync" <vertigo-repo> -S`
 
 Expected: only intentional migration notes, or zero references if fully removed.
 
 ### Task 5: Update `arnis-roblox` to use the shared edit-preview contract
 
 **Files:**
-- Modify: `/Users/adpena/Projects/arnis-roblox/roblox/default.project.json`
-- Modify: `/Users/adpena/Projects/arnis-roblox/scripts/run_studio_harness.sh`
+- Modify: `<arnis-roblox-repo>/roblox/default.project.json`
+- Modify: `<arnis-roblox-repo>/scripts/run_studio_harness.sh`
 
 - [ ] **Step 1: Add `editPreview` config to `arnis-roblox`**
 
@@ -208,7 +208,7 @@ Stop depending on the removed standalone plugin. Prefer:
 
 - [ ] **Step 3: Verify no harness logic still assumes `VertigoEditSync`**
 
-Run: `rg -n "VertigoEditSync|StudioPreviewBuilder" /Users/adpena/Projects/arnis-roblox/scripts /Users/adpena/Projects/arnis-roblox/roblox -S`
+Run: `rg -n "VertigoEditSync|StudioPreviewBuilder" <arnis-roblox-repo>/scripts <arnis-roblox-repo>/roblox -S`
 
 Expected: no references to the old standalone plugin contract.
 
@@ -216,19 +216,19 @@ Expected: no references to the old standalone plugin contract.
 
 **Files:**
 - Verify across:
-  - `/Users/adpena/Projects/vertigo-sync`
-  - `/Users/adpena/Projects/vertigo`
-  - `/Users/adpena/Projects/arnis-roblox`
+  - `<project-root>`
+  - `<vertigo-repo>`
+  - `<arnis-roblox-repo>`
 
 - [ ] **Step 1: Run `vertigo-sync` tests**
 
-Run: `cargo test --manifest-path /Users/adpena/Projects/vertigo-sync/Cargo.toml --all-targets --all-features`
+Run: `cargo test --manifest-path <project-root>/Cargo.toml --all-targets --all-features`
 
 Expected: PASS.
 
 - [ ] **Step 2: Reinstall the Studio plugin from `vertigo-sync`**
 
-Run: `cargo run --manifest-path /Users/adpena/Projects/vertigo-sync/Cargo.toml -- plugin-install`
+Run: `cargo run --manifest-path <project-root>/Cargo.toml -- plugin-install`
 
 Expected: installed plugin updated.
 
@@ -237,7 +237,7 @@ Expected: installed plugin updated.
 Run:
 
 ```bash
-vsync --root /Users/adpena/Projects/arnis-roblox --turbo serve --project roblox/default.project.json
+vsync --root <arnis-roblox-repo> --turbo serve --project roblox/default.project.json
 ```
 
 Expected: server starts and advertises the `arnis-roblox` project identity.
@@ -247,7 +247,7 @@ Expected: server starts and advertises the `arnis-roblox` project identity.
 Run:
 
 ```bash
-bash /Users/adpena/Projects/arnis-roblox/scripts/run_studio_harness.sh --takeover --hard-restart --no-play --edit-wait 30 --pattern-wait 150
+bash <arnis-roblox-repo>/scripts/run_studio_harness.sh --takeover --hard-restart --no-play --edit-wait 30 --pattern-wait 150
 ```
 
 Expected:
@@ -260,13 +260,13 @@ Expected:
 Commit separately per repo so the extraction boundary stays reviewable:
 
 ```bash
-git -C /Users/adpena/Projects/vertigo-sync add src/project.rs src/server.rs assets/plugin_src/00_main.lua assets/VertigoSyncPlugin.lua docs/configuration.md docs/quickstart.md docs/troubleshooting.md docs/superpowers/specs/2026-03-20-edit-preview-extraction-design.md docs/superpowers/plans/2026-03-20-edit-preview-extraction.md
-git -C /Users/adpena/Projects/vertigo-sync commit -m "feat: integrate edit preview orchestration into vertigo sync"
+git -C <project-root> add src/project.rs src/server.rs assets/plugin_src/00_main.lua assets/VertigoSyncPlugin.lua docs/configuration.md docs/quickstart.md docs/troubleshooting.md docs/superpowers/specs/2026-03-20-edit-preview-extraction-design.md docs/superpowers/plans/2026-03-20-edit-preview-extraction.md
+git -C <project-root> commit -m "feat: integrate edit preview orchestration into vertigo sync"
 
-git -C /Users/adpena/Projects/vertigo add default.project.json
-git -C /Users/adpena/Projects/vertigo rm studio-plugin/VertigoEditSync.lua
-git -C /Users/adpena/Projects/vertigo commit -m "chore: adopt vertigo sync edit preview contract"
+git -C <vertigo-repo> add default.project.json
+git -C <vertigo-repo> rm studio-plugin/VertigoEditSync.lua
+git -C <vertigo-repo> commit -m "chore: adopt vertigo sync edit preview contract"
 
-git -C /Users/adpena/Projects/arnis-roblox add roblox/default.project.json scripts/run_studio_harness.sh
-git -C /Users/adpena/Projects/arnis-roblox commit -m "chore: adopt vertigo sync edit preview contract"
+git -C <arnis-roblox-repo> add roblox/default.project.json scripts/run_studio_harness.sh
+git -C <arnis-roblox-repo> commit -m "chore: adopt vertigo sync edit preview contract"
 ```

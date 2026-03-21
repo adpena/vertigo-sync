@@ -111,7 +111,7 @@ To consolidate `wally.toml`, `selene.toml`, and `stylua.toml` into a single `vsy
 vsync migrate
 ```
 
-See [docs/migration.md](docs/migration.md) for the full migration guide.
+See [docs/migration-from-rojo.md](docs/migration-from-rojo.md) for the full migration guide.
 
 ## Architecture
 

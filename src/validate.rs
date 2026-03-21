@@ -1092,18 +1092,33 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 
 /// Find selene on PATH.
 fn which_selene() -> Option<String> {
-    // Check common locations first.
-    for path in &[std::env::var("HOME")
-        .map(|h| format!("{h}/.aftman/bin/selene"))
-        .unwrap_or_default()]
+    // Check common aftman install locations first.
+    #[cfg(target_os = "windows")]
     {
-        if !path.is_empty() && Path::new(path).is_file() {
-            return Some(path.clone());
+        if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+            let path = format!("{appdata}\\aftman\\bin\\selene.exe");
+            if Path::new(&path).is_file() {
+                return Some(path);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            let path = format!("{home}/.aftman/bin/selene");
+            if Path::new(&path).is_file() {
+                return Some(path);
+            }
         }
     }
 
-    // Fall back to PATH lookup via `which`.
-    Command::new("which")
+    // Fall back to PATH lookup via `which` (Unix) or `where` (Windows).
+    #[cfg(target_os = "windows")]
+    let which_cmd = "where";
+    #[cfg(not(target_os = "windows"))]
+    let which_cmd = "which";
+
+    Command::new(which_cmd)
         .arg("selene")
         .output()
         .ok()
