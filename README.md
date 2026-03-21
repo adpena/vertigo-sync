@@ -2,7 +2,7 @@
 
 Fast, deterministic source sync and toolchain for Roblox Studio.
 
-![version](https://img.shields.io/badge/version-0.1.0-blue)
+![version](https://img.shields.io/badge/version-0.2.0-blue)
 ![status](https://img.shields.io/badge/status-early%20release-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
