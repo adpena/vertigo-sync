@@ -309,6 +309,138 @@ pub fn validate_plugin_source_text(path: &str, content: &str) -> Result<PluginSa
 }
 
 // ---------------------------------------------------------------------------
+// Auto-fix support
+// ---------------------------------------------------------------------------
+
+/// Auto-fix known issues across all `.luau`/`.lua` files under the given
+/// include roots. Returns the number of files that were modified.
+///
+/// Fixable rules:
+/// - `wait-deprecated`  -> replace bare `wait(` with `task.wait(`
+/// - `spawn-deprecated` -> replace bare `spawn(` with `task.spawn(`
+/// - `delay-deprecated` -> replace bare `delay(` with `task.delay(`
+/// - `strict-mode`      -> prepend `--!strict\n` to `.luau` files missing it
+pub fn auto_fix_source_tree(
+    root: &Path,
+    includes: &[String],
+    ignore_globs: &[String],
+) -> Result<usize> {
+    let resolved = crate::resolve_includes(includes);
+    let ignores = GlobIgnoreSet::new(ignore_globs);
+    let mut fixed_count = 0usize;
+
+    for inc in &resolved {
+        let inc_path = root.join(inc);
+        if !inc_path.exists() {
+            continue;
+        }
+        auto_fix_walk(&inc_path, root, &ignores, &mut fixed_count)?;
+    }
+
+    Ok(fixed_count)
+}
+
+fn auto_fix_walk(
+    dir: &Path,
+    root: &Path,
+    ignores: &GlobIgnoreSet,
+    fixed_count: &mut usize,
+) -> Result<()> {
+    let read_dir =
+        std::fs::read_dir(dir).with_context(|| format!("cannot read dir: {}", dir.display()))?;
+
+    for entry in read_dir {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            if matches!(
+                name_str.as_ref(),
+                ".git" | "node_modules" | "Packages" | "target" | "dist" | "build"
+            ) {
+                continue;
+            }
+            auto_fix_walk(&entry.path(), root, ignores, fixed_count)?;
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        let is_luau = name_str.ends_with(".luau");
+        let is_lua = name_str.ends_with(".lua");
+        if !is_luau && !is_lua {
+            continue;
+        }
+
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        let rel_str = rel.to_string_lossy();
+        if ignores.is_ignored(&rel_str) {
+            continue;
+        }
+
+        let original = std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let mut content = original.clone();
+
+        // Fix deprecated bare calls
+        content = fix_deprecated_bare_call(&content, "wait");
+        content = fix_deprecated_bare_call(&content, "spawn");
+        content = fix_deprecated_bare_call(&content, "delay");
+
+        // Fix missing --!strict for .luau files
+        if is_luau {
+            let first_line = content.lines().next().unwrap_or("");
+            if first_line.trim() != "--!strict" {
+                content = format!("--!strict\n{content}");
+            }
+        }
+
+        if content != original {
+            std::fs::write(&path, &content)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            *fixed_count += 1;
+        }
+    }
+
+    Ok(())
+}
+
+/// Replace bare `wait(` / `spawn(` / `delay(` calls with `task.wait(` etc.
+/// Only replaces occurrences that are NOT preceded by `.` or a word character
+/// (to avoid replacing `task.wait(` or `obj.wait(`).
+fn fix_deprecated_bare_call(source: &str, func_name: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    // Build a regex that matches bare calls: start-of-line or non-word/non-dot
+    // character followed by the function name and `(`.
+    // We capture the prefix so we can preserve it.
+    static FIX_WAIT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)(^|[^.\w])wait\s*\(").unwrap());
+    static FIX_SPAWN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)(^|[^.\w])spawn\s*\(").unwrap());
+    static FIX_DELAY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)(^|[^.\w])delay\s*\(").unwrap());
+
+    let re = match func_name {
+        "wait" => &*FIX_WAIT,
+        "spawn" => &*FIX_SPAWN,
+        "delay" => &*FIX_DELAY,
+        _ => return source.to_string(),
+    };
+
+    let replacement = format!("${{1}}task.{func_name}(");
+    re.replace_all(source, replacement.as_str()).into_owned()
+}
+
+// ---------------------------------------------------------------------------
 // Individual checks
 // ---------------------------------------------------------------------------
 

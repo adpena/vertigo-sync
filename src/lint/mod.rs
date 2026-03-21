@@ -56,6 +56,17 @@ const BUILTIN_RULES: &[(&str, RuleFn)] = &[
     ("delay-deprecated", rules::check_delay_deprecated),
     ("empty-block", rules::check_empty_block),
     ("unreachable-code", rules::check_unreachable_code),
+    ("function-length", rules::check_function_length),
+    ("nesting-depth", rules::check_nesting_depth),
+    (
+        "cyclomatic-complexity",
+        rules::check_cyclomatic_complexity,
+    ),
+    (
+        "parentheses-condition",
+        rules::check_parentheses_condition,
+    ),
+    ("comparison-order", rules::check_comparison_order),
 ];
 
 // ---------------------------------------------------------------------------

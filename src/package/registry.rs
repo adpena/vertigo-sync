@@ -127,8 +127,13 @@ pub struct RegistryClient {
 impl RegistryClient {
     /// Create a client pointed at the default Wally registry.
     pub fn default_wally() -> Result<Self> {
+        Self::new("https://api.wally.run".to_string())
+    }
+
+    /// Create a client pointed at an arbitrary registry API URL.
+    pub fn new(api_url: String) -> Result<Self> {
         Ok(Self {
-            api_url: "https://api.wally.run".to_string(),
+            api_url,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()

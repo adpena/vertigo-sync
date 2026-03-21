@@ -113,7 +113,7 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
     // ── Phase 1: Collect and filter ──────────────────────────────────────
     // Check lockfile + cache BEFORE any network call.
     for (realm, deps) in &dep_groups {
-        for spec in (*deps).values() {
+        for (alias, spec) in *deps {
             total += 1;
             match spec {
                 DependencySpec::Simple(version_spec) => {
@@ -155,11 +155,91 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                     }
                     // Path deps are not cached or locked — they're used directly.
                 }
-                DependencySpec::Git { .. } => {
-                    bail!("git dependencies are not yet supported (coming in v1.1)");
+                DependencySpec::Git { git, rev, branch, tag } => {
+                    let clone_dir = cache::git_clone_dir(git)?;
+
+                    // Clone or fetch
+                    if !clone_dir.exists() {
+                        std::fs::create_dir_all(clone_dir.parent().unwrap())?;
+                        let mut cmd = std::process::Command::new("git");
+                        cmd.args(["clone", "--depth", "1"]);
+
+                        // If a specific branch/tag is requested, pass it to clone
+                        if let Some(b) = branch.as_deref() {
+                            cmd.args(["--branch", b]);
+                        } else if let Some(t) = tag.as_deref() {
+                            cmd.args(["--branch", t]);
+                        }
+
+                        cmd.arg(git.as_str()).arg(&clone_dir);
+                        let status = cmd.status()
+                            .with_context(|| format!("failed to run `git clone` for {git}"))?;
+                        if !status.success() {
+                            bail!("failed to clone {git}");
+                        }
+                    } else {
+                        // Repository already cloned — fetch updates
+                        let status = std::process::Command::new("git")
+                            .args(["fetch", "--all"])
+                            .current_dir(&clone_dir)
+                            .status()
+                            .with_context(|| format!("failed to run `git fetch` in {}", clone_dir.display()))?;
+                        if !status.success() {
+                            bail!("failed to fetch updates for {git}");
+                        }
+                    }
+
+                    // Checkout specific ref
+                    let checkout_ref = rev.as_deref()
+                        .or(tag.as_deref())
+                        .or(branch.as_deref())
+                        .unwrap_or("HEAD");
+
+                    let status = std::process::Command::new("git")
+                        .args(["checkout", checkout_ref])
+                        .current_dir(&clone_dir)
+                        .status()
+                        .with_context(|| format!("failed to checkout {checkout_ref} in {}", clone_dir.display()))?;
+                    if !status.success() {
+                        bail!("failed to checkout {checkout_ref} for {git}");
+                    }
+
+                    // Copy to Packages/<alias>
+                    let dest = packages_dir.join(alias);
+                    if dest.exists() {
+                        std::fs::remove_dir_all(&dest)?;
+                    }
+                    copy_dir_recursive(&clone_dir, &dest)
+                        .with_context(|| format!("failed to copy git dep {git} to {}", dest.display()))?;
+
+                    eprintln!("  \u{2193} {git} -> {}", dest.display());
                 }
-                DependencySpec::Registry { .. } => {
-                    bail!("custom registry dependencies are not yet supported (coming in v1.1)");
+                DependencySpec::Registry { registry, name: dep_name } => {
+                    let registry_url = config.registries.get(registry)
+                        .with_context(|| format!("registry '{registry}' not defined in [registries] of vsync.toml"))?;
+                    let _custom_registry = RegistryClient::new(registry_url.clone())?;
+
+                    // Parse name as scope/name@version
+                    let (scope, pkg_name, version_req) = parse_version_req(dep_name)
+                        .with_context(|| format!("bad registry dependency spec: {dep_name}"))?;
+                    let full_name = format!("{scope}/{pkg_name}");
+
+                    // Check lockfile + cache
+                    if let Some(locked) = lockfile.packages.iter().find(|p| p.name == full_name) {
+                        if cache::is_cached(&locked.checksum)? {
+                            cached += 1;
+                            continue;
+                        }
+                    }
+
+                    // Enqueue for resolution via the standard pipeline
+                    pending_resolve.push(PendingResolve {
+                        scope,
+                        name: pkg_name,
+                        version_req,
+                        realm: realm.to_string(),
+                        full_name,
+                    });
                 }
             }
         }
@@ -486,6 +566,41 @@ fn select_version<'a>(versions: &'a [IndexEntry], req_str: &str) -> Result<&'a I
         .with_context(|| format!("no version satisfies {req_str}"))
 }
 
+/// Recursively copy a directory tree from `src` to `dst`, skipping `.git` metadata.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)
+        .with_context(|| format!("failed to read directory {}", src.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Skip .git directory to avoid copying repository metadata
+        if name_str == ".git" {
+            continue;
+        }
+
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)
+                .with_context(|| {
+                    format!(
+                        "failed to copy {} to {}",
+                        src_path.display(),
+                        dst_path.display()
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
 /// Extract a zip archive from `bytes` into `dest`, creating directories as needed.
 fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     const MAX_ZIP_ENTRIES: usize = 2_000;
@@ -559,4 +674,29 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_dir_recursive_skips_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+
+        // Create source with .git and a regular file
+        std::fs::create_dir_all(src.join(".git")).unwrap();
+        std::fs::write(src.join(".git/config"), "git config").unwrap();
+        std::fs::write(src.join("init.luau"), "return {}").unwrap();
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/module.luau"), "return {}").unwrap();
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        assert!(dst.join("init.luau").exists());
+        assert!(dst.join("sub/module.luau").exists());
+        assert!(!dst.join(".git").exists(), ".git should be skipped");
+    }
 }

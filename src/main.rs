@@ -207,6 +207,9 @@ enum Command {
         /// Project file path (default: default.project.json).
         #[arg(long, default_value = "default.project.json")]
         project: PathBuf,
+        /// Auto-fix lint issues where possible.
+        #[arg(long)]
+        fix: bool,
     },
     /// Scan a Roblox Studio log for fatal Vertigo Sync plugin smoke failures.
     #[command(display_order = 14)]
@@ -294,6 +297,9 @@ enum Command {
         /// Project name (default: current directory name)
         #[arg(long)]
         name: Option<String>,
+        /// Project template: "default", "library", or "plugin"
+        #[arg(long, default_value = "default")]
+        template: String,
     },
     /// Install packages from vsync.toml.
     #[command(display_order = 44)]
@@ -374,6 +380,26 @@ enum Command {
         #[arg(long, default_value = "default.project.json")]
         project: PathBuf,
     },
+    /// Authenticate with a package registry.
+    #[command(display_order = 51)]
+    Login {
+        /// API token (if omitted, reads from stdin).
+        #[arg(long)]
+        token: Option<String>,
+        /// Registry URL to authenticate with.
+        #[arg(long, default_value = "https://api.wally.run")]
+        registry: String,
+    },
+    /// Publish a package to a registry.
+    #[command(display_order = 52)]
+    Publish {
+        /// Registry URL to publish to.
+        #[arg(long, default_value = "https://api.wally.run")]
+        registry: String,
+        /// Project file path.
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
+    },
     /// Generate shell completion scripts.
     #[command(display_order = 90)]
     Completions {
@@ -414,7 +440,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         } => command_discover(&root, project, server_url.as_deref(), &cli).await,
         Command::Watch { project } => command_watch(&root, &state_dir, project, &cli),
         Command::WatchNative { project } => command_watch_native(&root, &state_dir, project, &cli),
-        Command::Validate { project } => command_validate(&root, project, &cli),
+        Command::Validate { project, fix } => command_validate(&root, project, *fix, &cli),
         Command::PluginSmokeLog {
             log,
             allow_plugin,
@@ -438,7 +464,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             include_non_scripts,
             watch,
         } => command_sourcemap(&root, output, project, *include_non_scripts, *watch, &cli).await,
-        Command::Init { name } => command_init(&root, name.as_deref()),
+        Command::Init { name, template } => command_init(&root, name.as_deref(), template),
         Command::Migrate => command_migrate(&root),
         Command::Run { name } => {
             let project_context = resolve_project_context(
@@ -673,6 +699,12 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 report.installed, report.cached, report.total
             ));
             Ok(())
+        }
+        Command::Login { token, registry } => {
+            command_login(token.as_deref(), registry)
+        }
+        Command::Publish { registry, project } => {
+            command_publish(&root, project, registry, &cli).await
         }
         Command::Serve { project } => {
             let project_context = resolve_project_context(&root, project, &cli.include)?;
@@ -1405,9 +1437,24 @@ async fn command_discover(
     Ok(())
 }
 
-fn command_validate(root: &Path, project: &Path, cli: &Cli) -> Result<()> {
+fn command_validate(root: &Path, project: &Path, fix: bool, cli: &Cli) -> Result<()> {
     let project_context =
         resolve_project_context(root, project, &cli.include)?;
+
+    // --fix: auto-fix supported rules before validating
+    if fix {
+        let fixed = validate::auto_fix_source_tree(
+            &project_context.project_root,
+            &project_context.includes,
+            &project_context.tree.glob_ignore_paths,
+        )?;
+        if fixed > 0 {
+            output::success(&format!("auto-fixed {fixed} file(s)"));
+        } else {
+            output::info("no auto-fixable issues found");
+        }
+    }
+
     let mut report = validate::validate_source_with_ignores(
         &project_context.project_root,
         &project_context.includes,
@@ -2383,7 +2430,7 @@ async fn command_sourcemap(
     Ok(())
 }
 
-fn command_init(root: &Path, name: Option<&str>) -> Result<()> {
+fn command_init(root: &Path, name: Option<&str>, template: &str) -> Result<()> {
     let project_name = name
         .map(|n| n.to_string())
         .or_else(|| {
@@ -2393,10 +2440,18 @@ fn command_init(root: &Path, name: Option<&str>) -> Result<()> {
         })
         .unwrap_or_else(|| "my-project".to_string());
 
-    output::header(&format!("Initializing project: {project_name}"));
+    output::header(&format!("Initializing project: {project_name} (template: {template})"));
     eprintln!();
 
     vertigo_sync::init::run_init(root, name)?;
+
+    // Apply template-specific scaffolding
+    match template {
+        "library" => vertigo_sync::init::apply_library_template(root, &project_name)?,
+        "plugin" => vertigo_sync::init::apply_plugin_template(root, &project_name)?,
+        "default" => {}
+        other => bail!("unknown template '{other}' — use 'default', 'library', or 'plugin'"),
+    }
 
     eprintln!();
     output::success(&format!("Project '{project_name}' initialized"));
@@ -2408,6 +2463,67 @@ fn command_init(root: &Path, name: Option<&str>) -> Result<()> {
     output::info("  vsync serve --turbo             Start syncing");
     output::info("  vsync plugin-install            Install Studio plugin");
 
+    Ok(())
+}
+
+fn command_login(token: Option<&str>, registry: &str) -> Result<()> {
+    let api_token = if let Some(t) = token {
+        t.to_string()
+    } else {
+        output::info(&format!("Enter API token for {registry}:"));
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("failed to read token from stdin")?;
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            bail!("token cannot be empty");
+        }
+        trimmed
+    };
+
+    vertigo_sync::credentials::set_token(registry, &api_token)?;
+    output::success(&format!("Authenticated with {registry}"));
+    let path = vertigo_sync::credentials::credentials_path()?;
+    output::info(&format!("Credentials saved to {}", path.display()));
+
+    Ok(())
+}
+
+async fn command_publish(
+    root: &Path,
+    project: &Path,
+    registry: &str,
+    cli: &Cli,
+) -> Result<()> {
+    let project_context = resolve_project_context(root, project, &cli.include)?;
+    let config = project_context
+        .vsync_config
+        .as_ref()
+        .with_context(|| "vsync.toml is required for publishing")?;
+
+    // Validate metadata
+    output::info("Validating package metadata...");
+    vertigo_sync::publish::validate_publish_metadata(config)?;
+
+    // Run format check
+    output::info("Checking formatting...");
+    command_fmt(root, project, None, true, false, cli)?;
+
+    // Run validation
+    output::info("Running validation...");
+    command_validate(root, project, false, cli)?;
+
+    // Publish
+    output::info("Publishing...");
+    let version = vertigo_sync::publish::publish_package(
+        &project_context.project_root,
+        config,
+        registry,
+    )
+    .await?;
+
+    output::success(&format!("Published version {version}"));
     Ok(())
 }
 

@@ -206,3 +206,191 @@ vsync serve --turbo  # start syncing to Roblox Studio
 
     Ok(())
 }
+
+/// Apply the "library" template on top of the default scaffold.
+///
+/// Adds: CHANGELOG.md, `.github/workflows/release.yml`, enriched `vsync.toml`
+/// metadata (description, license, authors).
+pub fn apply_library_template(root: &Path, project_name: &str) -> Result<()> {
+    // CHANGELOG.md
+    let changelog = format!(
+        r#"# Changelog
+
+All notable changes to **{project_name}** will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+### Added
+- Initial release
+"#
+    );
+    write_if_missing(&root.join("CHANGELOG.md"), &changelog)?;
+
+    // .github/workflows/release.yml — publish on tag push
+    let release_yml = r#"name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install vsync
+        run: cargo install vertigo-sync
+
+      - name: Validate
+        run: vsync validate
+
+      - name: Format check
+        run: vsync fmt --check
+
+      - name: Publish
+        run: vsync publish
+        env:
+          VSYNC_TOKEN: ${{ secrets.VSYNC_TOKEN }}
+"#;
+    write_if_missing(
+        &root.join(".github/workflows/release.yml"),
+        release_yml,
+    )?;
+
+    // Enrich vsync.toml with library metadata if not already present.
+    // We re-read the file to patch in additional fields.
+    let toml_path = root.join("vsync.toml");
+    if toml_path.exists() {
+        let content = std::fs::read_to_string(&toml_path)
+            .with_context(|| format!("failed to read {}", toml_path.display()))?;
+
+        // Only add fields if they are not already present
+        let mut additions = String::new();
+
+        if !content.contains("description") {
+            additions.push_str("\n# description = \"A Luau library for Roblox\"\n");
+        }
+        if !content.contains("license") {
+            additions.push_str("# license = \"MIT\"\n");
+        }
+        if !content.contains("authors") {
+            additions.push_str("# authors = [\"Your Name\"]\n");
+        }
+        if !content.contains("realm") || content.contains("# realm") {
+            // Uncomment realm for libraries — they are typically shared
+            let new_content = content.replace(
+                "# realm = \"shared\"  # shared | server",
+                "realm = \"shared\"",
+            );
+            if new_content != content {
+                std::fs::write(&toml_path, &new_content)
+                    .with_context(|| format!("failed to write {}", toml_path.display()))?;
+            }
+        }
+
+        if !additions.is_empty() {
+            // Append after the [package] section header
+            let updated = std::fs::read_to_string(&toml_path)?;
+            if let Some(pos) = updated.find("# realm") {
+                // Find the end of that line
+                let line_end = updated[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(updated.len());
+                let mut patched = String::with_capacity(updated.len() + additions.len());
+                patched.push_str(&updated[..line_end]);
+                patched.push_str(&additions);
+                patched.push_str(&updated[line_end..]);
+                std::fs::write(&toml_path, &patched)?;
+            } else {
+                // Just append at the end of the [package] section
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&toml_path)?;
+                use std::io::Write;
+                write!(f, "{additions}")?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply the "plugin" template on top of the default scaffold.
+///
+/// Replaces the standard Server/Client/Shared layout with a single
+/// plugin entry point.
+pub fn apply_plugin_template(root: &Path, project_name: &str) -> Result<()> {
+    // Override default.project.json with plugin-specific tree
+    let project_path = root.join("default.project.json");
+    let project_json = serde_json::json!({
+        "name": project_name,
+        "projectId": uuid::Uuid::new_v4().to_string(),
+        "tree": {
+            "$className": "DataModel",
+            "ServerStorage": {
+                project_name: {
+                    "$path": "src/Plugin"
+                }
+            }
+        }
+    });
+    let formatted = serde_json::to_string_pretty(&project_json)?;
+    // Overwrite (plugin template replaces default)
+    std::fs::write(&project_path, &formatted)?;
+
+    // Create plugin entry point
+    let plugin_init = format!(
+        r#"--!strict
+-- {project_name} Plugin Entry Point
+
+local toolbar = plugin:CreateToolbar("{project_name}")
+local button = toolbar:CreateButton(
+    "{project_name}",
+    "Launch {project_name}",
+    "rbxassetid://0"
+)
+
+local widgetInfo = DockWidgetPluginGuiInfo.new(
+    Enum.InitialDockState.Float,
+    false,
+    false,
+    400,
+    300,
+    200,
+    150
+)
+
+local widget = plugin:CreateDockWidgetPluginGui("{project_name}", widgetInfo)
+widget.Title = "{project_name}"
+
+button.Click:Connect(function()
+    widget.Enabled = not widget.Enabled
+end)
+
+print("[{project_name}] Plugin loaded")
+"#
+    );
+
+    write_if_missing(
+        &root.join("src/Plugin/init.server.luau"),
+        &plugin_init,
+    )?;
+
+    // Update vsync.toml realm to server for plugins
+    let toml_path = root.join("vsync.toml");
+    if toml_path.exists() {
+        let content = std::fs::read_to_string(&toml_path)?;
+        let updated = content.replace(
+            "# realm = \"shared\"  # shared | server",
+            "realm = \"server\"",
+        );
+        if updated != content {
+            std::fs::write(&toml_path, &updated)?;
+        }
+    }
+
+    Ok(())
+}

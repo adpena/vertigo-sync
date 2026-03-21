@@ -8,6 +8,63 @@ pub fn resolve_script(name: &str, scripts: &BTreeMap<String, String>) -> Option<
     scripts.get(name).cloned()
 }
 
+/// Probe whether a command is available on PATH by attempting to resolve it.
+fn which_cmd(name: &str) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    let lookup = "where";
+    #[cfg(not(target_os = "windows"))]
+    let lookup = "which";
+
+    Command::new(lookup)
+        .arg(name)
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if !path.is_empty() {
+                    Some(path)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+}
+
+/// Resolve the shell and flag to use for script execution.
+///
+/// On Unix: prefers `sh` from PATH, falls back to `/bin/sh`.
+/// On Windows: prefers `pwsh`, then `powershell`, then `cmd`.
+///
+/// Returns `(shell_program, flag)` or an error if no shell is available.
+fn resolve_shell() -> Result<(&'static str, &'static str)> {
+    #[cfg(target_os = "windows")]
+    {
+        if which_cmd("pwsh").is_some() {
+            Ok(("pwsh", "-Command"))
+        } else if which_cmd("powershell").is_some() {
+            Ok(("powershell", "-Command"))
+        } else if which_cmd("cmd").is_some() {
+            Ok(("cmd", "/C"))
+        } else {
+            bail!(
+                "no shell found: vsync requires pwsh, powershell, or cmd to be available on PATH"
+            )
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if which_cmd("sh").is_some() || Path::new("/bin/sh").exists() {
+            Ok(("sh", "-c"))
+        } else {
+            bail!("no shell found: vsync requires `sh` to be available on PATH or at /bin/sh")
+        }
+    }
+}
+
 /// Execute a named script in a shell subprocess.
 ///
 /// # Trust model
@@ -27,15 +84,11 @@ pub fn run_script(
     project_root: &Path,
     project_name: &str,
 ) -> Result<i32> {
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(command);
-        c
-    };
+    let (shell, flag) = resolve_shell()
+        .with_context(|| format!("cannot run script '{name}': shell detection failed"))?;
+
+    let mut cmd = Command::new(shell);
+    cmd.arg(flag).arg(command);
 
     cmd.current_dir(project_root)
         .env("VSYNC_PROJECT_ROOT", project_root.as_os_str())

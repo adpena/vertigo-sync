@@ -53,6 +53,24 @@ static RE_LOCAL_ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=").unwrap()
 });
 
+static RE_COMPLEXITY_KEYWORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:if|elseif|while|for|repeat)\b").unwrap()
+});
+
+static RE_LOGICAL_OPERATOR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:and|or)\b").unwrap()
+});
+
+/// Matches `if (expr) then` or `elseif (expr) then` — the outer parens are unnecessary.
+static RE_PAREN_CONDITION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)\b(?:if|elseif|while)\s*\((.+)\)\s*(?:then|do)\b").unwrap()
+});
+
+/// Matches Yoda conditions: a literal or nil/true/false on the left side of == or ~=.
+static RE_YODA_CONDITION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)\b(?:nil|true|false)\s*(?:==|~=)\s*\w").unwrap()
+});
+
 // NOTE: RE_GLOBAL_SHADOW was identical to RE_LOCAL_ASSIGN; reuse the same static.
 
 static RE_WAIT_DEPRECATED: LazyLock<Regex> = LazyLock::new(|| {
@@ -479,4 +497,350 @@ fn build_line_offsets(source: &str) -> Vec<usize> {
         offsets.push(pos);
     }
     offsets
+}
+
+// ---------------------------------------------------------------------------
+// Complexity lint rules (P2)
+// ---------------------------------------------------------------------------
+
+/// Default threshold for function-length rule (lines).
+const DEFAULT_FUNCTION_LENGTH: usize = 100;
+/// Default threshold for nesting-depth rule (levels).
+const DEFAULT_NESTING_DEPTH: usize = 5;
+/// Default threshold for cyclomatic-complexity rule (branches).
+const DEFAULT_CYCLOMATIC_COMPLEXITY: usize = 10;
+
+/// Track Lua/Luau block depth changes on a single line.
+/// Returns the net change in depth (positive for openers, negative for `end`).
+fn line_depth_delta(trimmed: &str) -> i32 {
+    let mut delta: i32 = 0;
+
+    // Block openers: function, if...then, for...do, while...do, repeat, do
+    let is_opener = trimmed.starts_with("function ")
+        || trimmed.starts_with("local function ")
+        || trimmed.contains("= function(")
+        || trimmed.contains("= function (")
+        || ((trimmed.starts_with("if ") || trimmed.starts_with("elseif "))
+            && trimmed.contains("then")
+            && !trimmed.contains("end"))
+        || ((trimmed.starts_with("for ") || trimmed.starts_with("while "))
+            && trimmed.ends_with("do"))
+        || trimmed == "repeat"
+        || (trimmed.starts_with("repeat") && !trimmed.contains("until"))
+        || trimmed == "do";
+
+    if is_opener {
+        delta += 1;
+    }
+
+    // Block closers
+    let is_closer = trimmed == "end"
+        || trimmed == "end)"
+        || trimmed == "end,"
+        || trimmed.starts_with("end)")
+        || trimmed.starts_with("end,")
+        || trimmed.starts_with("end ")
+        || trimmed.starts_with("until ")
+        || trimmed == "until";
+
+    if is_closer {
+        delta -= 1;
+    }
+
+    delta
+}
+
+/// Heuristic function span extractor.
+/// Returns `(name, start_line_0based, end_line_0based)` tuples.
+fn extract_function_spans(source: &str, comment_map: &[bool]) -> Vec<(String, usize, usize)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut spans = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        if comment_map.get(i).copied().unwrap_or(false) {
+            i += 1;
+            continue;
+        }
+        let trimmed = lines[i].trim();
+        let is_fn = trimmed.starts_with("function ")
+            || trimmed.starts_with("local function ")
+            || trimmed.contains("= function(")
+            || trimmed.contains("= function (");
+
+        if is_fn {
+            // Extract function name heuristically
+            let name = if let Some(rest) = trimmed.strip_prefix("local function ") {
+                rest.split('(').next().unwrap_or("anonymous").trim()
+            } else if let Some(rest) = trimmed.strip_prefix("function ") {
+                rest.split('(').next().unwrap_or("anonymous").trim()
+            } else if let Some(eq_pos) = trimmed.find("= function") {
+                trimmed[..eq_pos]
+                    .trim()
+                    .trim_start_matches("local ")
+                    .trim()
+            } else {
+                "anonymous"
+            };
+
+            let fn_start = i;
+            let mut depth: i32 = 1;
+            let mut j = i + 1;
+            while j < lines.len() && depth > 0 {
+                if !comment_map.get(j).copied().unwrap_or(false) {
+                    let t = lines[j].trim();
+                    depth += line_depth_delta(t);
+                }
+                j += 1;
+            }
+            spans.push((name.to_string(), fn_start, j.saturating_sub(1)));
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+
+    spans
+}
+
+/// **function-length** -- warn if a function body exceeds the configured line limit.
+pub fn check_function_length(
+    source: &str,
+    file: &str,
+    comment_map: &[bool],
+) -> Vec<LintIssue> {
+    check_function_length_with_threshold(source, file, comment_map, DEFAULT_FUNCTION_LENGTH)
+}
+
+/// Inner implementation with configurable threshold (for testing).
+pub fn check_function_length_with_threshold(
+    source: &str,
+    file: &str,
+    comment_map: &[bool],
+    max_lines: usize,
+) -> Vec<LintIssue> {
+    let mut issues = Vec::new();
+    let spans = extract_function_spans(source, comment_map);
+    let line_offsets = build_line_offsets(source);
+
+    for (name, start, end) in &spans {
+        let body_lines = end.saturating_sub(*start) + 1;
+        if body_lines > max_lines {
+            let byte_off = line_offsets.get(*start).copied().unwrap_or(0);
+            let (line, col) = line_col_at(source, byte_off);
+            issues.push(LintIssue {
+                rule: "function-length".into(),
+                severity: LintSeverity::Warning,
+                message: format!(
+                    "function `{name}` is {body_lines} lines long (limit: {max_lines})"
+                ),
+                line,
+                column: col,
+                file: file.into(),
+            });
+        }
+    }
+
+    issues
+}
+
+/// **nesting-depth** -- warn if nesting exceeds the configured depth limit.
+pub fn check_nesting_depth(
+    source: &str,
+    file: &str,
+    comment_map: &[bool],
+) -> Vec<LintIssue> {
+    check_nesting_depth_with_threshold(source, file, comment_map, DEFAULT_NESTING_DEPTH)
+}
+
+/// Inner implementation with configurable threshold.
+pub fn check_nesting_depth_with_threshold(
+    source: &str,
+    file: &str,
+    comment_map: &[bool],
+    max_depth: usize,
+) -> Vec<LintIssue> {
+    let mut issues = Vec::new();
+    let lines: Vec<&str> = source.lines().collect();
+    let line_offsets = build_line_offsets(source);
+    let spans = extract_function_spans(source, comment_map);
+
+    for (name, start, end) in &spans {
+        let mut depth: i32 = 0;
+        let mut max_seen: i32 = 0;
+        let mut max_line_idx = *start;
+
+        for idx in *start..=*end {
+            if idx >= lines.len() {
+                break;
+            }
+            if comment_map.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let trimmed = lines[idx].trim();
+            let delta = line_depth_delta(trimmed);
+
+            if delta > 0 {
+                depth += delta;
+                if depth > max_seen {
+                    max_seen = depth;
+                    max_line_idx = idx;
+                }
+            } else if delta < 0 {
+                depth += delta;
+            }
+        }
+
+        if max_seen as usize > max_depth {
+            let byte_off = line_offsets.get(max_line_idx).copied().unwrap_or(0);
+            let (line, col) = line_col_at(source, byte_off);
+            issues.push(LintIssue {
+                rule: "nesting-depth".into(),
+                severity: LintSeverity::Warning,
+                message: format!(
+                    "function `{name}` has nesting depth {max_seen} (limit: {max_depth})"
+                ),
+                line,
+                column: col,
+                file: file.into(),
+            });
+        }
+    }
+
+    issues
+}
+
+/// **parentheses-condition** -- unnecessary parentheses around `if (x) then` conditions.
+pub fn check_parentheses_condition(
+    source: &str,
+    file: &str,
+    comment_map: &[bool],
+) -> Vec<LintIssue> {
+    let mut issues = Vec::new();
+
+    for m in RE_PAREN_CONDITION.find_iter(source) {
+        if is_comment_line(source, m.start(), comment_map) {
+            continue;
+        }
+
+        // Check if the parentheses are actually wrapping the entire condition,
+        // not a function call like `if foo(x) then`
+        let matched = m.as_str();
+
+        // Extract the keyword to find where the paren starts
+        let paren_start = matched.find('(');
+        if let Some(ps) = paren_start {
+            // Check that the character before '(' is whitespace (not an identifier char),
+            // which means it's `if (expr)` not `if func(expr)`
+            let before_paren = &matched[..ps];
+            let before_trimmed = before_paren.trim_end();
+            if before_trimmed.ends_with("if")
+                || before_trimmed.ends_with("elseif")
+                || before_trimmed.ends_with("while")
+            {
+                let (line, col) = line_col_at(source, m.start());
+                issues.push(LintIssue {
+                    rule: "parentheses-condition".into(),
+                    severity: LintSeverity::Warning,
+                    message: "unnecessary parentheses around condition".into(),
+                    line,
+                    column: col,
+                    file: file.into(),
+                });
+            }
+        }
+    }
+
+    issues
+}
+
+/// **comparison-order** -- Yoda conditions like `nil == x` instead of `x == nil`.
+pub fn check_comparison_order(
+    source: &str,
+    file: &str,
+    comment_map: &[bool],
+) -> Vec<LintIssue> {
+    let mut issues = Vec::new();
+
+    for m in RE_YODA_CONDITION.find_iter(source) {
+        if is_comment_line(source, m.start(), comment_map) {
+            continue;
+        }
+
+        let (line, col) = line_col_at(source, m.start());
+        let matched = m.as_str();
+        issues.push(LintIssue {
+            rule: "comparison-order".into(),
+            severity: LintSeverity::Warning,
+            message: format!(
+                "Yoda condition `{matched}` — prefer the variable on the left side"
+            ),
+            line,
+            column: col,
+            file: file.into(),
+        });
+    }
+
+    issues
+}
+
+/// **cyclomatic-complexity** -- warn if a function has too many branches.
+pub fn check_cyclomatic_complexity(
+    source: &str,
+    file: &str,
+    comment_map: &[bool],
+) -> Vec<LintIssue> {
+    check_cyclomatic_complexity_with_threshold(
+        source,
+        file,
+        comment_map,
+        DEFAULT_CYCLOMATIC_COMPLEXITY,
+    )
+}
+
+/// Inner implementation with configurable threshold.
+pub fn check_cyclomatic_complexity_with_threshold(
+    source: &str,
+    file: &str,
+    comment_map: &[bool],
+    max_complexity: usize,
+) -> Vec<LintIssue> {
+    let mut issues = Vec::new();
+    let lines: Vec<&str> = source.lines().collect();
+    let line_offsets = build_line_offsets(source);
+    let spans = extract_function_spans(source, comment_map);
+
+    for (name, start, end) in &spans {
+        // Start at 1 (the function itself is one path)
+        let mut complexity: usize = 1;
+
+        for idx in *start..=*end {
+            if idx >= lines.len() {
+                break;
+            }
+            if comment_map.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let line = lines[idx];
+            complexity += RE_COMPLEXITY_KEYWORD.find_iter(line).count();
+            complexity += RE_LOGICAL_OPERATOR.find_iter(line).count();
+        }
+
+        if complexity > max_complexity {
+            let byte_off = line_offsets.get(*start).copied().unwrap_or(0);
+            let (line, col) = line_col_at(source, byte_off);
+            issues.push(LintIssue {
+                rule: "cyclomatic-complexity".into(),
+                severity: LintSeverity::Warning,
+                message: format!(
+                    "function `{name}` has cyclomatic complexity {complexity} (limit: {max_complexity})"
+                ),
+                line,
+                column: col,
+                file: file.into(),
+            });
+        }
+    }
+
+    issues
 }

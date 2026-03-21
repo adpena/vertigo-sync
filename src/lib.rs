@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 pub mod config;
+pub mod credentials;
 pub mod fmt;
 pub mod init;
 pub mod migrate;
@@ -22,6 +23,7 @@ pub mod mcp;
 pub mod output;
 pub mod plugin_smoke;
 pub mod project;
+pub mod publish;
 pub mod rbxl;
 pub mod serve_rbxl;
 pub mod server;
