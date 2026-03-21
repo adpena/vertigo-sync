@@ -167,11 +167,28 @@ pub fn build_comment_map(source: &str) -> Vec<bool> {
         .map(|line| {
             let trimmed = line.trim();
             if in_block {
-                if trimmed.contains("]]") || trimmed.contains("]=]") {
+                if trimmed.contains("]]") || trimmed.contains("]=]") || trimmed.contains("]==]") {
                     in_block = false;
                 }
                 true
-            } else if trimmed.starts_with("--[[") || trimmed.starts_with("--[=[") {
+            } else if trimmed.contains("--[[")
+                || trimmed.contains("--[=[")
+                || trimmed.contains("--[==[")
+            {
+                // Check if the block also closes on this same line
+                let after_open = if trimmed.contains("--[==[") {
+                    trimmed.find("--[==[").map(|i| &trimmed[i + 6..])
+                } else if trimmed.contains("--[=[") {
+                    trimmed.find("--[=[").map(|i| &trimmed[i + 5..])
+                } else {
+                    trimmed.find("--[[").map(|i| &trimmed[i + 4..])
+                };
+                if let Some(rest) = after_open {
+                    if rest.contains("]]") || rest.contains("]=]") || rest.contains("]==]") {
+                        // Opens and closes on same line — line has comment but block doesn't persist
+                        return true;
+                    }
+                }
                 in_block = true;
                 true
             } else {
@@ -250,6 +267,17 @@ pub fn check_global_shadow(source: &str, file: &str, comment_map: &[bool]) -> Ve
         }
 
         if ROBLOX_GLOBALS.contains(&var) {
+            // Skip self-aliasing pattern: `local string = string` (common perf idiom)
+            let after_eq = source[cap.get(0).unwrap().end()..].trim_start();
+            // Extract the first token after `=` to compare with var_name
+            let rhs_token_end = after_eq
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after_eq.len());
+            let rhs_token = &after_eq[..rhs_token_end];
+            if rhs_token == var {
+                continue; // self-aliasing for performance, not a true shadow
+            }
+
             let (line, col) = line_col_at(source, name.start());
             issues.push(LintIssue {
                 rule: "global-shadow".into(),

@@ -367,8 +367,22 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
+    let json_mode = cli.json;
+    let result = run_cli(cli).await;
+    if let Err(e) = result {
+        if json_mode {
+            let err_json = serde_json::json!({ "error": format!("{e:#}") });
+            eprintln!("{}", serde_json::to_string(&err_json).unwrap_or_default());
+        } else {
+            eprintln!("error: {e:#}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run_cli(cli: Cli) -> Result<()> {
     let root = resolve_root(&cli.root)?;
     let state_dir = resolve_relative_to_root(&root, &cli.state_dir);
 

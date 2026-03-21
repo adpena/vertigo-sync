@@ -324,6 +324,21 @@ pub async fn run_serve(options: ServeOptions) -> anyhow::Result<()> {
             if let Err(error) = poll_state.poll_and_broadcast() {
                 eprintln!("[vertigo-sync] poll error: {error}");
             }
+
+            // TODO: Auto-regenerate sourcemap.json on each file change event.
+            // If a sourcemap.json exists in the project root, call
+            // `crate::sourcemap::generate_sourcemap()` and write it here after
+            // each successful poll_and_broadcast. This requires access to the
+            // parsed ProjectTree (from project_path) and the project root.
+            // Wire in the project tree and root, then:
+            //   if poll_state.root.join("sourcemap.json").exists() {
+            //       if let Ok(tree) = crate::project::parse_project(&project_path) {
+            //           if let Ok(sm) = crate::sourcemap::generate_sourcemap(&root, &tree, true) {
+            //               let _ = std::fs::write(root.join("sourcemap.json"),
+            //                   serde_json::to_string_pretty(&sm).unwrap_or_default());
+            //           }
+            //       }
+            //   }
         }
     });
 
