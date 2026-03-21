@@ -99,10 +99,10 @@ version = "0.1.0"
 # Full rule list: https://github.com/vertigo-sync/vertigo-sync/blob/main/docs/configuration.md#lint
 [lint]
 unused-variable = "warn"
-deprecated-api = "error"
 global-shadow = "error"
-strict-mode = "warn"
 wait-deprecated = "warn"
+empty-block = "warn"
+unreachable-code = "warn"
 
 # Formatting options (powered by StyLua)
 # Full options: https://github.com/vertigo-sync/vertigo-sync/blob/main/docs/configuration.md#format

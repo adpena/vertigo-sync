@@ -158,7 +158,7 @@ pub async fn publish_package(
         .post(&url)
         .header("Authorization", format!("Bearer {token}"))
         .header("Wally-Version", "0.3.2")
-        .header("Content-Type", "application/gzip")
+        .header("Content-Type", "application/zip")
         .body(zip_bytes)
         .send()
         .await

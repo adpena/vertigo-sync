@@ -115,6 +115,11 @@ Controls the severity of built-in lint rules. Each key is a rule name, each valu
 | `delay-deprecated` | `warn` | Bare `delay()` call. Use `task.delay()` instead. |
 | `empty-block` | `warn` | Empty `then ... end` or `do ... end` block body. |
 | `unreachable-code` | `warn` | Code after unconditional `return`, `break`, `continue`, or `error()`. |
+| `parentheses-condition` | `warn` | Unnecessary parentheses around `if`/`while` conditions (e.g., `if (x) then`). |
+| `comparison-order` | `warn` | Yoda conditions (e.g., `nil == x` instead of `x == nil`). |
+| `function-length` | `warn` | Functions exceeding 100 lines. |
+| `nesting-depth` | `warn` | Nesting deeper than 5 levels inside a function. |
+| `cyclomatic-complexity` | `warn` | Functions with more than 10 branches (`if`, `elseif`, `and`, `or`, `while`, `for`, `repeat`). |
 
 ```toml
 [lint]
@@ -125,6 +130,11 @@ spawn-deprecated = "warn"
 delay-deprecated = "warn"
 empty-block = "off"
 unreachable-code = "warn"
+parentheses-condition = "warn"
+comparison-order = "warn"
+function-length = "warn"
+nesting-depth = "warn"
+cyclomatic-complexity = "warn"
 ```
 
 #### Validation rules (always active)

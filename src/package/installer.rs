@@ -179,12 +179,19 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                         }
                     } else {
                         // Repository already cloned — fetch updates
+                        // Use --unshallow if a specific rev is needed (shallow clones may not have it)
+                        let fetch_args = if rev.is_some() {
+                            vec!["fetch", "--unshallow"]
+                        } else {
+                            vec!["fetch", "--all"]
+                        };
                         let status = std::process::Command::new("git")
-                            .args(["fetch", "--all"])
+                            .args(&fetch_args)
                             .current_dir(&clone_dir)
                             .status()
                             .with_context(|| format!("failed to run `git fetch` in {}", clone_dir.display()))?;
-                        if !status.success() {
+                        // --unshallow fails if repo is already unshallow; ignore that case
+                        if !status.success() && rev.is_none() {
                             bail!("failed to fetch updates for {git}");
                         }
                     }
@@ -198,7 +205,7 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                     validate_git_ref(checkout_ref)?;
 
                     let status = std::process::Command::new("git")
-                        .args(["checkout", "--", checkout_ref])
+                        .args(["checkout", checkout_ref])
                         .current_dir(&clone_dir)
                         .status()
                         .with_context(|| format!("failed to checkout {checkout_ref} in {}", clone_dir.display()))?;

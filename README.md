@@ -173,22 +173,21 @@ vsync 0.1 is an early release. Here is what works today and what is planned.
 
 ### Functional (new in 0.1, tested against real Wally registry)
 
-- `vsync install` / `vsync add` / `vsync remove` with transitive dependency resolution
+- `vsync install` / `vsync add` / `vsync remove` / `vsync update` with transitive dependency resolution
 - `vsync fmt` (StyLua-powered, parallel via rayon)
-- `vsync validate` with 20 built-in lint rules (parallel via rayon)
-- `vsync init` / `vsync migrate` / `vsync run`
+- `vsync validate` with 25 built-in lint rules (parallel via rayon), `--fix` for auto-fixes
+- `vsync init` / `vsync migrate` / `vsync run` / `vsync open`
+- `vsync publish` / `vsync login` (registry auth and package upload)
+- `vsync completions` (bash, zsh, fish, elvish, powershell)
+- Git and private registry dependencies
+- `.vsyncignore` for excluding files from fmt and validate
 - `vsync.toml` unified config, `vsync.lock` lockfile
+- Sourcemap auto-regeneration during `vsync serve`
 
 ### Not yet implemented
 
-- `vsync publish` / `vsync login` (registry auth and package upload)
-- `vsync update` (re-resolve dependencies to latest matching versions)
-- Git and private registry dependencies
 - Workspace / monorepo support
-- `.styluaignore` equivalent
-- Shell completion generation (`vsync completions <shell>`)
 - Type checking integration (`luau-analyze`)
-- Sourcemap auto-regeneration during `vsync serve`
 
 ### Out of scope (use alongside vsync)
 
