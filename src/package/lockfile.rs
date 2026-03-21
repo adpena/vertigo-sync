@@ -58,12 +58,14 @@ impl Lockfile {
         Self::parse(&content).map(Some)
     }
 
-    /// Write the lockfile to disk.
+    /// Write the lockfile to disk atomically via temp file + rename.
     pub fn save(&self, path: &Path) -> Result<()> {
         let content = self.to_string();
-        std::fs::write(path, content)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(())
+        let tmp = path.with_extension("lock.tmp");
+        std::fs::write(&tmp, content.as_bytes())
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))
     }
 }
 

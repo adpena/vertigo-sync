@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
@@ -10,6 +11,29 @@ use crate::output;
 use super::cache;
 use super::lockfile::{Lockfile, LockedPackage};
 use super::registry::{IndexEntry, RegistryClient, parse_version_req};
+
+/// Retry an async operation with exponential backoff.
+async fn retry_async<F, Fut, T>(max_retries: u32, label: &str, f: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut last_err = None;
+    for attempt in 0..=max_retries {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                if attempt < max_retries {
+                    let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt));
+                    eprintln!("  \u{21bb} {label} failed (attempt {}), retrying in {delay:?}...", attempt + 1);
+                    tokio::time::sleep(delay).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
 
 /// Summary of what the install operation did.
 pub struct InstallReport {
@@ -168,52 +192,101 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
         });
     }
 
-    // ── Phase 2: Resolve concurrently ────────────────────────────────────
-    let resolve_count = pending_resolve.len();
-    output::info(&format!(
-        "Resolving {} package{}...",
-        resolve_count,
-        if resolve_count == 1 { "" } else { "s" }
-    ));
+    // ── Phase 2: Resolve concurrently (BFS for transitive deps) ─────────
+    let mut resolved_names: HashSet<String> = HashSet::new();
+    let mut pending_download: Vec<PendingDownload> = Vec::new();
 
-    let mut resolve_set = tokio::task::JoinSet::new();
-    // Bounded concurrency: process in chunks of 8.
-    let mut pending_download: Vec<PendingDownload> = Vec::with_capacity(resolve_count);
-
-    for chunk in pending_resolve.chunks(8) {
-        for pending in chunk {
-            let reg = Arc::clone(&registry);
-            let scope = pending.scope.clone();
-            let name = pending.name.clone();
-            let version_req = pending.version_req.clone();
-            let realm = pending.realm.clone();
-            let full_name = pending.full_name.clone();
-            resolve_set.spawn(async move {
-                let versions = reg
-                    .fetch_versions(&scope, &name)
-                    .await
-                    .with_context(|| format!("failed to query {scope}/{name}"))?;
-
-                let entry = select_version(&versions, &version_req)
-                    .with_context(|| {
-                        format!("no version of {scope}/{name} satisfies {version_req}")
-                    })?
-                    .clone();
-
-                Ok::<PendingDownload, anyhow::Error>(PendingDownload {
-                    scope,
-                    name,
-                    version: entry.version.clone(),
-                    realm,
-                    full_name,
-                    entry,
-                })
-            });
+    // Mark already-cached packages as resolved so we don't re-resolve them.
+    for pkg in &lockfile.packages {
+        if cache::is_cached(&pkg.checksum).unwrap_or(false) {
+            resolved_names.insert(pkg.name.clone());
         }
-        while let Some(result) = resolve_set.join_next().await {
-            let resolved = result.context("resolve task panicked")??;
-            pending_download.push(resolved);
+    }
+
+    // BFS loop: resolve current batch, then discover transitive deps, repeat.
+    let mut current_batch = pending_resolve;
+    while !current_batch.is_empty() {
+        let resolve_count = current_batch.len();
+        output::info(&format!(
+            "Resolving {} package{}...",
+            resolve_count,
+            if resolve_count == 1 { "" } else { "s" }
+        ));
+
+        let mut resolve_set = tokio::task::JoinSet::new();
+        let mut batch_resolved: Vec<PendingDownload> = Vec::with_capacity(resolve_count);
+
+        for chunk in current_batch.chunks(8) {
+            for pending in chunk {
+                let reg = Arc::clone(&registry);
+                let scope = pending.scope.clone();
+                let name = pending.name.clone();
+                let version_req = pending.version_req.clone();
+                let realm = pending.realm.clone();
+                let full_name = pending.full_name.clone();
+                resolve_set.spawn(async move {
+                    let versions = retry_async(3, &format!("fetch {scope}/{name}"), || {
+                        let reg = reg.clone();
+                        let scope = scope.clone();
+                        let name = name.clone();
+                        async move {
+                            reg.fetch_versions(&scope, &name)
+                                .await
+                                .with_context(|| format!("failed to query {scope}/{name}"))
+                        }
+                    })
+                    .await?;
+
+                    let entry = select_version(&versions, &version_req)
+                        .with_context(|| {
+                            format!("no version of {scope}/{name} satisfies {version_req}")
+                        })?
+                        .clone();
+
+                    Ok::<PendingDownload, anyhow::Error>(PendingDownload {
+                        scope,
+                        name,
+                        version: entry.version.clone(),
+                        realm,
+                        full_name,
+                        entry,
+                    })
+                });
+            }
+            while let Some(result) = resolve_set.join_next().await {
+                let resolved = result.context("resolve task panicked")??;
+                batch_resolved.push(resolved);
+            }
         }
+
+        // Collect transitive deps from newly resolved packages.
+        let mut next_batch: Vec<PendingResolve> = Vec::new();
+        for pd in &batch_resolved {
+            resolved_names.insert(pd.full_name.clone());
+
+            // Gather transitive deps from both dependencies and server_dependencies.
+            let all_dep_specs = pd.entry.dependencies.values()
+                .chain(pd.entry.server_dependencies.values());
+            for dep_spec in all_dep_specs {
+                if let Ok((scope, name, version_req)) = parse_version_req(dep_spec) {
+                    let full_name = format!("{scope}/{name}");
+                    if !resolved_names.contains(&full_name) {
+                        resolved_names.insert(full_name.clone());
+                        total += 1;
+                        next_batch.push(PendingResolve {
+                            scope,
+                            name,
+                            version_req,
+                            realm: pd.realm.clone(),
+                            full_name,
+                        });
+                    }
+                }
+            }
+        }
+
+        pending_download.extend(batch_resolved);
+        current_batch = next_batch;
     }
 
     // ── Phase 3: Download concurrently ───────────────────────────────────
@@ -230,12 +303,20 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
             let full_name = pd.full_name.clone();
             let entry = pd.entry.clone();
             download_set.spawn(async move {
-                let bytes = reg
-                    .download_package(&scope, &name, &version)
-                    .await
-                    .with_context(|| {
-                        format!("failed to download {scope}/{name}@{version}")
-                    })?;
+                let bytes = retry_async(3, &format!("download {scope}/{name}@{version}"), || {
+                    let reg = reg.clone();
+                    let scope = scope.clone();
+                    let name = name.clone();
+                    let version = version.clone();
+                    async move {
+                        reg.download_package(&scope, &name, &version)
+                            .await
+                            .with_context(|| {
+                                format!("failed to download {scope}/{name}@{version}")
+                            })
+                    }
+                })
+                .await?;
 
                 let checksum = hex_sha256(&bytes);
                 let size_kb = bytes.len() / 1024;
@@ -322,6 +403,10 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                 .map(|(k, v)| format!("{k}@{v}"))
                 .collect(),
         });
+
+        // Incremental save: persist lockfile after each successful extraction
+        // so that partial failures don't lose progress.
+        lockfile.save(&lock_path)?;
 
         installed += 1;
     }

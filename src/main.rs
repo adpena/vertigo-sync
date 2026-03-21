@@ -554,8 +554,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Update { package: _, project: _ } => {
-            output::success("vsync update is coming soon");
-            Ok(())
+            bail!("vsync update is not yet implemented — manually edit vsync.toml and run vsync install");
         }
         Command::Serve { project } => {
             let project_context = resolve_project_context(&root, project, &cli.include)?;
@@ -1776,7 +1775,45 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
                     segment
                 };
 
-                let builder = InstanceBuilder::new(class).with_name(*segment);
+                let mut builder = InstanceBuilder::new(class).with_name(*segment);
+
+                // Apply $properties from the mapping to the leaf instance.
+                if i == segments.len() - 1 {
+                    if let Some(ref props) = mapping.properties {
+                        for (key, value) in props {
+                            match value {
+                                serde_json::Value::Bool(b) => {
+                                    builder = builder.with_property(
+                                        key.as_str(),
+                                        rbx_dom_weak::types::Variant::Bool(*b),
+                                    );
+                                }
+                                serde_json::Value::String(s) => {
+                                    builder = builder.with_property(
+                                        key.as_str(),
+                                        rbx_dom_weak::types::Variant::String(s.clone()),
+                                    );
+                                }
+                                serde_json::Value::Number(n) => {
+                                    if let Some(i) = n.as_i64() {
+                                        builder = builder.with_property(
+                                            key.as_str(),
+                                            rbx_dom_weak::types::Variant::Int32(i as i32),
+                                        );
+                                    } else if let Some(f) = n.as_f64() {
+                                        builder = builder.with_property(
+                                            key.as_str(),
+                                            rbx_dom_weak::types::Variant::Float64(f),
+                                        );
+                                    }
+                                }
+                                // TODO: support array/object property types (e.g. Color3, Vector3)
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
                 dom.insert(parent_ref, builder)
             };
 
