@@ -325,20 +325,26 @@ pub async fn run_serve(options: ServeOptions) -> anyhow::Result<()> {
                 eprintln!("[vertigo-sync] poll error: {error}");
             }
 
-            // TODO: Auto-regenerate sourcemap.json on each file change event.
-            // If a sourcemap.json exists in the project root, call
-            // `crate::sourcemap::generate_sourcemap()` and write it here after
-            // each successful poll_and_broadcast. This requires access to the
-            // parsed ProjectTree (from project_path) and the project root.
-            // Wire in the project tree and root, then:
-            //   if poll_state.root.join("sourcemap.json").exists() {
-            //       if let Ok(tree) = crate::project::parse_project(&project_path) {
-            //           if let Ok(sm) = crate::sourcemap::generate_sourcemap(&root, &tree, true) {
-            //               let _ = std::fs::write(root.join("sourcemap.json"),
-            //                   serde_json::to_string_pretty(&sm).unwrap_or_default());
-            //           }
-            //       }
-            //   }
+            // Auto-regenerate sourcemap.json after each successful poll.
+            // Only runs if sourcemap.json already exists in the project root
+            // (i.e. the user has previously run `vsync sourcemap`).
+            let sourcemap_path = poll_state.root.join("sourcemap.json");
+            if sourcemap_path.exists() {
+                if let Ok(tree) = crate::project::parse_project(&poll_state.project_path) {
+                    match crate::sourcemap::generate_sourcemap(&poll_state.root, &tree, true) {
+                        Ok(sm) => {
+                            let json = serde_json::to_string_pretty(&sm)
+                                .unwrap_or_default();
+                            if let Err(e) = std::fs::write(&sourcemap_path, json.as_bytes()) {
+                                eprintln!("[vertigo-sync] warning: failed to write sourcemap.json: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[vertigo-sync] warning: failed to generate sourcemap: {e}");
+                        }
+                    }
+                }
+            }
         }
     });
 

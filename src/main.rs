@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -324,7 +324,7 @@ enum Command {
         project: PathBuf,
     },
     /// Update dependencies.
-    #[command(display_order = 47, hide = true)]
+    #[command(display_order = 47)]
     Update {
         /// Specific package to update (default: all)
         package: Option<String>,
@@ -339,6 +339,16 @@ enum Command {
     Run {
         /// Script name.
         name: String,
+    },
+    /// Open a place file in Roblox Studio.
+    #[command(display_order = 50)]
+    Open {
+        /// Path to .rbxl or .rbxlx file to open (default: build a temp file and open it).
+        #[arg(long, short)]
+        file: Option<PathBuf>,
+        /// Project file path.
+        #[arg(long, default_value = "default.project.json")]
+        project: PathBuf,
     },
     /// Install the Vertigo Sync Studio plugin.
     #[command(display_order = 41)]
@@ -363,6 +373,12 @@ enum Command {
         /// Project file path.
         #[arg(long, default_value = "default.project.json")]
         project: PathBuf,
+    },
+    /// Generate shell completion scripts.
+    #[command(display_order = 90)]
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
     },
 }
 
@@ -462,6 +478,56 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Open { file, project } => {
+            let place_path = if let Some(f) = file {
+                if f.is_absolute() {
+                    f.clone()
+                } else {
+                    root.join(f)
+                }
+            } else {
+                // Build a temp place file
+                let ctx = resolve_project_context(&root, project, &cli.include)?;
+                let temp_path = ctx
+                    .project_root
+                    .join(".vertigo-sync-state")
+                    .join("preview.rbxl");
+                std::fs::create_dir_all(temp_path.parent().unwrap())?;
+                command_build(&root, &temp_path, project, false)?;
+                output::info(&format!("Built {}", temp_path.display()));
+                temp_path
+            };
+
+            if !place_path.exists() {
+                bail!("place file not found: {}", place_path.display());
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                std::process::Command::new("open")
+                    .arg(&place_path)
+                    .spawn()
+                    .context("failed to open place file — is Roblox Studio installed?")?;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                std::process::Command::new("cmd")
+                    .args(["/C", "start", ""])
+                    .arg(&place_path)
+                    .spawn()
+                    .context("failed to open place file — is Roblox Studio installed?")?;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                std::process::Command::new("xdg-open")
+                    .arg(&place_path)
+                    .spawn()
+                    .context("failed to open place file — is xdg-open installed?")?;
+            }
+
+            output::success(&format!("Opened {}", place_path.display()));
+            Ok(())
+        }
         Command::PluginInstall => command_plugin_install(),
         Command::PluginSetIcon { asset_id } => command_plugin_set_icon(asset_id),
         Command::Fmt {
@@ -470,6 +536,11 @@ async fn run_cli(cli: Cli) -> Result<()> {
             path,
             project,
         } => command_fmt(&root, project, path.as_deref(), *check, *diff, &cli),
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(*shell, &mut cmd, "vsync", &mut std::io::stdout());
+            Ok(())
+        }
         Command::Install { project } => {
             let ctx = resolve_project_context(&root, project, &cli.include)?;
             let config = ctx.vsync_config.clone().unwrap_or_default();
@@ -567,8 +638,41 @@ async fn run_cli(cli: Cli) -> Result<()> {
             output::success(&format!("removed {package}"));
             Ok(())
         }
-        Command::Update { package: _, project: _ } => {
-            bail!("vsync update is not yet implemented — manually edit vsync.toml and run vsync install");
+        Command::Update { package, project } => {
+            let ctx = resolve_project_context(&root, project, &cli.include)?;
+            let config = ctx.vsync_config.clone().unwrap_or_default();
+            let lock_path = ctx.project_root.join("vsync.lock");
+
+            if let Some(pkg_name) = &package {
+                // Update specific package: remove from lockfile
+                if let Some(mut lockfile) = vertigo_sync::package::lockfile::Lockfile::load(&lock_path)? {
+                    let before = lockfile.packages.len();
+                    lockfile.packages.retain(|p| {
+                        // Match by alias or full name
+                        !p.name.ends_with(&format!("/{pkg_name}")) && p.name != *pkg_name
+                    });
+                    let removed = before - lockfile.packages.len();
+                    if removed > 0 {
+                        lockfile.save(&lock_path)?;
+                        output::info(&format!("Removed {pkg_name} from lockfile, re-resolving..."));
+                    } else {
+                        output::warn(&format!("{pkg_name} not found in lockfile"));
+                    }
+                }
+            } else {
+                // Update all: delete lockfile entirely
+                if lock_path.exists() {
+                    std::fs::remove_file(&lock_path)?;
+                    output::info("Removed lockfile, re-resolving all dependencies...");
+                }
+            }
+
+            let report = vertigo_sync::package::installer::install(&ctx.project_root, &config).await?;
+            output::success(&format!(
+                "{} installed, {} cached, {} total",
+                report.installed, report.cached, report.total
+            ));
+            Ok(())
         }
         Command::Serve { project } => {
             let project_context = resolve_project_context(&root, project, &cli.include)?;
@@ -1310,6 +1414,17 @@ fn command_validate(root: &Path, project: &Path, cli: &Cli) -> Result<()> {
         &project_context.tree.glob_ignore_paths,
     )?;
 
+    // Apply .vsyncignore patterns — remove issues for ignored files.
+    let ignore_patterns = load_ignore_patterns(&project_context.project_root);
+    if !ignore_patterns.is_empty() {
+        report.issues.retain(|issue| {
+            !ignore_patterns.iter().any(|p| p.matches(&issue.path))
+        });
+        report.errors = report.issues.iter().filter(|i| i.severity == "error").count();
+        report.warnings = report.issues.iter().filter(|i| i.severity == "warning").count();
+        report.clean = report.errors == 0 && report.warnings == 0;
+    }
+
     // Wire existing validate.rs rules into the configurable [lint] config from
     // vsync.toml.  Rules set to "off" are dropped; severity can be escalated
     // or downgraded via "error" / "warn".
@@ -1392,10 +1507,11 @@ fn command_validate(root: &Path, project: &Path, cli: &Cli) -> Result<()> {
             .as_ref()
             .map(|c| c.lint.clone())
             .unwrap_or_default();
-        let lint_issues = vertigo_sync::lint::lint_source_tree(
+        let lint_issues = vertigo_sync::lint::lint_source_tree_with_ignores(
             &project_context.project_root,
             &project_context.includes,
             &lint_config,
+            &ignore_patterns,
         );
         if !lint_issues.is_empty() {
             eprintln!();
@@ -1494,6 +1610,22 @@ fn command_validate(root: &Path, project: &Path, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+fn load_ignore_patterns(project_root: &Path) -> Vec<glob::Pattern> {
+    let ignore_path = project_root.join(".vsyncignore");
+    if !ignore_path.exists() {
+        return Vec::new();
+    }
+    let content = match std::fs::read_to_string(&ignore_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .filter_map(|line| glob::Pattern::new(line.trim()).ok())
+        .collect()
+}
+
 fn command_fmt(
     root: &Path,
     project: &Path,
@@ -1537,6 +1669,19 @@ fn command_fmt(
         }
         all
     };
+
+    // Apply .vsyncignore patterns.
+    let ignore_patterns = load_ignore_patterns(&project_context.project_root);
+    let mut files = files;
+    if !ignore_patterns.is_empty() {
+        files.retain(|path| {
+            let rel = path
+                .strip_prefix(&project_context.project_root)
+                .unwrap_or(path);
+            let rel_str = rel.to_string_lossy();
+            !ignore_patterns.iter().any(|p| p.matches(&rel_str))
+        });
+    }
 
     if files.is_empty() {
         if !cli.json {

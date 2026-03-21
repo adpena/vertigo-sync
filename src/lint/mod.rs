@@ -115,6 +115,17 @@ pub fn lint_source_tree(
     includes: &[String],
     rule_config: &BTreeMap<String, String>,
 ) -> Vec<LintIssue> {
+    lint_source_tree_with_ignores(root, includes, rule_config, &[])
+}
+
+/// Lint all `.lua` and `.luau` files under the given include roots,
+/// skipping any file whose relative path matches one of the `ignore_patterns`.
+pub fn lint_source_tree_with_ignores(
+    root: &Path,
+    includes: &[String],
+    rule_config: &BTreeMap<String, String>,
+    ignore_patterns: &[glob::Pattern],
+) -> Vec<LintIssue> {
     // 1. Collect all file paths sequentially.
     let mut all_files: Vec<PathBuf> = Vec::new();
     for include in includes {
@@ -122,6 +133,15 @@ pub fn lint_source_tree(
         if dir.is_dir() {
             collect_file_paths(&dir, &mut all_files);
         }
+    }
+
+    // Filter out files matching ignore patterns.
+    if !ignore_patterns.is_empty() {
+        all_files.retain(|path| {
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            let rel_str = rel.to_string_lossy();
+            !ignore_patterns.iter().any(|p| p.matches(&rel_str))
+        });
     }
 
     // 2. Read + lint each file in parallel.
