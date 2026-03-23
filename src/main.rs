@@ -3823,17 +3823,17 @@ mod tests {
     #[test]
     fn embedded_plugin_ignores_managed_edit_preview_churn() {
         assert!(
-            PLUGIN_SOURCE.contains("local function isManagedMutationInstance"),
+            PLUGIN_SOURCE.contains("function Runtime.isManagedMutationInstance"),
             "embedded plugin should classify managed sync mutations separately from authored edits"
         );
         assert!(
             PLUGIN_SOURCE.contains("descendant_added:%s")
-                && PLUGIN_SOURCE.contains("isManagedMutationInstance(descendant)"),
+                && PLUGIN_SOURCE.contains("Runtime.isManagedMutationInstance(descendant)"),
             "embedded plugin should suppress managed descendant-added churn from edit-preview rebuild triggers"
         );
         assert!(
             PLUGIN_SOURCE.contains("descendant_removed:%s")
-                && PLUGIN_SOURCE.contains("isManagedMutationInstance(descendant)"),
+                && PLUGIN_SOURCE.contains("Runtime.isManagedMutationInstance(descendant)"),
             "embedded plugin should suppress managed descendant-removed churn from edit-preview rebuild triggers"
         );
     }
