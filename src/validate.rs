@@ -1458,12 +1458,51 @@ fn block_depth_delta(line: &str) -> isize {
     delta
 }
 
+fn mask_string_literals(line: &str) -> String {
+    let mut masked = String::with_capacity(line.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in line.chars() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                masked.push(' ');
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                masked.push(' ');
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+                masked.push(' ');
+                continue;
+            }
+            masked.push(' ');
+            continue;
+        }
+
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            masked.push(' ');
+            continue;
+        }
+
+        masked.push(ch);
+    }
+
+    masked
+}
+
 fn count_keyword_occurrences(line: &str, keyword: &str) -> usize {
+    let masked = mask_string_literals(line);
     let mut count = 0usize;
     let mut start = 0usize;
-    while let Some(pos) = line[start..].find(keyword) {
+    while let Some(pos) = masked[start..].find(keyword) {
         let abs = start + pos;
-        if is_keyword_boundary(line, abs, keyword.len()) {
+        if is_keyword_boundary(&masked, abs, keyword.len()) {
             count += 1;
         }
         start = abs + keyword.len();
@@ -1488,15 +1527,18 @@ fn is_identifier_char(ch: char) -> bool {
 }
 
 fn opens_if_block(line: &str) -> bool {
-    line.starts_with("if ") && line.contains(" then")
+    let masked = mask_string_literals(line);
+    masked.starts_with("if ") && masked.contains(" then") && masked.trim_end().ends_with("then")
 }
 
 fn opens_for_block(line: &str) -> bool {
-    line.starts_with("for ") && line.contains(" do")
+    let masked = mask_string_literals(line);
+    masked.starts_with("for ") && masked.contains(" do")
 }
 
 fn opens_while_block(line: &str) -> bool {
-    line.starts_with("while ") && line.contains(" do")
+    let masked = mask_string_literals(line);
+    masked.starts_with("while ") && masked.contains(" do")
 }
 
 fn opens_repeat_block(line: &str) -> bool {
@@ -2101,6 +2143,58 @@ return small
         assert!(
             findings.iter().all(|finding| !finding.hard_fail),
             "small helper functions should stay below the hard-fail threshold"
+        );
+    }
+
+    #[test]
+    fn plugin_safety_does_not_treat_inline_if_expressions_as_if_blocks() {
+        let content = "\
+--!strict
+local function small(config)
+\tlocal mode =
+\t\tif type(config) == \"table\" then config.mode else \"edit_only\"
+\treturn mode
+end
+
+return small
+";
+        let findings = plugin_function_risk_findings(content);
+        assert!(
+            findings.iter().any(|finding| finding.name == "small"),
+            "inline if expressions should still produce a bounded finding for the surrounding function: {:?}",
+            findings
+        );
+        assert!(
+            findings.iter().all(|finding| !finding.hard_fail),
+            "inline if expressions should not inflate function spans into hard-fail risk: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn plugin_safety_ignores_keywords_inside_string_literals() {
+        let content = "\
+--!strict
+local function small(value)
+\tif type(value) == \"function\" then
+\t\treturn true
+\tend
+\treturn false
+end
+
+return small
+";
+        let findings = plugin_function_risk_findings(content);
+        let small = findings
+            .iter()
+            .find(|finding| finding.name == "small")
+            .expect(
+                "string-literal keywords should not prevent the function from being discovered",
+            );
+        assert!(
+            !small.hard_fail,
+            "keywords inside string literals should not inflate function risk: {:?}",
+            findings
         );
     }
 }

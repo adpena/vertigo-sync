@@ -11,9 +11,18 @@ fn init_creates_vsync_toml() {
     assert!(content.contains("[lint]"));
     assert!(content.contains("[format]"));
     // Verify inline comments are present for DX
-    assert!(content.contains("# vsync.toml"), "should have header comment");
-    assert!(content.contains("# Documentation:"), "should have docs link");
-    assert!(content.contains("name = \"test-project\""), "should contain project name");
+    assert!(
+        content.contains("# vsync.toml"),
+        "should have header comment"
+    );
+    assert!(
+        content.contains("# Documentation:"),
+        "should have docs link"
+    );
+    assert!(
+        content.contains("name = \"test-project\""),
+        "should contain project name"
+    );
 }
 
 #[test]
@@ -61,7 +70,10 @@ fn init_skips_existing_files() {
     vertigo_sync::init::run_init(tmp.path(), Some("test-project")).unwrap();
 
     let content = fs::read_to_string(&toml_path).unwrap();
-    assert_eq!(content, "# my custom config\n", "vsync.toml should not be overwritten");
+    assert_eq!(
+        content, "# my custom config\n",
+        "vsync.toml should not be overwritten"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -89,7 +101,10 @@ fn library_template_creates_release_workflow() {
     vertigo_sync::init::apply_library_template(tmp.path(), "my-lib").unwrap();
 
     let release_path = tmp.path().join(".github/workflows/release.yml");
-    assert!(release_path.exists(), "library template should create release.yml");
+    assert!(
+        release_path.exists(),
+        "library template should create release.yml"
+    );
     let content = fs::read_to_string(&release_path).unwrap();
     assert!(content.contains("vsync publish"));
 }

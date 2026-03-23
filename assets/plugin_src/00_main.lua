@@ -67,6 +67,7 @@ local CORE = table.freeze({
 	SELF_MUTATION_GUARD_SECONDS = 1.75,
 	MANAGED_PATH_ATTR = "VertigoSyncPath",
 	MANAGED_SHA_ATTR = "VertigoSyncSha256",
+	EDIT_PREVIEW_IGNORE_ATTR = "VertigoSyncEditPreviewIgnore",
 })
 -- PLUGIN_SEMVER "0.1.0" used inline in status line 3 (no new local to stay under 194 register limit)
 local APPLY = table.freeze({
@@ -470,6 +471,41 @@ local function bumpTimeTravelEpoch(): number
 	return nextEpoch
 end
 
+local function bumpPreviewInvalidationEpoch(): number
+	local currentEpoch: any = Workspace:GetAttribute("VertigoSyncPreviewInvalidationEpoch")
+	local nextEpoch: number = if type(currentEpoch) == "number" then (currentEpoch + 1) else 1
+	Workspace:SetAttribute("VertigoSyncPreviewInvalidationEpoch", nextEpoch)
+	return nextEpoch
+end
+
+local function historyTransitionAffectsPreview(fromIndex: number, toIndex: number): boolean
+	if fromIndex == toIndex then
+		return false
+	end
+
+	local lowerExclusive: number
+	local upperInclusive: number
+	if fromIndex == 0 then
+		lowerExclusive = toIndex
+		upperInclusive = #HISTORY.entries
+	elseif toIndex == 0 then
+		lowerExclusive = fromIndex
+		upperInclusive = #HISTORY.entries
+	else
+		lowerExclusive = math.min(fromIndex, toIndex)
+		upperInclusive = math.max(fromIndex, toIndex)
+	end
+
+	for index = lowerExclusive + 1, upperInclusive do
+		local entry = HISTORY.entries[index]
+		if entry and entry.geometry_affecting then
+			return true
+		end
+	end
+
+	return false
+end
+
 local function isTimeTravelHardPauseActive(): boolean
 	return SETTINGS.timeTravelUI and HISTORY.active and HISTORY.currentIndex > 0
 end
@@ -564,6 +600,7 @@ local PROJECT = {
 	builderRoots = {} :: { string },
 	builderDependencyRoots = {} :: { string },
 	lastStatusToastKey = "",
+	lastReadinessKey = "",
 	attachedRootGuards = {} :: { [Instance]: boolean },
 	editPreview = {
 		enabled = false,
@@ -583,6 +620,7 @@ local PROJECT = {
 		lastSkipSignature = nil :: string?,
 		nextRootRefreshAt = 0.0,
 		initialBuildQueued = false,
+		scheduleEpoch = 0,
 	},
 }
 local SERVER = {
@@ -591,6 +629,11 @@ local SERVER = {
 	lastGoodProjectId = nil :: string?,
 	allowUntrustedDiscovery = false,
 	discoveryError = "",
+	liveSyncSkipAggregation = nil :: {
+		context: string,
+		count: number,
+		samplePaths: { string },
+	}?,
 }
 local Runtime = {}
 local resolveMapping: (filePath: string) -> (PathMapping?, string?)
@@ -673,6 +716,47 @@ local function inSelfMutationGuard(): boolean
 end
 
 @native
+function Runtime.isManagedMutationInstance(instance: Instance): boolean
+	local managedPath: any = instance:GetAttribute(CORE.MANAGED_PATH_ATTR)
+	if type(managedPath) == "string" and managedPath ~= "" then
+		return true
+	end
+	local managedSha: any = instance:GetAttribute(CORE.MANAGED_SHA_ATTR)
+	return type(managedSha) == "string" and managedSha ~= ""
+end
+
+function Runtime.isEditPreviewIgnoredInstance(instance: Instance): boolean
+	local node: Instance? = instance
+	while node ~= nil do
+		local ignored: any = node:GetAttribute(CORE.EDIT_PREVIEW_IGNORE_ATTR)
+		if ignored == true then
+			return true
+		end
+		node = node.Parent
+	end
+	return false
+end
+
+function Runtime.isEditPreviewGeometryAffectingInstance(instance: Instance): boolean
+	if instance:IsA("LocalizationTable") then
+		return false
+	end
+
+	local fullName = instance:GetFullName()
+	if fullName == "Lighting" or string.find(fullName, "Lighting.", 1, true) == 1 then
+		return false
+	end
+	if string.find(fullName, "ServerScriptService.ImportService.DayNightCycle", 1, true) then
+		return false
+	end
+	if string.find(fullName, "ServerScriptService.ImportService.SceneAudit", 1, true) then
+		return false
+	end
+
+	return true
+end
+
+@native
 local function isEditMode(): boolean
 	return RunService:IsEdit() and not RunService:IsRunning()
 end
@@ -703,6 +787,74 @@ end
 
 -- ─── Attributes / Telemetry ─────────────────────────────────────────────────
 
+function Runtime.evaluateProjectReadiness(): (boolean, string, string)
+	if not syncEnabled then
+		return false, "sync_disabled", "Sync is disabled in the plugin toolbar."
+	end
+	if not isStudioSyncMode() then
+		return false, "studio_mode_unsupported", string.format("Sync is unavailable in Studio mode %s.", describeStudioMode())
+	end
+	if PROJECT.blocked then
+		if PROJECT.message ~= "" then
+			return false, "project_blocked", PROJECT.message
+		end
+		return false, "project_blocked", "Project bootstrap is blocked."
+	end
+	if not PROJECT.loaded then
+		if PROJECT.message ~= "" then
+			return false, "project_bootstrap_pending", PROJECT.message
+		end
+		return false, "project_bootstrap_pending", "Waiting for /project"
+	end
+	if PROJECT.editPreview.enabled and PROJECT.editPreview.builderModulePath == "" then
+		return false, "edit_preview_misconfigured", "Edit preview is enabled, but builderModulePath is missing."
+	end
+	if currentStatus == "error" then
+		if PROJECT.message ~= "" then
+			return false, "sync_error", PROJECT.message
+		end
+		return false, "sync_error", "Sync is in an error state."
+	end
+	if currentStatus ~= "connected" then
+		if hasEverConnected then
+			return false, "sync_disconnected", "Sync is disconnected from the server."
+		end
+		return false, "sync_disconnected", "Waiting for the initial sync connection."
+	end
+	return true, "ready", "Project is ready for sync and edit preview."
+end
+
+@native
+function Runtime.isEditPreviewSuspended(): (boolean, string?)
+	local suspended: any = Workspace:GetAttribute("VertigoSyncEditPreviewSuspended")
+	if suspended == true then
+		local reason: any = Workspace:GetAttribute("VertigoSyncEditPreviewSuspendReason")
+		if type(reason) == "string" and reason ~= "" then
+			return true, reason
+		end
+		return true, "suspended"
+	end
+	return false, nil
+end
+
+function Runtime.updateProjectReadinessAttributes()
+	local ready, code, message = Runtime.evaluateProjectReadiness()
+	Workspace:SetAttribute("VertigoSyncProjectReadinessReady", ready)
+	Workspace:SetAttribute("VertigoSyncProjectReadinessCode", code)
+	Workspace:SetAttribute("VertigoSyncProjectReadinessMessage", message)
+
+	local nextKey = string.format("%s::%s", code, message)
+	if nextKey == PROJECT.lastReadinessKey then
+		return
+	end
+	PROJECT.lastReadinessKey = nextKey
+	if ready then
+		info(string.format("Project readiness: %s", message))
+	else
+		warnMsg(string.format("Project readiness blocked (%s): %s", code, message))
+	end
+end
+
 local function setStatusAttributes(status: SyncStatus, hash: string?)
 	currentStatus = status
 	Workspace:SetAttribute("VertigoSyncStatus", status)
@@ -710,6 +862,7 @@ local function setStatusAttributes(status: SyncStatus, hash: string?)
 		Workspace:SetAttribute("VertigoSyncHash", hash)
 	end
 	Workspace:SetAttribute("VertigoSyncLastUpdate", os.date("!%Y-%m-%dT%H:%M:%SZ"))
+	Runtime.updateProjectReadinessAttributes()
 end
 
 local function setProjectStatus(mode: ProjectBootstrapMode, message: string, projectName: string?, blocked: boolean)
@@ -726,6 +879,7 @@ local function setProjectStatus(mode: ProjectBootstrapMode, message: string, pro
 	Workspace:SetAttribute("VertigoSyncProjectMismatch", mode == "mismatch")
 	Workspace:SetAttribute("VertigoSyncProjectMappingCount", PROJECT.mappingCount)
 	Workspace:SetAttribute("VertigoSyncEmitLegacyScripts", PROJECT.emitLegacyScripts)
+	Runtime.updateProjectReadinessAttributes()
 
 	if mode == "mismatch" and message ~= "" then
 		local toastKey = "mismatch::" .. message
@@ -1061,7 +1215,6 @@ local function discoverServerBaseUrl(allowUntrustedDiscovery: boolean?): string?
 	pushCandidate(plugin:GetSetting("VertigoSyncServerUrl"))
 	pushCandidate(plugin:GetSetting("VertigoSyncLastGoodServerUrl"))
 	pushCandidate(SERVER.activeBaseUrl)
-	pushCandidate("http://127.0.0.1:34872")
 	pushCandidate(CORE.DEFAULT_SERVER_BASE_URL)
 
 	for i = 1, #candidates do
@@ -1361,6 +1514,7 @@ local function applyProjectPayload(payload: any): boolean
 		if type(editPreviewConfig) == "table" and type(editPreviewConfig.mode) == "string" and editPreviewConfig.mode ~= ""
 			then editPreviewConfig.mode
 			else "edit_only"
+	Workspace:SetAttribute("VertigoSyncEditPreviewEnabled", PROJECT.editPreview.enabled)
 	PROJECT.editPreview.pendingReason = nil
 	PROJECT.editPreview.buildScheduled = false
 	PROJECT.editPreview.buildInProgress = false
@@ -1811,6 +1965,21 @@ function Runtime.canRunEditPreview(): boolean
 	return false
 end
 
+function Runtime.isEditPreviewReady(): (boolean, string?)
+	if not Runtime.canRunEditPreview() then
+		return false, "mode"
+	end
+	local suspended, suspendReason = Runtime.isEditPreviewSuspended()
+	if suspended then
+		return false, suspendReason or "suspended"
+	end
+	local ready, code, _message = Runtime.evaluateProjectReadiness()
+	if not ready then
+		return false, code
+	end
+	return true, nil
+end
+
 function Runtime.recordEditPreviewSkip(reason: string, context: string)
 	local editPreview = PROJECT.editPreview
 	local mode = describeStudioMode()
@@ -1824,6 +1993,15 @@ function Runtime.recordEditPreviewSkip(reason: string, context: string)
 	editPreview.lastSkipSignature = signature
 	editPreview.lastSkipAt = now
 	info(string.format("Skipping preview rebuild (%s, %s): mode=%s", reason, context, mode))
+end
+
+function Runtime.cancelPendingEditPreviewBuild(reason: string)
+	local editPreview = PROJECT.editPreview
+	editPreview.scheduleEpoch += 1
+	editPreview.pendingReason = nil
+	editPreview.buildScheduled = false
+	Workspace:SetAttribute("VertigoPreviewLastSkippedReason", reason)
+	Workspace:SetAttribute("VertigoPreviewLastSkippedMode", describeStudioMode())
 end
 
 function Runtime.resolveEditPreviewBuilderModule(): (ModuleScript?, string?)
@@ -1855,8 +2033,18 @@ function Runtime.trackEditPreviewSource(instance: Instance)
 		return
 	end
 	editPreview.sourceConnections[instance] = instance:GetPropertyChangedSignal("Source"):Connect(function()
-		if inSelfMutationGuard() or editPreview.buildInProgress then
+		local suspended = Runtime.isEditPreviewSuspended()
+		if
+			suspended
+			or inSelfMutationGuard()
+			or editPreview.buildInProgress
+			or Runtime.isEditPreviewIgnoredInstance(instance)
+		then
 			Runtime.recordEditPreviewSkip(string.format("source_changed:%s", instance.Name), "self_mutation_guard")
+			return
+		end
+		if not Runtime.isEditPreviewGeometryAffectingInstance(instance) then
+			Runtime.recordEditPreviewSkip(string.format("source_changed:%s", instance.Name), "non_geometry_source")
 			return
 		end
 		Runtime.scheduleEditPreviewBuild(string.format("source_changed:%s", instance:GetFullName()))
@@ -1890,8 +2078,19 @@ function Runtime.attachEditPreviewRoot(key: string, root: Instance)
 	table.insert(connections, root.DescendantAdded:Connect(function(descendant: Instance)
 		Runtime.trackEditPreviewSource(descendant)
 		if descendant:IsA("LuaSourceContainer") then
-			if inSelfMutationGuard() or PROJECT.editPreview.buildInProgress then
+			local suspended = Runtime.isEditPreviewSuspended()
+			if
+				suspended
+				or inSelfMutationGuard()
+				or PROJECT.editPreview.buildInProgress
+				or Runtime.isManagedMutationInstance(descendant)
+				or Runtime.isEditPreviewIgnoredInstance(descendant)
+			then
 				Runtime.recordEditPreviewSkip(string.format("descendant_added:%s", descendant.Name), "self_mutation_guard")
+				return
+			end
+			if not Runtime.isEditPreviewGeometryAffectingInstance(descendant) then
+				Runtime.recordEditPreviewSkip(string.format("descendant_added:%s", descendant.Name), "non_geometry_source")
 				return
 			end
 			Runtime.scheduleEditPreviewBuild(string.format("descendant_added:%s", descendant:GetFullName()))
@@ -1900,8 +2099,19 @@ function Runtime.attachEditPreviewRoot(key: string, root: Instance)
 	table.insert(connections, root.DescendantRemoving:Connect(function(descendant: Instance)
 		Runtime.untrackEditPreviewSource(descendant)
 		if descendant:IsA("LuaSourceContainer") then
-			if inSelfMutationGuard() or PROJECT.editPreview.buildInProgress then
+			local suspended = Runtime.isEditPreviewSuspended()
+			if
+				suspended
+				or inSelfMutationGuard()
+				or PROJECT.editPreview.buildInProgress
+				or Runtime.isManagedMutationInstance(descendant)
+				or Runtime.isEditPreviewIgnoredInstance(descendant)
+			then
 				Runtime.recordEditPreviewSkip(string.format("descendant_removed:%s", descendant.Name), "self_mutation_guard")
+				return
+			end
+			if not Runtime.isEditPreviewGeometryAffectingInstance(descendant) then
+				Runtime.recordEditPreviewSkip(string.format("descendant_removed:%s", descendant.Name), "non_geometry_source")
 				return
 			end
 			Runtime.scheduleEditPreviewBuild(string.format("descendant_removed:%s", descendant:GetFullName()))
@@ -1917,6 +2127,11 @@ end
 function Runtime.refreshEditPreviewWatchRoots()
 	local editPreview = PROJECT.editPreview
 	if not editPreview.enabled then
+		Runtime.clearEditPreviewWatchers()
+		return
+	end
+	local suspended = Runtime.isEditPreviewSuspended()
+	if suspended then
 		Runtime.clearEditPreviewWatchers()
 		return
 	end
@@ -1949,8 +2164,9 @@ function Runtime.runEditPreviewBuild(reason: string)
 	if not editPreview.enabled then
 		return
 	end
-	if not Runtime.canRunEditPreview() then
-		Runtime.recordEditPreviewSkip(reason, "mode")
+	local ready, context = Runtime.isEditPreviewReady()
+	if not ready then
+		Runtime.recordEditPreviewSkip(reason, context or "readiness")
 		return
 	end
 	if editPreview.builderModulePath == "" then
@@ -2021,9 +2237,10 @@ function Runtime.scheduleEditPreviewBuild(reason: string)
 	if not editPreview.enabled then
 		return
 	end
-	if not Runtime.canRunEditPreview() then
+	local ready, context = Runtime.isEditPreviewReady()
+	if not ready then
 		editPreview.pendingReason = nil
-		Runtime.recordEditPreviewSkip(reason, "schedule")
+		Runtime.recordEditPreviewSkip(reason, context or "schedule")
 		return
 	end
 	editPreview.pendingReason = reason
@@ -2031,12 +2248,17 @@ function Runtime.scheduleEditPreviewBuild(reason: string)
 		return
 	end
 	editPreview.buildScheduled = true
+	local scheduleEpoch = editPreview.scheduleEpoch
 	task.delay(editPreview.debounceSeconds, function()
+		if editPreview.scheduleEpoch ~= scheduleEpoch then
+			return
+		end
 		editPreview.buildScheduled = false
 		local buildReason = editPreview.pendingReason or reason
 		editPreview.pendingReason = nil
-		if not Runtime.canRunEditPreview() then
-			Runtime.recordEditPreviewSkip(buildReason, "debounced")
+		local buildReady, buildContext = Runtime.isEditPreviewReady()
+		if not buildReady then
+			Runtime.recordEditPreviewSkip(buildReason, buildContext or "debounced")
 			return
 		end
 		if editPreview.buildInProgress then
@@ -2057,7 +2279,8 @@ function Runtime.tickEditPreview()
 		editPreview.nextRootRefreshAt = now + editPreview.rootRefreshSeconds
 		Runtime.refreshEditPreviewWatchRoots()
 	end
-	if not editPreview.initialBuildQueued then
+	local ready = Runtime.isEditPreviewReady()
+	if not editPreview.initialBuildQueued and ready then
 		editPreview.initialBuildQueued = true
 		Runtime.scheduleEditPreviewBuild("project_bootstrap")
 	end
@@ -3510,6 +3733,111 @@ function Runtime.stageWrite(path: string, expectedSha: string?)
 end
 
 @native
+function Runtime.isLiveSyncWritableSourceEntry(path: string, bytes: number): (boolean, string?)
+	if bytes < CORE.MAX_LUA_SOURCE_LENGTH then
+		return true, nil
+	end
+
+	local mapping, remainder = resolveMapping(path)
+	if mapping == nil or remainder == nil then
+		return true, nil
+	end
+
+	local _segments, className, _instanceName = Runtime.parseRelativePath(remainder)
+	if SCRIPT_CLASSES[className] then
+		return false, string.format(
+			"LIVE_SYNC_SKIPPED_OVERSIZE:%s exceeds Roblox ModuleScript/Script Source limit (%d >= %d)",
+			path,
+			bytes,
+			CORE.MAX_LUA_SOURCE_LENGTH
+		)
+	end
+
+	return true, nil
+end
+
+@native
+function Runtime.beginLiveSyncSkipAggregation(context: string)
+	SERVER.liveSyncSkipAggregation = {
+		context = context,
+		count = 0,
+		samplePaths = table.create(6),
+	}
+end
+
+@native
+function Runtime.recordLiveSyncSkipAggregation(path: string, reason: string)
+	local aggregation = SERVER.liveSyncSkipAggregation
+	if aggregation == nil then
+		warnMsg(string.format("Live sync skipped for %s: %s", path, reason))
+		return
+	end
+
+	aggregation.count += 1
+	if #aggregation.samplePaths < 6 then
+		table.insert(aggregation.samplePaths, path)
+	end
+end
+
+@native
+function Runtime.flushLiveSyncSkipAggregation()
+	local aggregation = SERVER.liveSyncSkipAggregation
+	SERVER.liveSyncSkipAggregation = nil
+	if aggregation == nil or aggregation.count == 0 then
+		return
+	end
+
+	local sampleCount = #aggregation.samplePaths
+	local sampleText = ""
+	if sampleCount > 0 then
+		sampleText = string.format("; samples: %s", table.concat(aggregation.samplePaths, ", "))
+	end
+
+	local omittedCount = aggregation.count - sampleCount
+	local remainderText = ""
+	if omittedCount > 0 then
+		remainderText = string.format(" (+%d more)", omittedCount)
+	end
+
+	warnMsg(string.format(
+		"LIVE_SYNC_SKIPPED_OVERSIZE_SUMMARY:%s skipped %d oversized live-sync source entries (limit=%d)%s%s",
+		aggregation.context,
+		aggregation.count,
+		CORE.MAX_LUA_SOURCE_LENGTH,
+		sampleText,
+		remainderText
+	))
+end
+
+@native
+function Runtime.stageWriteEntry(path: string, expectedSha: string?, bytes: number?, meta: EntryMeta?)
+	if meta ~= nil then
+		metaByPath[path] = meta
+	end
+
+	if type(bytes) == "number" then
+		local writable, reason = Runtime.isLiveSyncWritableSourceEntry(path, bytes)
+		if not writable and reason ~= nil then
+			local rejectedSha: string = expectedSha or ""
+			if hardRejectedShaByPath[path] ~= rejectedSha or hardRejectedReasonByPath[path] ~= reason then
+				hardRejectedShaByPath[path] = rejectedSha
+				hardRejectedReasonByPath[path] = reason
+				Runtime.recordLiveSyncSkipAggregation(path, reason)
+			end
+			return
+		end
+	end
+
+	local rejectedSha: string? = hardRejectedShaByPath[path]
+	if rejectedSha ~= nil and expectedSha ~= nil and rejectedSha ~= expectedSha then
+		hardRejectedShaByPath[path] = nil
+		hardRejectedReasonByPath[path] = nil
+	end
+
+	Runtime.stageWrite(path, expectedSha)
+end
+
+@native
 function Runtime.stageDelete(path: string)
 	Runtime.stageOperation(path, "delete", nil)
 end
@@ -3609,11 +3937,6 @@ function Runtime.reconcileSnapshot(snapshot: SnapshotResponse)
 		local entryPath: string = entry.path
 		local entrySha: string = entry.sha256
 
-		-- Cache meta for later application during applyWrite
-		if entry.meta ~= nil then
-			metaByPath[entryPath] = entry.meta
-		end
-
 		local rejectedSha: string? = hardRejectedShaByPath[entryPath]
 		if rejectedSha ~= nil and rejectedSha == entrySha then
 			continue
@@ -3624,9 +3947,13 @@ function Runtime.reconcileSnapshot(snapshot: SnapshotResponse)
 		end
 
 		if managedShaByPath[entryPath] ~= entrySha then
-			Runtime.stageWrite(entryPath, entrySha)
+			if SERVER.liveSyncSkipAggregation == nil then
+				Runtime.beginLiveSyncSkipAggregation("snapshot_reconcile")
+			end
+			Runtime.stageWriteEntry(entryPath, entrySha, entry.bytes, entry.meta)
 		end
 	end
+	Runtime.flushLiveSyncSkipAggregation()
 
 	lastHash = snapshot.fingerprint
 	setStatusAttributes("connected", snapshot.fingerprint)
@@ -3765,24 +4092,22 @@ function Runtime.pollDiff()
 		end
 	end
 	if type(diff.added) == "table" then
+		Runtime.beginLiveSyncSkipAggregation("diff_added")
 		for _, entry in ipairs(diff.added) do
 			if type(entry) == "table" and type(entry.path) == "string" then
-				if entry.meta ~= nil then
-					metaByPath[entry.path] = entry.meta
-				end
-				Runtime.stageWrite(entry.path, entry.sha256)
+				Runtime.stageWriteEntry(entry.path, entry.sha256, entry.bytes, entry.meta)
 			end
 		end
+		Runtime.flushLiveSyncSkipAggregation()
 	end
 	if type(diff.modified) == "table" then
+		Runtime.beginLiveSyncSkipAggregation("diff_modified")
 		for _, entry in ipairs(diff.modified) do
 			if type(entry) == "table" and type(entry.path) == "string" then
-				if entry.meta ~= nil then
-					metaByPath[entry.path] = entry.meta
-				end
-				Runtime.stageWrite(entry.path, entry.current_sha256)
+				Runtime.stageWriteEntry(entry.path, entry.current_sha256, entry.current_bytes, entry.meta)
 			end
 		end
+		Runtime.flushLiveSyncSkipAggregation()
 	end
 
 	lastHash = diff.current_fingerprint
@@ -4254,6 +4579,7 @@ function TimeTravel.rewindToIndex(targetIndex: number)
 	end
 
 	local targetFingerprint: string = HISTORY.entries[targetIndex].fingerprint
+	local previewInvalidationNeeded = historyTransitionAffectsPreview(HISTORY.currentIndex, targetIndex)
 	HISTORY.active = true
 	HISTORY.busy = true
 
@@ -4288,6 +4614,9 @@ function TimeTravel.rewindToIndex(targetIndex: number)
 	HISTORY.currentIndex = targetIndex
 	HISTORY.needsBuilderReconcile = BUILDERS.enabled
 	bumpTimeTravelEpoch()
+	if previewInvalidationNeeded then
+		bumpPreviewInvalidationEpoch()
+	end
 
 	setStatusAttributes("connected", snapshot.fingerprint)
 	publishTimeTravelAttributes()
@@ -4336,7 +4665,11 @@ function TimeTravel.resumeLiveSync()
 	HISTORY.pendingIndex = nil
 	HISTORY.pendingResumeLive = false
 	HISTORY.needsBuilderReconcile = BUILDERS.enabled
+	local previewInvalidationNeeded = historyTransitionAffectsPreview(HISTORY.currentIndex, 0)
 	bumpTimeTravelEpoch()
+	if previewInvalidationNeeded then
+		bumpPreviewInvalidationEpoch()
+	end
 	syncEnabled = true
 	resyncRequested = true -- Force full resync to get back to current state
 	publishTimeTravelAttributes()
@@ -6587,7 +6920,9 @@ Runtime.initInstancePool()
 Workspace:SetAttribute("VertigoSyncPluginVersion", CORE.PLUGIN_VERSION)
 Workspace:SetAttribute("VertigoSyncRealtimeDefault", true)
 Workspace:SetAttribute("VertigoSyncBinaryModels", SETTINGS.binaryModels)
+Workspace:SetAttribute("VertigoSyncWebSocketAvailable", WebSocketService ~= nil)
 Workspace:SetAttribute("VertigoSyncBuildersEnabled", BUILDERS.enabled)
+Workspace:SetAttribute("VertigoSyncEditPreviewEnabled", false)
 Workspace:SetAttribute("VertigoPreviewBuildInProgress", false)
 updateBuilderPerfAttributes()
 setProjectStatus("bootstrapping", "Waiting for /project", nil, false)
@@ -6607,6 +6942,16 @@ flushMetrics(true)
 
 task.defer(function()
 	ensureProjectBootstrap(false)
+end)
+
+Workspace:GetAttributeChangedSignal("VertigoSyncEditPreviewSuspended"):Connect(function()
+	if Workspace:GetAttribute("VertigoSyncEditPreviewSuspended") == true then
+		Runtime.cancelPendingEditPreviewBuild("workspace_suspended")
+		Runtime.clearEditPreviewWatchers()
+	else
+		PROJECT.editPreview.nextRootRefreshAt = 0.0
+		PROJECT.editPreview.initialBuildQueued = false
+	end
 end)
 
 Workspace:GetAttributeChangedSignal("VertigoPreviewForceRebuild"):Connect(function()

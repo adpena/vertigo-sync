@@ -40,7 +40,9 @@ TestEZ = "roblox/testez@^0.4.0"
     );
     assert_eq!(
         config.server_dependencies.get("DataStoreService"),
-        Some(&DependencySpec::Simple("roblox/data-store@^1.0.0".to_string()))
+        Some(&DependencySpec::Simple(
+            "roblox/data-store@^1.0.0".to_string()
+        ))
     );
     assert_eq!(
         config.dev_dependencies.get("TestEZ"),

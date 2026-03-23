@@ -19,7 +19,10 @@ fn format_source_with_indent_spaces() {
         ..Default::default()
     };
     let output = fmt::format_source(input, &config).unwrap();
-    assert!(output.contains("  x = 1"), "expected 2-space indent, got: {output}");
+    assert!(
+        output.contains("  x = 1"),
+        "expected 2-space indent, got: {output}"
+    );
 }
 
 #[test]
@@ -30,7 +33,10 @@ fn format_source_with_tabs() {
         ..Default::default()
     };
     let output = fmt::format_source(input, &config).unwrap();
-    assert!(output.contains("\tx = 1"), "expected tab indent, got: {output}");
+    assert!(
+        output.contains("\tx = 1"),
+        "expected tab indent, got: {output}"
+    );
 }
 
 #[test]

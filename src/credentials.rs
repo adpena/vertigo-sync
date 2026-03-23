@@ -37,8 +37,8 @@ pub fn load_credentials() -> Result<CredentialStore> {
     }
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let store: CredentialStore = toml::from_str(&content)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let store: CredentialStore =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
     Ok(store)
 }
 
@@ -49,14 +49,13 @@ pub fn save_credentials(store: &CredentialStore) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let content = toml::to_string_pretty(store)
-        .context("failed to serialize credentials")?;
+    let content = toml::to_string_pretty(store).context("failed to serialize credentials")?;
 
     // Write with restrictive permissions on Unix
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -140,9 +139,6 @@ mod tests {
 
         let loaded: CredentialStore =
             toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            loaded.registries["https://example.com"].token,
-            "secret123"
-        );
+        assert_eq!(loaded.registries["https://example.com"].token, "secret123");
     }
 }

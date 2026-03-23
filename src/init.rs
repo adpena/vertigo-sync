@@ -80,7 +80,8 @@ pub fn run_init(root: &Path, name: Option<&str>) -> Result<()> {
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '/')
             .collect();
 
-        let vsync_toml = format!(r#"# vsync.toml — unified project configuration
+        let vsync_toml = format!(
+            r#"# vsync.toml — unified project configuration
 # Documentation: https://github.com/vertigo-sync/vertigo-sync/blob/main/docs/configuration.md
 
 [package]
@@ -115,7 +116,8 @@ quote-style = "double"
 # Project scripts — run with: vsync run <name>
 # [scripts]
 # test = "vsync build -o test.rbxl"
-"#);
+"#
+        );
         write_if_missing(&root.join("vsync.toml"), &vsync_toml)?;
     }
 
@@ -138,10 +140,7 @@ sourcemap.json
         &root.join("src/Client/init.client.luau"),
         "--!strict\nprint(\"[Client] Hello from Vertigo Sync!\")\n",
     )?;
-    write_if_missing(
-        &root.join("src/Shared/init.luau"),
-        "--!strict\nreturn {}\n",
-    )?;
+    write_if_missing(&root.join("src/Shared/init.luau"), "--!strict\nreturn {}\n")?;
 
     // -- tests/init.luau -----------------------------------------------------
     write_if_missing(
@@ -257,10 +256,7 @@ jobs:
         env:
           VSYNC_TOKEN: ${{ secrets.VSYNC_TOKEN }}
 "#;
-    write_if_missing(
-        &root.join(".github/workflows/release.yml"),
-        release_yml,
-    )?;
+    write_if_missing(&root.join(".github/workflows/release.yml"), release_yml)?;
 
     // Enrich vsync.toml with library metadata if not already present.
     // We re-read the file to patch in additional fields.
@@ -298,7 +294,10 @@ jobs:
             let updated = std::fs::read_to_string(&toml_path)?;
             if let Some(pos) = updated.find("# realm") {
                 // Find the end of that line
-                let line_end = updated[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(updated.len());
+                let line_end = updated[pos..]
+                    .find('\n')
+                    .map(|i| pos + i + 1)
+                    .unwrap_or(updated.len());
                 let mut patched = String::with_capacity(updated.len() + additions.len());
                 patched.push_str(&updated[..line_end]);
                 patched.push_str(&additions);
@@ -306,9 +305,7 @@ jobs:
                 std::fs::write(&toml_path, &patched)?;
             } else {
                 // Just append at the end of the [package] section
-                let mut f = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&toml_path)?;
+                let mut f = std::fs::OpenOptions::new().append(true).open(&toml_path)?;
                 use std::io::Write;
                 write!(f, "{additions}")?;
             }
@@ -374,10 +371,7 @@ print("[{project_name}] Plugin loaded")
 "#
     );
 
-    write_if_missing(
-        &root.join("src/Plugin/init.server.luau"),
-        &plugin_init,
-    )?;
+    write_if_missing(&root.join("src/Plugin/init.server.luau"), &plugin_init)?;
 
     // Update vsync.toml realm to server for plugins
     let toml_path = root.join("vsync.toml");

@@ -20,6 +20,8 @@ benchmark-results/
 # OS files
 .DS_Store
 Thumbs.db
+.worktrees/
+worktrees/
 
 # Logs
 *.log

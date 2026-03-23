@@ -64,10 +64,7 @@ wait(1)
         .iter()
         .filter(|i| i.rule == "wait-deprecated")
         .collect();
-    assert!(
-        !wait_issues.is_empty(),
-        "expected wait-deprecated issue"
-    );
+    assert!(!wait_issues.is_empty(), "expected wait-deprecated issue");
 }
 
 #[test]
@@ -112,10 +109,7 @@ print("hello")
 fn detects_empty_block() {
     let source = "if true then\nend\n";
     let issues = lint_source(source, "test.lua", &BTreeMap::new());
-    let empty: Vec<_> = issues
-        .iter()
-        .filter(|i| i.rule == "empty-block")
-        .collect();
+    let empty: Vec<_> = issues.iter().filter(|i| i.rule == "empty-block").collect();
     assert!(!empty.is_empty(), "expected empty-block issue");
 }
 
@@ -132,10 +126,7 @@ end
         .iter()
         .filter(|i| i.rule == "unreachable-code")
         .collect();
-    assert!(
-        !unreachable.is_empty(),
-        "expected unreachable-code issue"
-    );
+    assert!(!unreachable.is_empty(), "expected unreachable-code issue");
 }
 
 #[test]

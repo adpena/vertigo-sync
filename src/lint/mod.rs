@@ -58,14 +58,8 @@ const BUILTIN_RULES: &[(&str, RuleFn)] = &[
     ("unreachable-code", rules::check_unreachable_code),
     ("function-length", rules::check_function_length),
     ("nesting-depth", rules::check_nesting_depth),
-    (
-        "cyclomatic-complexity",
-        rules::check_cyclomatic_complexity,
-    ),
-    (
-        "parentheses-condition",
-        rules::check_parentheses_condition,
-    ),
+    ("cyclomatic-complexity", rules::check_cyclomatic_complexity),
+    ("parentheses-condition", rules::check_parentheses_condition),
     ("comparison-order", rules::check_comparison_order),
 ];
 
@@ -86,10 +80,7 @@ pub fn lint_source(
     let mut issues = Vec::new();
 
     for &(name, check_fn) in BUILTIN_RULES {
-        let config_value = rule_config
-            .get(name)
-            .map(|s| s.as_str())
-            .unwrap_or("warn");
+        let config_value = rule_config.get(name).map(|s| s.as_str()).unwrap_or("warn");
 
         if config_value == "off" {
             continue;

@@ -1,4 +1,4 @@
-use vertigo_sync::package::lockfile::{Lockfile, LockedPackage};
+use vertigo_sync::package::lockfile::{LockedPackage, Lockfile};
 
 #[test]
 fn lockfile_roundtrip() {
@@ -22,7 +22,10 @@ fn lockfile_roundtrip() {
     assert_eq!(parsed.packages[0].realm, "shared");
     assert_eq!(parsed.packages[0].checksum, "abc123def456");
     assert_eq!(parsed.packages[0].source, "wally");
-    assert_eq!(parsed.packages[0].dependencies, vec!["roblox/react-lua@0.1.0"]);
+    assert_eq!(
+        parsed.packages[0].dependencies,
+        vec!["roblox/react-lua@0.1.0"]
+    );
     assert_eq!(lf, parsed);
 }
 

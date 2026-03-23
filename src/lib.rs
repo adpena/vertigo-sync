@@ -12,26 +12,26 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+pub mod builder_codegen;
 pub mod config;
 pub mod credentials;
+pub mod errors;
 pub mod fmt;
 pub mod init;
-pub mod migrate;
-pub mod builder_codegen;
-pub mod errors;
+pub mod lint;
 pub mod mcp;
+pub mod migrate;
 pub mod output;
+pub mod package;
 pub mod plugin_smoke;
 pub mod project;
 pub mod publish;
 pub mod rbxl;
+pub mod scripts;
 pub mod serve_rbxl;
 pub mod server;
-pub mod scripts;
 pub mod sourcemap;
-pub mod lint;
 pub mod validate;
-pub mod package;
 
 // ---------------------------------------------------------------------------
 // Event coalescer — batches filesystem events within a configurable window
@@ -2253,13 +2253,32 @@ pub struct HistoryEntry {
     pub scope: String,
 }
 
+fn is_non_geometry_import_service_path(path: &str) -> bool {
+    path.ends_with("/ImportService/DayNightCycle.lua")
+        || path.ends_with("/ImportService/SceneAudit.lua")
+}
+
+fn is_non_geometry_preview_path(path: &str) -> bool {
+    is_non_geometry_import_service_path(path)
+        || path.contains("/src/Lighting/")
+        || path.ends_with("/src/Lighting")
+}
+
 pub fn classify_history_path(path: &str) -> (&'static str, bool) {
     if path.contains("AustinManifest")
         || path.contains("AustinPreviewManifest")
         || path.contains("StudioPreview/AustinPreviewBuilder.lua")
-        || path.contains("/ImportService/")
     {
         return ("geometry", true);
+    }
+    if path.contains("/ImportService/") {
+        if is_non_geometry_preview_path(path) {
+            return ("code", false);
+        }
+        return ("geometry", true);
+    }
+    if is_non_geometry_preview_path(path) {
+        return ("code", false);
     }
     if path.contains("assets/plugin_src/")
         || path.contains("assets/VertigoSyncPlugin.lua")
@@ -3434,5 +3453,99 @@ mod tests {
         assert_eq!(diff.renamed.len(), 2);
         assert!(diff.added.is_empty());
         assert!(diff.deleted.is_empty());
+    }
+
+    #[test]
+    fn classify_history_path_treats_day_night_cycle_as_code_not_geometry() {
+        assert_eq!(
+            classify_history_path("roblox/src/ServerScriptService/ImportService/DayNightCycle.lua"),
+            ("code", false)
+        );
+    }
+
+    #[test]
+    fn classify_history_path_treats_scene_audit_as_code_not_geometry() {
+        assert_eq!(
+            classify_history_path("roblox/src/ServerScriptService/ImportService/SceneAudit.lua"),
+            ("code", false)
+        );
+    }
+
+    #[test]
+    fn classify_history_path_treats_lighting_root_as_code_not_geometry() {
+        assert_eq!(
+            classify_history_path("roblox/src/Lighting"),
+            ("code", false)
+        );
+        assert_eq!(
+            classify_history_path("roblox/src/Lighting/Atmosphere.json"),
+            ("code", false)
+        );
+    }
+
+    #[test]
+    fn classify_history_path_keeps_builder_changes_geometry_affecting() {
+        assert_eq!(
+            classify_history_path(
+                "roblox/src/ServerScriptService/ImportService/Builders/RoadBuilder.lua"
+            ),
+            ("geometry", true)
+        );
+    }
+
+    #[test]
+    fn classify_history_diff_does_not_mark_day_night_only_change_as_geometry() {
+        let diff = SnapshotDiff {
+            previous_fingerprint: "prev".to_string(),
+            current_fingerprint: "curr".to_string(),
+            added: vec![make_entry(
+                "roblox/src/ServerScriptService/ImportService/DayNightCycle.lua",
+                "sha",
+                128,
+            )],
+            modified: Vec::new(),
+            deleted: Vec::new(),
+            renamed: Vec::new(),
+        };
+
+        let (scope, geometry_affecting) = classify_history_diff(&diff);
+        assert_eq!(scope, "mixed");
+        assert!(!geometry_affecting);
+    }
+
+    #[test]
+    fn classify_history_diff_marks_builder_change_as_geometry() {
+        let diff = SnapshotDiff {
+            previous_fingerprint: "prev".to_string(),
+            current_fingerprint: "curr".to_string(),
+            added: vec![make_entry(
+                "roblox/src/ServerScriptService/ImportService/Builders/BuildingBuilder.lua",
+                "sha",
+                128,
+            )],
+            modified: Vec::new(),
+            deleted: Vec::new(),
+            renamed: Vec::new(),
+        };
+
+        let (scope, geometry_affecting) = classify_history_diff(&diff);
+        assert_eq!(scope, "geometry");
+        assert!(geometry_affecting);
+    }
+
+    #[test]
+    fn classify_history_diff_does_not_mark_lighting_only_change_as_geometry() {
+        let diff = SnapshotDiff {
+            previous_fingerprint: "prev".to_string(),
+            current_fingerprint: "curr".to_string(),
+            added: vec![make_entry("roblox/src/Lighting/Atmosphere.json", "sha", 64)],
+            modified: Vec::new(),
+            deleted: Vec::new(),
+            renamed: Vec::new(),
+        };
+
+        let (scope, geometry_affecting) = classify_history_diff(&diff);
+        assert_eq!(scope, "mixed");
+        assert!(!geometry_affecting);
     }
 }

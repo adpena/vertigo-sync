@@ -28,9 +28,15 @@ datastore = "acme/datastore@^1.0.0"
 
     assert!(report.wally_migrated);
     let content = fs::read_to_string(tmp.path().join("vsync.toml")).unwrap();
-    assert!(content.contains("acme/widget"), "should contain package name");
+    assert!(
+        content.contains("acme/widget"),
+        "should contain package name"
+    );
     assert!(content.contains("roact"), "should contain dependency");
-    assert!(content.contains("datastore"), "should contain server dependency");
+    assert!(
+        content.contains("datastore"),
+        "should contain server dependency"
+    );
 }
 
 #[test]
@@ -51,9 +57,18 @@ quote_style = "ForceSingle"
 
     assert!(report.stylua_migrated);
     let content = fs::read_to_string(tmp.path().join("vsync.toml")).unwrap();
-    assert!(content.contains("tabs"), "indent_type should be mapped to 'tabs'");
-    assert!(content.contains("100"), "column_width should map to line-width");
-    assert!(content.contains("single"), "quote_style should be mapped to 'single'");
+    assert!(
+        content.contains("tabs"),
+        "indent_type should be mapped to 'tabs'"
+    );
+    assert!(
+        content.contains("100"),
+        "column_width should map to line-width"
+    );
+    assert!(
+        content.contains("single"),
+        "quote_style should be mapped to 'single'"
+    );
 }
 
 #[test]
@@ -102,5 +117,8 @@ version = "1.0.0"
     assert!(!report.stylua_migrated);
 
     let content = fs::read_to_string(&vsync_path).unwrap();
-    assert_eq!(content, "# my custom config\n", "vsync.toml should not be overwritten");
+    assert_eq!(
+        content, "# my custom config\n",
+        "vsync.toml should not be overwritten"
+    );
 }

@@ -445,9 +445,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             log,
             allow_plugin,
             ignore_cloud_plugins,
-        } => {
-            command_plugin_smoke_log(log, allow_plugin, *ignore_cloud_plugins, &cli)
-        }
+        } => command_plugin_smoke_log(log, allow_plugin, *ignore_cloud_plugins, &cli),
         Command::Build {
             output,
             project,
@@ -467,15 +465,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Init { name, template } => command_init(&root, name.as_deref(), template),
         Command::Migrate => command_migrate(&root),
         Command::Run { name } => {
-            let project_context = resolve_project_context(
-                &root,
-                Path::new("default.project.json"),
-                &cli.include,
-            )?;
-            let scripts = project_context
-                .vsync_config
-                .as_ref()
-                .map(|c| &c.scripts);
+            let project_context =
+                resolve_project_context(&root, Path::new("default.project.json"), &cli.include)?;
+            let scripts = project_context.vsync_config.as_ref().map(|c| &c.scripts);
             let empty = std::collections::BTreeMap::new();
             let scripts = scripts.unwrap_or(&empty);
             match vertigo_sync::scripts::resolve_script(name, scripts) {
@@ -574,7 +566,12 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 vertigo_sync::package::installer::install(&ctx.project_root, &config).await?;
             Ok(())
         }
-        Command::Add { package, server, dev, project } => {
+        Command::Add {
+            package,
+            server,
+            dev,
+            project,
+        } => {
             use vertigo_sync::config::{DependencySpec, save_config};
             use vertigo_sync::package::registry::parse_version_req;
 
@@ -587,7 +584,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     (name, spec.clone())
                 }
                 2 => (package[0].clone(), package[1].clone()),
-                _ => bail!("usage: vsync add [<alias>] <spec>  (e.g. vsync add roblox/roact@^17.0.0)"),
+                _ => bail!(
+                    "usage: vsync add [<alias>] <spec>  (e.g. vsync add roblox/roact@^17.0.0)"
+                ),
             };
 
             // Validate the spec parses correctly
@@ -599,13 +598,21 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
             // Add to the appropriate dependency map
             if *server {
-                config.server_dependencies.insert(alias.clone(), DependencySpec::Simple(spec.clone()));
-                output::success(&format!("added {alias} = \"{spec}\" to [server-dependencies]"));
+                config
+                    .server_dependencies
+                    .insert(alias.clone(), DependencySpec::Simple(spec.clone()));
+                output::success(&format!(
+                    "added {alias} = \"{spec}\" to [server-dependencies]"
+                ));
             } else if *dev {
-                config.dev_dependencies.insert(alias.clone(), DependencySpec::Simple(spec.clone()));
+                config
+                    .dev_dependencies
+                    .insert(alias.clone(), DependencySpec::Simple(spec.clone()));
                 output::success(&format!("added {alias} = \"{spec}\" to [dev-dependencies]"));
             } else {
-                config.dependencies.insert(alias.clone(), DependencySpec::Simple(spec.clone()));
+                config
+                    .dependencies
+                    .insert(alias.clone(), DependencySpec::Simple(spec.clone()));
                 output::success(&format!("added {alias} = \"{spec}\" to [dependencies]"));
             }
 
@@ -634,9 +641,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
             save_config(&ctx.project_root, &config)?;
 
             // Remove from Packages/ directory
-            let packages_dir = ctx.project_root.join(
-                config.package.packages_dir.as_deref().unwrap_or("Packages"),
-            );
+            let packages_dir = ctx
+                .project_root
+                .join(config.package.packages_dir.as_deref().unwrap_or("Packages"));
             // The package could be under any scope, so search for directories named `package`
             if packages_dir.is_dir() {
                 if let Ok(entries) = std::fs::read_dir(&packages_dir) {
@@ -655,9 +662,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
             let lock_path = ctx.project_root.join("vsync.lock");
             if let Some(mut lockfile) = Lockfile::load(&lock_path)? {
                 let suffix = format!("/{package}");
-                lockfile.packages.retain(|p| {
-                    !p.name.ends_with(&suffix) && p.name != *package
-                });
+                lockfile
+                    .packages
+                    .retain(|p| !p.name.ends_with(&suffix) && p.name != *package);
                 lockfile.save(&lock_path)?;
             }
 
@@ -671,7 +678,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
             if let Some(pkg_name) = &package {
                 // Update specific package: remove from lockfile
-                if let Some(mut lockfile) = vertigo_sync::package::lockfile::Lockfile::load(&lock_path)? {
+                if let Some(mut lockfile) =
+                    vertigo_sync::package::lockfile::Lockfile::load(&lock_path)?
+                {
                     let before = lockfile.packages.len();
                     lockfile.packages.retain(|p| {
                         // Match by alias or full name
@@ -680,7 +689,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     let removed = before - lockfile.packages.len();
                     if removed > 0 {
                         lockfile.save(&lock_path)?;
-                        output::info(&format!("Removed {pkg_name} from lockfile, re-resolving..."));
+                        output::info(&format!(
+                            "Removed {pkg_name} from lockfile, re-resolving..."
+                        ));
                     } else {
                         output::warn(&format!("{pkg_name} not found in lockfile"));
                     }
@@ -693,16 +704,15 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 }
             }
 
-            let report = vertigo_sync::package::installer::install(&ctx.project_root, &config).await?;
+            let report =
+                vertigo_sync::package::installer::install(&ctx.project_root, &config).await?;
             output::success(&format!(
                 "{} installed, {} cached, {} total",
                 report.installed, report.cached, report.total
             ));
             Ok(())
         }
-        Command::Login { token, registry } => {
-            command_login(token.as_deref(), registry)
-        }
+        Command::Login { token, registry } => command_login(token.as_deref(), registry),
         Command::Publish { registry, project } => {
             command_publish(&root, project, registry, &cli).await
         }
@@ -1438,8 +1448,7 @@ async fn command_discover(
 }
 
 fn command_validate(root: &Path, project: &Path, fix: bool, cli: &Cli) -> Result<()> {
-    let project_context =
-        resolve_project_context(root, project, &cli.include)?;
+    let project_context = resolve_project_context(root, project, &cli.include)?;
 
     // --fix: auto-fix supported rules before validating
     if fix {
@@ -1464,11 +1473,19 @@ fn command_validate(root: &Path, project: &Path, fix: bool, cli: &Cli) -> Result
     // Apply .vsyncignore patterns — remove issues for ignored files.
     let ignore_patterns = load_ignore_patterns(&project_context.project_root);
     if !ignore_patterns.is_empty() {
-        report.issues.retain(|issue| {
-            !ignore_patterns.iter().any(|p| p.matches(&issue.path))
-        });
-        report.errors = report.issues.iter().filter(|i| i.severity == "error").count();
-        report.warnings = report.issues.iter().filter(|i| i.severity == "warning").count();
+        report
+            .issues
+            .retain(|issue| !ignore_patterns.iter().any(|p| p.matches(&issue.path)));
+        report.errors = report
+            .issues
+            .iter()
+            .filter(|i| i.severity == "error")
+            .count();
+        report.warnings = report
+            .issues
+            .iter()
+            .filter(|i| i.severity == "warning")
+            .count();
         report.clean = report.errors == 0 && report.warnings == 0;
     }
 
@@ -1476,9 +1493,9 @@ fn command_validate(root: &Path, project: &Path, fix: bool, cli: &Cli) -> Result
     // vsync.toml.  Rules set to "off" are dropped; severity can be escalated
     // or downgraded via "error" / "warn".
     if let Some(ref config) = project_context.vsync_config {
-        report.issues.retain(|issue| {
-            config.lint.get(&issue.rule).map(|s| s.as_str()) != Some("off")
-        });
+        report
+            .issues
+            .retain(|issue| config.lint.get(&issue.rule).map(|s| s.as_str()) != Some("off"));
         for issue in &mut report.issues {
             if let Some(configured) = config.lint.get(&issue.rule) {
                 match configured.as_str() {
@@ -1489,8 +1506,16 @@ fn command_validate(root: &Path, project: &Path, fix: bool, cli: &Cli) -> Result
             }
         }
         // Recompute summary counts after filtering and severity changes.
-        report.errors = report.issues.iter().filter(|i| i.severity == "error").count();
-        report.warnings = report.issues.iter().filter(|i| i.severity == "warning").count();
+        report.errors = report
+            .issues
+            .iter()
+            .filter(|i| i.severity == "error")
+            .count();
+        report.warnings = report
+            .issues
+            .iter()
+            .filter(|i| i.severity == "warning")
+            .count();
         report.clean = report.errors == 0 && report.warnings == 0;
     }
 
@@ -1544,7 +1569,9 @@ fn command_validate(root: &Path, project: &Path, fix: bool, cli: &Cli) -> Result
                 output::info(line);
             }
         }
-        output::warn("Selene passthrough is deprecated and will be removed in v1.0. Built-in lint rules will replace it.");
+        output::warn(
+            "Selene passthrough is deprecated and will be removed in v1.0. Built-in lint rules will replace it.",
+        );
     }
 
     // Built-in configurable lint pass.
@@ -1708,9 +1735,7 @@ fn command_fmt(
             let inc_path = project_context.project_root.join(inc);
             if inc_path.is_dir() {
                 all.extend(vertigo_sync::fmt::collect_lua_files(&inc_path)?);
-            } else if inc_path.is_file()
-                && (inc.ends_with(".luau") || inc.ends_with(".lua"))
-            {
+            } else if inc_path.is_file() && (inc.ends_with(".luau") || inc.ends_with(".lua")) {
                 all.push(inc_path);
             }
         }
@@ -1816,8 +1841,13 @@ fn command_fmt(
         println!("{}", serde_json::to_string(&report)?);
     } else {
         vertigo_sync::output::header("Fmt");
-        eprintln!("  {checked_count} file(s) checked, {changed_count} file(s) {}.",
-            if check || diff { "would change" } else { "formatted" }
+        eprintln!(
+            "  {checked_count} file(s) checked, {changed_count} file(s) {}.",
+            if check || diff {
+                "would change"
+            } else {
+                "formatted"
+            }
         );
         for err in &errors {
             eprintln!("  error: {err}");
@@ -1927,7 +1957,10 @@ fn command_watch_native(root: &Path, state_dir: &Path, project: &Path, cli: &Cli
 }
 
 fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: bool) -> Result<()> {
-    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+    use rbx_dom_weak::{
+        InstanceBuilder, WeakDom,
+        types::{Attributes, Variant},
+    };
     use vertigo_sync::project::resolve_instance_class;
 
     let project_context = resolve_project_context(root, project, &[])?;
@@ -1983,7 +2016,7 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
 
                 let mut builder = InstanceBuilder::new(class).with_name(*segment);
 
-                // Apply $properties from the mapping to the leaf instance.
+                // Apply $properties and $attributes from the mapping to the leaf instance.
                 if i == segments.len() - 1 {
                     if let Some(ref props) = mapping.properties {
                         for (key, value) in props {
@@ -2016,6 +2049,34 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
                                 // Complex property types (Color3, Vector3, CFrame, UDim2) are not supported in build mode
                                 _ => {}
                             }
+                        }
+                    }
+
+                    if let Some(ref attrs) = mapping.attributes {
+                        let mut serialized_attributes = Attributes::new();
+                        for (key, value) in attrs {
+                            let variant = match value {
+                                serde_json::Value::Bool(b) => Some(Variant::Bool(*b)),
+                                serde_json::Value::String(s) => Some(Variant::String(s.clone())),
+                                serde_json::Value::Number(n) => {
+                                    if let Some(i) = n.as_i64() {
+                                        Some(Variant::Int64(i))
+                                    } else {
+                                        n.as_f64().map(Variant::Float64)
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if let Some(variant) = variant {
+                                serialized_attributes.insert(key.clone(), variant);
+                            }
+                        }
+
+                        if !serialized_attributes.is_empty() {
+                            builder = builder.with_property(
+                                "Attributes",
+                                Variant::Attributes(serialized_attributes),
+                            );
                         }
                     }
                 }
@@ -2440,7 +2501,9 @@ fn command_init(root: &Path, name: Option<&str>, template: &str) -> Result<()> {
         })
         .unwrap_or_else(|| "my-project".to_string());
 
-    output::header(&format!("Initializing project: {project_name} (template: {template})"));
+    output::header(&format!(
+        "Initializing project: {project_name} (template: {template})"
+    ));
     eprintln!();
 
     vertigo_sync::init::run_init(root, name)?;
@@ -2468,7 +2531,10 @@ fn command_init(root: &Path, name: Option<&str>, template: &str) -> Result<()> {
 
 fn command_login(token: Option<&str>, registry: &str) -> Result<()> {
     // Enforce HTTPS for registry tokens (localhost exempt for dev)
-    if !registry.starts_with("https://") && !registry.starts_with("http://127.0.0.1") && !registry.starts_with("http://localhost") {
+    if !registry.starts_with("https://")
+        && !registry.starts_with("http://127.0.0.1")
+        && !registry.starts_with("http://localhost")
+    {
         bail!("registry URL must use HTTPS to protect credentials: {registry}");
     }
 
@@ -2495,12 +2561,7 @@ fn command_login(token: Option<&str>, registry: &str) -> Result<()> {
     Ok(())
 }
 
-async fn command_publish(
-    root: &Path,
-    project: &Path,
-    registry: &str,
-    cli: &Cli,
-) -> Result<()> {
+async fn command_publish(root: &Path, project: &Path, registry: &str, cli: &Cli) -> Result<()> {
     let project_context = resolve_project_context(root, project, &cli.include)?;
     let config = project_context
         .vsync_config
@@ -2521,12 +2582,9 @@ async fn command_publish(
 
     // Publish
     output::info("Publishing...");
-    let version = vertigo_sync::publish::publish_package(
-        &project_context.project_root,
-        config,
-        registry,
-    )
-    .await?;
+    let version =
+        vertigo_sync::publish::publish_package(&project_context.project_root, config, registry)
+            .await?;
 
     output::success(&format!("Published version {version}"));
     Ok(())
@@ -2557,21 +2615,33 @@ fn command_migrate(root: &Path) -> Result<()> {
             parts.push(format!(
                 "{} {}",
                 report.dep_count,
-                if report.dep_count == 1 { "dependency" } else { "dependencies" }
+                if report.dep_count == 1 {
+                    "dependency"
+                } else {
+                    "dependencies"
+                }
             ));
         }
         if report.server_dep_count > 0 {
             parts.push(format!(
                 "{} server {}",
                 report.server_dep_count,
-                if report.server_dep_count == 1 { "dependency" } else { "dependencies" }
+                if report.server_dep_count == 1 {
+                    "dependency"
+                } else {
+                    "dependencies"
+                }
             ));
         }
         if report.dev_dep_count > 0 {
             parts.push(format!(
                 "{} dev {}",
                 report.dev_dep_count,
-                if report.dev_dep_count == 1 { "dependency" } else { "dependencies" }
+                if report.dev_dep_count == 1 {
+                    "dependency"
+                } else {
+                    "dependencies"
+                }
             ));
         }
         let suffix = if parts.is_empty() {
@@ -2579,9 +2649,7 @@ fn command_migrate(root: &Path) -> Result<()> {
         } else {
             format!(" ({})", parts.join(", "))
         };
-        output::success(&format!(
-            "Migrated wally.toml \u{2192} vsync.toml{suffix}"
-        ));
+        output::success(&format!("Migrated wally.toml \u{2192} vsync.toml{suffix}"));
     }
     if report.selene_migrated {
         output::success("Migrated selene.toml \u{2192} vsync.toml [lint]");
@@ -2591,7 +2659,9 @@ fn command_migrate(root: &Path) -> Result<()> {
     }
     if report.aftman_found {
         eprintln!();
-        output::warn("aftman.toml / foreman.toml detected — tool versions are not migrated automatically");
+        output::warn(
+            "aftman.toml / foreman.toml detected — tool versions are not migrated automatically",
+        );
     }
 
     eprintln!();
@@ -3149,13 +3219,15 @@ fn default_event_output_path(state_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, PLUGIN_SOURCE, ProjectContext, SyncbackContext, discover_server_url,
-        fetch_json_http, parse_http_url, populate_from_dir, resolve_container_class,
-        resolve_effective_includes, resolve_instance_name, resolve_project_context,
-        resolve_syncback_path, syncback_walk,
+        Cli, Command, PLUGIN_SOURCE, ProjectContext, SyncbackContext, command_build,
+        discover_server_url, fetch_json_http, parse_http_url, populate_from_dir,
+        resolve_container_class, resolve_effective_includes, resolve_instance_name,
+        resolve_project_context, resolve_syncback_path, syncback_walk,
     };
     use axum::{Json, Router, routing::get};
+    use base64::Engine;
     use clap::Parser;
+    use rbx_dom_weak::types::{BinaryString, Variant};
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3576,6 +3648,14 @@ mod tests {
     }
 
     #[test]
+    fn embedded_plugin_has_no_implicit_rojo_discovery_fallback() {
+        assert!(
+            !PLUGIN_SOURCE.contains("http://127.0.0.1:34872"),
+            "embedded plugin should not probe the legacy Rojo port unless explicitly configured"
+        );
+    }
+
+    #[test]
     fn embedded_plugin_hardens_oversized_source_and_queue_overflow() {
         assert!(
             PLUGIN_SOURCE.contains("MAX_LUA_SOURCE_LENGTH = 199999"),
@@ -3680,6 +3760,46 @@ mod tests {
     }
 
     #[test]
+    fn embedded_plugin_skips_live_sync_for_oversized_script_entries() {
+        assert!(
+            PLUGIN_SOURCE.contains("function Runtime.isLiveSyncWritableSourceEntry"),
+            "embedded plugin should classify whether a source entry is live-writable before fetch/apply"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("LIVE_SYNC_SKIPPED_OVERSIZE:"),
+            "embedded plugin should emit a stable diagnostic when oversized script entries are skipped during live sync"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains(
+                "Runtime.stageWriteEntry(entry.path, entry.sha256, entry.bytes, entry.meta)"
+            ),
+            "embedded plugin should carry snapshot entry byte counts into staged write decisions"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("Runtime.stageWriteEntry(entry.path, entry.current_sha256, entry.current_bytes, entry.meta)"),
+            "embedded plugin should carry diff entry byte counts into staged write decisions"
+        );
+    }
+
+    #[test]
+    fn embedded_plugin_aggregates_oversized_live_sync_skip_diagnostics() {
+        assert!(
+            PLUGIN_SOURCE.contains("LIVE_SYNC_SKIPPED_OVERSIZE_SUMMARY:"),
+            "embedded plugin should emit a bounded summary diagnostic for oversized live-sync skips"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("snapshot_reconcile")
+                && PLUGIN_SOURCE.contains("diff_added")
+                && PLUGIN_SOURCE.contains("diff_modified"),
+            "embedded plugin should aggregate oversized live-sync skips by reconcile/diff batch"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("function Runtime.flushLiveSyncSkipAggregation"),
+            "embedded plugin should flush aggregated live-sync skip diagnostics explicitly"
+        );
+    }
+
+    #[test]
     fn embedded_plugin_contains_edit_preview_runtime_contract() {
         assert!(
             PLUGIN_SOURCE.contains("editPreview"),
@@ -3692,6 +3812,213 @@ mod tests {
         assert!(
             PLUGIN_SOURCE.contains("VertigoPreviewLastBuildError"),
             "embedded plugin should expose preview build failure state"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("function Runtime.isEditPreviewReady")
+                || PLUGIN_SOURCE.contains("local function isManagedMutationInstance"),
+            "embedded plugin should keep generic edit-preview readiness and managed-mutation guards"
+        );
+    }
+
+    #[test]
+    fn embedded_plugin_ignores_managed_edit_preview_churn() {
+        assert!(
+            PLUGIN_SOURCE.contains("local function isManagedMutationInstance"),
+            "embedded plugin should classify managed sync mutations separately from authored edits"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("descendant_added:%s")
+                && PLUGIN_SOURCE.contains("isManagedMutationInstance(descendant)"),
+            "embedded plugin should suppress managed descendant-added churn from edit-preview rebuild triggers"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("descendant_removed:%s")
+                && PLUGIN_SOURCE.contains("isManagedMutationInstance(descendant)"),
+            "embedded plugin should suppress managed descendant-removed churn from edit-preview rebuild triggers"
+        );
+    }
+
+    #[test]
+    fn embedded_plugin_contains_generic_project_readiness_contract() {
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoSyncProjectReadinessCode"),
+            "embedded plugin should expose a generic project readiness code"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoSyncProjectReadinessReady"),
+            "embedded plugin should expose whether the current project state is actually ready"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoSyncProjectReadinessMessage"),
+            "embedded plugin should expose a generic project readiness message"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoSyncWebSocketAvailable"),
+            "embedded plugin should expose websocket transport capability"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoSyncEditPreviewEnabled"),
+            "embedded plugin should expose whether edit preview is configured"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoSyncEditPreviewSuspended"),
+            "embedded plugin should expose a generic workspace-level preview suspension contract"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoSyncPreviewInvalidationEpoch"),
+            "embedded plugin should expose a generic preview invalidation epoch for geometry-affecting history transitions"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("\"project_bootstrap_pending\""),
+            "embedded plugin should expose a precise bootstrapping readiness code"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("\"sync_disabled\""),
+            "embedded plugin should expose a precise sync-disabled readiness code"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("Waiting for /project"),
+            "embedded plugin should surface a precise bootstrapping readiness message"
+        );
+    }
+
+    #[test]
+    fn plugin_source_module_contains_generic_project_readiness_contract() {
+        let source = std::fs::read_to_string("assets/plugin_src/00_main.lua")
+            .expect("plugin source module should be readable");
+        assert!(
+            source.contains("VertigoSyncProjectReadinessCode"),
+            "plugin source module should expose a generic project readiness code"
+        );
+        assert!(
+            source.contains("VertigoSyncProjectReadinessReady"),
+            "plugin source module should expose whether the project is actually ready"
+        );
+        assert!(
+            source.contains("VertigoSyncProjectReadinessMessage"),
+            "plugin source module should expose a generic project readiness message"
+        );
+        assert!(
+            source.contains("\"project_bootstrap_pending\""),
+            "plugin source module should expose a precise bootstrapping readiness code"
+        );
+        assert!(
+            source.contains("\"sync_disabled\""),
+            "plugin source module should expose a precise sync-disabled readiness code"
+        );
+        assert!(
+            source.contains("VertigoSyncEditPreviewSuspended"),
+            "plugin source module should expose a generic workspace-level preview suspension contract"
+        );
+        assert!(
+            source.contains("VertigoSyncPreviewInvalidationEpoch"),
+            "plugin source module should expose a generic preview invalidation epoch for geometry-affecting history transitions"
+        );
+    }
+
+    #[test]
+    fn plugin_source_module_ignores_managed_edit_preview_churn() {
+        let source = std::fs::read_to_string("assets/plugin_src/00_main.lua")
+            .expect("plugin source module should be readable");
+        assert!(
+            source.contains("function Runtime.isManagedMutationInstance"),
+            "plugin source module should classify managed sync mutations separately from authored edits"
+        );
+        assert!(
+            source.contains("descendant_added:%s")
+                && source.contains("Runtime.isManagedMutationInstance(descendant)"),
+            "plugin source module should suppress managed descendant-added churn from edit-preview rebuild triggers"
+        );
+        assert!(
+            source.contains("descendant_removed:%s")
+                && source.contains("Runtime.isManagedMutationInstance(descendant)"),
+            "plugin source module should suppress managed descendant-removed churn from edit-preview rebuild triggers"
+        );
+        assert!(
+            source.contains("local suspended = Runtime.isEditPreviewSuspended()")
+                && source.contains("or inSelfMutationGuard()"),
+            "plugin source module should suppress source and descendant preview churn while the generic suspension contract is active"
+        );
+        assert!(
+            source.contains("EDIT_PREVIEW_IGNORE_ATTR = \"VertigoSyncEditPreviewIgnore\"")
+                && source.contains("function Runtime.isEditPreviewIgnoredInstance"),
+            "plugin source module should expose a generic subtree ignore contract for edit-preview churn"
+        );
+        assert!(
+            source.contains("function Runtime.isEditPreviewGeometryAffectingInstance"),
+            "plugin source module should classify whether a watched authored edit is geometry-affecting before rebuilding preview"
+        );
+        assert!(
+            source.contains("ServerScriptService.ImportService.DayNightCycle")
+                && source.contains("ServerScriptService.ImportService.SceneAudit")
+                && source.contains("fullName == \"Lighting\"")
+                && source.contains("non_geometry_source"),
+            "plugin source module should suppress non-geometry ImportService source churn from preview rebuild triggers"
+        );
+        assert!(
+            source.contains(
+                "Workspace:GetAttributeChangedSignal(\"VertigoSyncEditPreviewSuspended\")"
+            ) && source.contains("Runtime.cancelPendingEditPreviewBuild(\"workspace_suspended\")"),
+            "plugin source module should cancel queued preview work when the generic suspension contract becomes active"
+        );
+    }
+
+    #[test]
+    fn embedded_plugin_filters_non_geometry_edit_preview_source_churn() {
+        assert!(
+            PLUGIN_SOURCE.contains("function Runtime.isEditPreviewGeometryAffectingInstance"),
+            "embedded plugin should classify whether watched source churn is geometry-affecting before rebuilding preview"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("ServerScriptService.ImportService.DayNightCycle")
+                && PLUGIN_SOURCE.contains("ServerScriptService.ImportService.SceneAudit")
+                && PLUGIN_SOURCE.contains("fullName == \"Lighting\"")
+                && PLUGIN_SOURCE.contains("non_geometry_source"),
+            "embedded plugin should suppress non-geometry ImportService source churn from preview rebuild triggers"
+        );
+    }
+
+    #[test]
+    fn plugin_source_module_skips_live_sync_for_oversized_script_entries() {
+        let source = std::fs::read_to_string("assets/plugin_src/00_main.lua")
+            .expect("plugin source module should be readable");
+        assert!(
+            source.contains("function Runtime.isLiveSyncWritableSourceEntry"),
+            "plugin source module should classify whether a source entry is live-writable before fetch/apply"
+        );
+        assert!(
+            source.contains("LIVE_SYNC_SKIPPED_OVERSIZE:"),
+            "plugin source module should emit a stable diagnostic when oversized script entries are skipped during live sync"
+        );
+        assert!(
+            source.contains(
+                "Runtime.stageWriteEntry(entry.path, entry.sha256, entry.bytes, entry.meta)"
+            ),
+            "plugin source module should carry snapshot entry byte counts into staged write decisions"
+        );
+        assert!(
+            source.contains("Runtime.stageWriteEntry(entry.path, entry.current_sha256, entry.current_bytes, entry.meta)"),
+            "plugin source module should carry diff entry byte counts into staged write decisions"
+        );
+    }
+
+    #[test]
+    fn plugin_source_module_aggregates_oversized_live_sync_skip_diagnostics() {
+        let source = std::fs::read_to_string("assets/plugin_src/00_main.lua")
+            .expect("plugin source module should be readable");
+        assert!(
+            source.contains("LIVE_SYNC_SKIPPED_OVERSIZE_SUMMARY:"),
+            "plugin source module should emit a bounded summary diagnostic for oversized live-sync skips"
+        );
+        assert!(
+            source.contains("snapshot_reconcile")
+                && source.contains("diff_added")
+                && source.contains("diff_modified"),
+            "plugin source module should aggregate oversized live-sync skips by reconcile/diff batch"
+        );
+        assert!(
+            source.contains("function Runtime.flushLiveSyncSkipAggregation"),
+            "plugin source module should flush aggregated live-sync skip diagnostics explicitly"
         );
     }
 
@@ -3814,6 +4141,70 @@ mod tests {
         assert!(
             !root.join("nested-src/Server/DataService.luau").exists(),
             "syncback should write under the selected project root"
+        );
+    }
+
+    #[test]
+    fn build_serializes_mapping_attributes_into_rbxlx_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let project_path = root.join("default.project.json");
+        let output_path = root.join("out/test.rbxlx");
+        fs::create_dir_all(root.join("src/Workspace")).expect("create workspace source dir");
+
+        fs::write(
+            &project_path,
+            serde_json::to_vec_pretty(&json!({
+                "name": "AttrBuild",
+                "servePort": 34872,
+                "tree": {
+                    "$className": "DataModel",
+                    "Workspace": {
+                        "$className": "Workspace",
+                        "$path": "src/Workspace",
+                        "$attributes": {
+                            "VertigoSyncServerUrl": "http://127.0.0.1:34872",
+                            "VertigoSyncEnabled": true
+                        }
+                    }
+                }
+            }))
+            .expect("serialize project"),
+        )
+        .expect("write project");
+
+        command_build(root, &output_path, Path::new("default.project.json"), false)
+            .expect("build project with attributes");
+
+        let output = fs::read_to_string(&output_path).expect("read built rbxlx");
+        let start = output
+            .find("<BinaryString name=\"AttributesSerialize\">")
+            .expect("rbxlx output should serialize attributes");
+        let start = start + "<BinaryString name=\"AttributesSerialize\">".len();
+        let end = output[start..]
+            .find("</BinaryString>")
+            .map(|offset| start + offset)
+            .expect("serialized attributes should terminate cleanly");
+        let encoded = &output[start..end];
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("decode serialized attributes");
+        let attributes = rbx_dom_weak::types::Attributes::from_reader(decoded.as_slice())
+            .expect("deserialize attributes payload");
+
+        assert!(
+            output.contains("AttributesSerialize"),
+            "rbxlx output should serialize Workspace attributes"
+        );
+        assert_eq!(
+            attributes.get("VertigoSyncServerUrl"),
+            Some(&Variant::BinaryString(BinaryString::from(
+                b"http://127.0.0.1:34872".to_vec(),
+            )))
+        );
+        assert_eq!(
+            attributes.get("VertigoSyncEnabled"),
+            Some(&Variant::Bool(true))
         );
     }
 }

@@ -333,10 +333,11 @@ pub async fn run_serve(options: ServeOptions) -> anyhow::Result<()> {
                 if let Ok(tree) = crate::project::parse_project(&poll_state.project_path) {
                     match crate::sourcemap::generate_sourcemap(&poll_state.root, &tree, true) {
                         Ok(sm) => {
-                            let json = serde_json::to_string_pretty(&sm)
-                                .unwrap_or_default();
+                            let json = serde_json::to_string_pretty(&sm).unwrap_or_default();
                             if let Err(e) = std::fs::write(&sourcemap_path, json.as_bytes()) {
-                                eprintln!("[vertigo-sync] warning: failed to write sourcemap.json: {e}");
+                                eprintln!(
+                                    "[vertigo-sync] warning: failed to write sourcemap.json: {e}"
+                                );
                             }
                         }
                         Err(e) => {
@@ -1589,8 +1590,14 @@ fn resolve_patch_target(source_root: &Path, raw_path: &str) -> anyhow::Result<Pa
 
     let target = source_root.join(candidate);
 
-    let canon_root = source_root.canonicalize().unwrap_or_else(|_| source_root.to_path_buf());
-    if let Some(canon_target) = target.parent().and_then(|p| p.canonicalize().ok()).or_else(|| target.canonicalize().ok()) {
+    let canon_root = source_root
+        .canonicalize()
+        .unwrap_or_else(|_| source_root.to_path_buf());
+    if let Some(canon_target) = target
+        .parent()
+        .and_then(|p| p.canonicalize().ok())
+        .or_else(|| target.canonicalize().ok())
+    {
         if !canon_target.starts_with(&canon_root) {
             anyhow::bail!("patch target escapes source root");
         }

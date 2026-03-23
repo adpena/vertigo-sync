@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -15,22 +15,14 @@ fn which_cmd(name: &str) -> Option<String> {
     #[cfg(not(target_os = "windows"))]
     let lookup = "which";
 
-    Command::new(lookup)
-        .arg(name)
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if !path.is_empty() {
-                    Some(path)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
+    Command::new(lookup).arg(name).output().ok().and_then(|o| {
+        if o.status.success() {
+            let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !path.is_empty() { Some(path) } else { None }
+        } else {
+            None
+        }
+    })
 }
 
 /// Resolve the shell and flag to use for script execution.
@@ -49,9 +41,7 @@ fn resolve_shell() -> Result<(&'static str, &'static str)> {
         } else if which_cmd("cmd").is_some() {
             Ok(("cmd", "/C"))
         } else {
-            bail!(
-                "no shell found: vsync requires pwsh, powershell, or cmd to be available on PATH"
-            )
+            bail!("no shell found: vsync requires pwsh, powershell, or cmd to be available on PATH")
         }
     }
 

@@ -358,3 +358,14 @@ workspace:SetAttribute("VertigoSyncBuildersEnabled", true)
 workspace:SetAttribute("VertigoSyncServerUrl", "http://127.0.0.1:7575")
 workspace:SetAttribute("VertigoSyncProjectId", "your-project-id")
 ```
+
+The plugin also emits generic readiness/capability attributes on `Workspace` for diagnostics:
+
+| Attribute | Type | Meaning |
+|-----------|------|---------|
+| `VertigoSyncProjectReadinessReady` | boolean | Whether the current place is ready for sync/edit preview. |
+| `VertigoSyncProjectReadinessCode` | string | Generic readiness code such as `ready`, `project_bootstrap_pending`, `project_blocked`, `edit_preview_misconfigured`, or `sync_disconnected`. |
+| `VertigoSyncProjectReadinessMessage` | string | Human-readable explanation of the current readiness state. |
+| `VertigoSyncWebSocketAvailable` | boolean | Whether Studio exposes `WebSocketService` in this session. |
+| `VertigoSyncBuildersEnabled` | boolean | Whether builder execution is enabled in the current plugin session. |
+| `VertigoSyncEditPreviewEnabled` | boolean | Whether the loaded project requested edit preview integration. |

@@ -335,6 +335,17 @@ To see only Vertigo Sync messages in Studio output, filter for the `[VertigoSync
 [VertigoSync] Snapshot reconciled (bootstrap). fingerprint=a3f8c2... entries=529
 ```
 
+If the plugin appears to load but the project does not sync or preview-build, inspect these `Workspace` attributes in Studio:
+
+- `VertigoSyncProjectReadinessCode`
+- `VertigoSyncProjectReadinessMessage`
+- `VertigoSyncProjectReadinessReady`
+- `VertigoSyncWebSocketAvailable`
+- `VertigoSyncBuildersEnabled`
+- `VertigoSyncEditPreviewEnabled`
+
+These are generic plugin diagnostics. They intentionally describe capability/readiness, not any project-specific behavior.
+
 ## Getting Help
 
 If none of the above resolves your issue:

@@ -68,7 +68,11 @@ pub struct PackageConfig {
     #[serde(default)]
     pub authors: Vec<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default, rename = "packages-dir")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "packages-dir"
+    )]
     pub packages_dir: Option<String>,
 }
 
@@ -91,33 +95,48 @@ pub enum DependencySpec {
     },
 
     /// Local filesystem path dependency.
-    Path {
-        path: String,
-    },
+    Path { path: String },
 
     /// Named dependency from a specific registry.
-    Registry {
-        registry: String,
-        name: String,
-    },
+    Registry { registry: String, name: String },
 }
 
 /// Formatter configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct FormatConfig {
-    #[serde(skip_serializing_if = "Option::is_none", default, rename = "indent-type")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "indent-type"
+    )]
     pub indent_type: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default, rename = "indent-width")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "indent-width"
+    )]
     pub indent_width: Option<u32>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default, rename = "line-width")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "line-width"
+    )]
     pub line_width: Option<u32>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default, rename = "quote-style")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "quote-style"
+    )]
     pub quote_style: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default, rename = "call-parentheses")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "call-parentheses"
+    )]
     pub call_parentheses: Option<String>,
 
     #[serde(
@@ -162,8 +181,7 @@ pub fn load_config(project_root: &Path) -> Result<Option<VsyncConfig>> {
 /// Serialize and write a `VsyncConfig` back to `vsync.toml` in the given project root.
 pub fn save_config(project_root: &Path, config: &VsyncConfig) -> Result<()> {
     let config_path = project_root.join("vsync.toml");
-    let content = toml::to_string_pretty(config)
-        .context("failed to serialize vsync.toml")?;
+    let content = toml::to_string_pretty(config).context("failed to serialize vsync.toml")?;
     std::fs::write(&config_path, content)
         .with_context(|| format!("failed to write {}", config_path.display()))?;
     Ok(())

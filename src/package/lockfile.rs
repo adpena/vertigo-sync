@@ -36,8 +36,7 @@ impl Lockfile {
 
     /// Parse a lockfile from its TOML string representation.
     pub fn parse(content: &str) -> Result<Self> {
-        let parsed: Lockfile =
-            toml::from_str(content).context("failed to parse vsync.lock")?;
+        let parsed: Lockfile = toml::from_str(content).context("failed to parse vsync.lock")?;
         if parsed.lockfile_version > 1 {
             bail!(
                 "vsync.lock has lockfile-version {}, which requires a newer version of vsync. \

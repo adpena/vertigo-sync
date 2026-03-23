@@ -132,7 +132,10 @@ impl RegistryClient {
 
     /// Create a client pointed at an arbitrary registry API URL.
     pub fn new(api_url: String) -> Result<Self> {
-        if !api_url.starts_with("https://") && !api_url.starts_with("http://127.0.0.1") && !api_url.starts_with("http://localhost") {
+        if !api_url.starts_with("https://")
+            && !api_url.starts_with("http://127.0.0.1")
+            && !api_url.starts_with("http://localhost")
+        {
             bail!("registry URL must use HTTPS to protect credentials: {api_url}");
         }
         Ok(Self {
@@ -148,15 +151,8 @@ impl RegistryClient {
     ///
     /// Uses the Wally `/v1/package-metadata/{scope}/{name}` endpoint and
     /// flattens the nested response into a `Vec<IndexEntry>`.
-    pub async fn fetch_versions(
-        &self,
-        scope: &str,
-        name: &str,
-    ) -> Result<Vec<IndexEntry>> {
-        let url = format!(
-            "{}/v1/package-metadata/{}/{}",
-            self.api_url, scope, name
-        );
+    pub async fn fetch_versions(&self, scope: &str, name: &str) -> Result<Vec<IndexEntry>> {
+        let url = format!("{}/v1/package-metadata/{}/{}", self.api_url, scope, name);
         let resp = self
             .client
             .get(&url)
@@ -165,12 +161,7 @@ impl RegistryClient {
             .with_context(|| format!("failed to fetch versions from {url}"))?;
 
         if !resp.status().is_success() {
-            bail!(
-                "registry returned {} for {}/{}",
-                resp.status(),
-                scope,
-                name
-            );
+            bail!("registry returned {} for {}/{}", resp.status(), scope, name);
         }
 
         let metadata: MetadataResponse = resp
@@ -222,10 +213,7 @@ impl RegistryClient {
             }
         }
 
-        let bytes = resp
-            .bytes()
-            .await
-            .context("failed to read package bytes")?;
+        let bytes = resp.bytes().await.context("failed to read package bytes")?;
 
         if bytes.len() as u64 > MAX_PACKAGE_BYTES {
             bail!("package response exceeded size limit");
@@ -271,7 +259,10 @@ mod tests {
         assert_eq!(entry.name, "roblox/roact");
         assert_eq!(entry.version, "17.0.1");
         assert_eq!(entry.realm, "shared");
-        assert_eq!(entry.description, Some("A declarative UI library".to_string()));
+        assert_eq!(
+            entry.description,
+            Some("A declarative UI library".to_string())
+        );
     }
 
     #[test]

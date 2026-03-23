@@ -27,9 +27,7 @@ pub fn build_package_zip(project_root: &Path) -> Result<Vec<u8>> {
     collect_publishable_files(project_root, project_root, &mut files)?;
 
     for file_path in &files {
-        let rel = file_path
-            .strip_prefix(project_root)
-            .unwrap_or(file_path);
+        let rel = file_path.strip_prefix(project_root).unwrap_or(file_path);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
 
         let content = std::fs::read(file_path)
@@ -103,13 +101,12 @@ pub fn validate_publish_metadata(config: &VsyncConfig) -> Result<()> {
     }
 
     // Validate version is valid semver
-    semver::Version::parse(&config.package.version)
-        .with_context(|| {
-            format!(
-                "package.version '{}' is not valid semver",
-                config.package.version
-            )
-        })?;
+    semver::Version::parse(&config.package.version).with_context(|| {
+        format!(
+            "package.version '{}' is not valid semver",
+            config.package.version
+        )
+    })?;
 
     // Validate name contains a scope separator
     if !config.package.name.contains('/') {
@@ -131,17 +128,17 @@ pub async fn publish_package(
     registry_url: &str,
 ) -> Result<String> {
     // Enforce HTTPS for registry tokens (localhost exempt for dev)
-    if !registry_url.starts_with("https://") && !registry_url.starts_with("http://127.0.0.1") && !registry_url.starts_with("http://localhost") {
+    if !registry_url.starts_with("https://")
+        && !registry_url.starts_with("http://127.0.0.1")
+        && !registry_url.starts_with("http://localhost")
+    {
         bail!("registry URL must use HTTPS to protect credentials: {registry_url}");
     }
 
     // Get auth token
-    let token = credentials::get_token(registry_url)?
-        .with_context(|| {
-            format!(
-                "not authenticated with {registry_url} — run `vsync login` first"
-            )
-        })?;
+    let token = credentials::get_token(registry_url)?.with_context(|| {
+        format!("not authenticated with {registry_url} — run `vsync login` first")
+    })?;
 
     // Build the package zip
     let zip_bytes = build_package_zip(project_root)?;
@@ -167,9 +164,7 @@ pub async fn publish_package(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!(
-            "registry returned {status} when publishing: {body}"
-        );
+        bail!("registry returned {status} when publishing: {body}");
     }
 
     let version = config.package.version.clone();

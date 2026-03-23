@@ -27,8 +27,7 @@ fn contains_word(haystack: &str, word: &str) -> bool {
         if let Some(pos) = haystack[start..].find(word) {
             let abs = start + pos;
             let before_ok = abs == 0 || !is_ident_byte(hay_bytes[abs - 1]);
-            let after_ok =
-                abs + wlen >= hay_bytes.len() || !is_ident_byte(hay_bytes[abs + wlen]);
+            let after_ok = abs + wlen >= hay_bytes.len() || !is_ident_byte(hay_bytes[abs + wlen]);
             if before_ok && after_ok {
                 return true;
             }
@@ -49,57 +48,44 @@ fn is_ident_byte(b: u8) -> bool {
 // Compiled regexes (initialized once)
 // ---------------------------------------------------------------------------
 
-static RE_LOCAL_ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=").unwrap()
-});
+static RE_LOCAL_ASSIGN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=").unwrap());
 
-static RE_COMPLEXITY_KEYWORD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:if|elseif|while|for|repeat)\b").unwrap()
-});
+static RE_COMPLEXITY_KEYWORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:if|elseif|while|for|repeat)\b").unwrap());
 
-static RE_LOGICAL_OPERATOR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:and|or)\b").unwrap()
-});
+static RE_LOGICAL_OPERATOR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:and|or)\b").unwrap());
 
 /// Matches `if (expr) then` or `elseif (expr) then` — the outer parens are unnecessary.
-static RE_PAREN_CONDITION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)\b(?:if|elseif|while)\s*\((.+)\)\s*(?:then|do)\b").unwrap()
-});
+static RE_PAREN_CONDITION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)\b(?:if|elseif|while)\s*\((.+)\)\s*(?:then|do)\b").unwrap());
 
 /// Matches Yoda conditions: a literal or nil/true/false on the left side of == or ~=.
-static RE_YODA_CONDITION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)\b(?:nil|true|false)\s*(?:==|~=)\s*\w").unwrap()
-});
+static RE_YODA_CONDITION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)\b(?:nil|true|false)\s*(?:==|~=)\s*\w").unwrap());
 
 // NOTE: RE_GLOBAL_SHADOW was identical to RE_LOCAL_ASSIGN; reuse the same static.
 
-static RE_WAIT_DEPRECATED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)(?:^|[^.\w])wait\s*\(").unwrap()
-});
+static RE_WAIT_DEPRECATED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)(?:^|[^.\w])wait\s*\(").unwrap());
 
-static RE_SPAWN_DEPRECATED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)(?:^|[^.\w])spawn\s*\(").unwrap()
-});
+static RE_SPAWN_DEPRECATED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)(?:^|[^.\w])spawn\s*\(").unwrap());
 
-static RE_DELAY_DEPRECATED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)(?:^|[^.\w])delay\s*\(").unwrap()
-});
+static RE_DELAY_DEPRECATED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)(?:^|[^.\w])delay\s*\(").unwrap());
 
-static RE_EMPTY_THEN_END: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)\bthen\s*\n\s*end\b").unwrap()
-});
+static RE_EMPTY_THEN_END: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)\bthen\s*\n\s*end\b").unwrap());
 
-static RE_EMPTY_DO_END: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)\bdo\s*\n\s*end\b").unwrap()
-});
+static RE_EMPTY_DO_END: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)\bdo\s*\n\s*end\b").unwrap());
 
-static RE_RETURN_BREAK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*(?:return\b|break\b|continue\b|error\s*\()").unwrap()
-});
+static RE_RETURN_BREAK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\s*(?:return\b|break\b|continue\b|error\s*\()").unwrap());
 
-static RE_COMMENT_LINE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*--").unwrap()
-});
+static RE_COMMENT_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*--").unwrap());
 
 // Roblox globals that should not be shadowed.
 const ROBLOX_GLOBALS: &[&str] = &[
@@ -365,9 +351,7 @@ fn check_deprecated_call(
         issues.push(LintIssue {
             rule: rule_name.into(),
             severity: LintSeverity::Warning,
-            message: format!(
-                "`{func_name}()` is deprecated; use `task.{func_name}()` instead"
-            ),
+            message: format!("`{func_name}()` is deprecated; use `task.{func_name}()` instead"),
             line,
             column: col,
             file: file.into(),
@@ -407,11 +391,7 @@ pub fn check_empty_block(source: &str, file: &str, comment_map: &[bool]) -> Vec<
 /// as unreachable if it has the **same or deeper** indentation as the terminal
 /// statement. Lines with less indentation are assumed to belong to an outer
 /// scope (e.g. code after `end` closing an `if` block).
-pub fn check_unreachable_code(
-    source: &str,
-    file: &str,
-    comment_map: &[bool],
-) -> Vec<LintIssue> {
+pub fn check_unreachable_code(source: &str, file: &str, comment_map: &[bool]) -> Vec<LintIssue> {
     let mut issues = Vec::new();
     let lines: Vec<&str> = source.lines().collect();
 
@@ -426,9 +406,7 @@ pub fn check_unreachable_code(
             i += 1;
             continue;
         }
-        if RE_RETURN_BREAK.is_match(line)
-            && !comment_map.get(i).copied().unwrap_or(false)
-        {
+        if RE_RETURN_BREAK.is_match(line) && !comment_map.get(i).copied().unwrap_or(false) {
             let terminal_indent = indent_level(line);
 
             // Look at the next non-empty, non-comment line.
@@ -462,7 +440,9 @@ pub fn check_unreachable_code(
                     issues.push(LintIssue {
                         rule: "unreachable-code".into(),
                         severity: LintSeverity::Warning,
-                        message: "code after unconditional return/break/continue/error() is unreachable".into(),
+                        message:
+                            "code after unconditional return/break/continue/error() is unreachable"
+                                .into(),
                         line: line_num,
                         column: col,
                         file: file.into(),
@@ -575,10 +555,7 @@ fn extract_function_spans(source: &str, comment_map: &[bool]) -> Vec<(String, us
             } else if let Some(rest) = trimmed.strip_prefix("function ") {
                 rest.split('(').next().unwrap_or("anonymous").trim()
             } else if let Some(eq_pos) = trimmed.find("= function") {
-                trimmed[..eq_pos]
-                    .trim()
-                    .trim_start_matches("local ")
-                    .trim()
+                trimmed[..eq_pos].trim().trim_start_matches("local ").trim()
             } else {
                 "anonymous"
             };
@@ -604,11 +581,7 @@ fn extract_function_spans(source: &str, comment_map: &[bool]) -> Vec<(String, us
 }
 
 /// **function-length** -- warn if a function body exceeds the configured line limit.
-pub fn check_function_length(
-    source: &str,
-    file: &str,
-    comment_map: &[bool],
-) -> Vec<LintIssue> {
+pub fn check_function_length(source: &str, file: &str, comment_map: &[bool]) -> Vec<LintIssue> {
     check_function_length_with_threshold(source, file, comment_map, DEFAULT_FUNCTION_LENGTH)
 }
 
@@ -645,11 +618,7 @@ pub fn check_function_length_with_threshold(
 }
 
 /// **nesting-depth** -- warn if nesting exceeds the configured depth limit.
-pub fn check_nesting_depth(
-    source: &str,
-    file: &str,
-    comment_map: &[bool],
-) -> Vec<LintIssue> {
+pub fn check_nesting_depth(source: &str, file: &str, comment_map: &[bool]) -> Vec<LintIssue> {
     check_nesting_depth_with_threshold(source, file, comment_map, DEFAULT_NESTING_DEPTH)
 }
 
@@ -755,11 +724,7 @@ pub fn check_parentheses_condition(
 }
 
 /// **comparison-order** -- Yoda conditions like `nil == x` instead of `x == nil`.
-pub fn check_comparison_order(
-    source: &str,
-    file: &str,
-    comment_map: &[bool],
-) -> Vec<LintIssue> {
+pub fn check_comparison_order(source: &str, file: &str, comment_map: &[bool]) -> Vec<LintIssue> {
     let mut issues = Vec::new();
 
     for m in RE_YODA_CONDITION.find_iter(source) {
@@ -772,9 +737,7 @@ pub fn check_comparison_order(
         issues.push(LintIssue {
             rule: "comparison-order".into(),
             severity: LintSeverity::Warning,
-            message: format!(
-                "Yoda condition `{matched}` — prefer the variable on the left side"
-            ),
+            message: format!("Yoda condition `{matched}` — prefer the variable on the left side"),
             line,
             column: col,
             file: file.into(),

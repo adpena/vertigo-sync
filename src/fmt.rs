@@ -123,8 +123,8 @@ pub fn collect_lua_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
 }
 
 fn collect_lua_files_inner(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
-    let read_dir = std::fs::read_dir(dir)
-        .with_context(|| format!("cannot read dir: {}", dir.display()))?;
+    let read_dir =
+        std::fs::read_dir(dir).with_context(|| format!("cannot read dir: {}", dir.display()))?;
 
     for entry in read_dir {
         let entry = entry?;

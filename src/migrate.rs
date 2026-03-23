@@ -121,8 +121,8 @@ pub fn parse_wally_toml(path: &Path) -> Result<VsyncConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
 
-    let manifest: WallyManifest = toml::from_str(&content)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let manifest: WallyManifest =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
 
     Ok(VsyncConfig {
         package: PackageConfig {
@@ -146,8 +146,8 @@ fn parse_stylua_to_format_config(path: &Path) -> Result<FormatConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
 
-    let manifest: StyluaManifest = toml::from_str(&content)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let manifest: StyluaManifest =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
 
     let indent_type = manifest.indent_type.map(|v| match v.as_str() {
         "Tabs" => "tabs".to_string(),
@@ -179,8 +179,8 @@ fn parse_selene_to_lint_config(path: &Path) -> Result<BTreeMap<String, String>> 
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
 
-    let manifest: SeleneManifest = toml::from_str(&content)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let manifest: SeleneManifest =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
 
     let mut lint = BTreeMap::new();
 
@@ -295,8 +295,7 @@ pub fn run_migrate(root: &Path) -> Result<MigrateReport> {
     }
 
     // 5. Write vsync.toml (atomic create to avoid TOCTOU race)
-    let content = toml::to_string_pretty(&config)
-        .context("failed to serialize vsync.toml")?;
+    let content = toml::to_string_pretty(&config).context("failed to serialize vsync.toml")?;
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -320,8 +319,9 @@ pub fn run_migrate(root: &Path) -> Result<MigrateReport> {
             });
         }
         Err(e) => {
-            return Err(anyhow::anyhow!(e)
-                .context(format!("failed to create {}", vsync_path.display())));
+            return Err(
+                anyhow::anyhow!(e).context(format!("failed to create {}", vsync_path.display()))
+            );
         }
     }
 

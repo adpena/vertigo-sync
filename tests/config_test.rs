@@ -113,7 +113,12 @@ my-lib = { git = "https://github.com/example/repo.git", rev = "abc123" }
 "#;
     let cfg: VsyncConfig = toml::from_str(git_toml).expect("git dep");
     match cfg.dependencies.get("my-lib").unwrap() {
-        DependencySpec::Git { git, rev, branch, tag } => {
+        DependencySpec::Git {
+            git,
+            rev,
+            branch,
+            tag,
+        } => {
             assert_eq!(git, "https://github.com/example/repo.git");
             assert_eq!(rev.as_deref(), Some("abc123"));
             assert!(branch.is_none());

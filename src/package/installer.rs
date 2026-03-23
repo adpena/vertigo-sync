@@ -6,11 +6,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::cache;
+use super::lockfile::{LockedPackage, Lockfile};
+use super::registry::{IndexEntry, RegistryClient, parse_version_req};
 use crate::config::{DependencySpec, VsyncConfig};
 use crate::output;
-use super::cache;
-use super::lockfile::{Lockfile, LockedPackage};
-use super::registry::{IndexEntry, RegistryClient, parse_version_req};
 
 /// Retry an async operation with exponential backoff.
 async fn retry_async<F, Fut, T>(max_retries: u32, label: &str, f: F) -> Result<T>
@@ -25,7 +25,10 @@ where
             Err(e) => {
                 if attempt < max_retries {
                     let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt));
-                    eprintln!("  \u{21bb} {label} failed (attempt {}), retrying in {delay:?}...", attempt + 1);
+                    eprintln!(
+                        "  \u{21bb} {label} failed (attempt {}), retrying in {delay:?}...",
+                        attempt + 1
+                    );
                     tokio::time::sleep(delay).await;
                 }
                 last_err = Some(e);
@@ -79,8 +82,7 @@ struct Downloaded {
 pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<InstallReport> {
     let start = Instant::now();
     let lock_path = project_root.join("vsync.lock");
-    let mut lockfile = Lockfile::load(&lock_path)?
-        .unwrap_or_else(Lockfile::new);
+    let mut lockfile = Lockfile::load(&lock_path)?.unwrap_or_else(Lockfile::new);
 
     // Collect all dependency maps with their realm tag.
     let dep_groups: Vec<(&str, &std::collections::BTreeMap<String, DependencySpec>)> = vec![
@@ -90,13 +92,8 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
     ];
 
     let registry = Arc::new(RegistryClient::default_wally()?);
-    let packages_dir = project_root.join(
-        config
-            .package
-            .packages_dir
-            .as_deref()
-            .unwrap_or("Packages"),
-    );
+    let packages_dir =
+        project_root.join(config.package.packages_dir.as_deref().unwrap_or("Packages"));
 
     // Validate packages-dir is inside the project root.
     std::fs::create_dir_all(&packages_dir)?;
@@ -155,7 +152,12 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                     }
                     // Path deps are not cached or locked — they're used directly.
                 }
-                DependencySpec::Git { git, rev, branch, tag } => {
+                DependencySpec::Git {
+                    git,
+                    rev,
+                    branch,
+                    tag,
+                } => {
                     let clone_dir = cache::git_clone_dir(git)?;
 
                     // Clone or fetch
@@ -172,7 +174,8 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                         }
 
                         cmd.arg(git.as_str()).arg(&clone_dir);
-                        let status = cmd.status()
+                        let status = cmd
+                            .status()
                             .with_context(|| format!("failed to run `git clone` for {git}"))?;
                         if !status.success() {
                             bail!("failed to clone {git}");
@@ -189,7 +192,9 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                             .args(&fetch_args)
                             .current_dir(&clone_dir)
                             .status()
-                            .with_context(|| format!("failed to run `git fetch` in {}", clone_dir.display()))?;
+                            .with_context(|| {
+                                format!("failed to run `git fetch` in {}", clone_dir.display())
+                            })?;
                         // --unshallow fails if repo is already unshallow; ignore that case
                         if !status.success() && rev.is_none() {
                             bail!("failed to fetch updates for {git}");
@@ -197,7 +202,8 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                     }
 
                     // Checkout specific ref
-                    let checkout_ref = rev.as_deref()
+                    let checkout_ref = rev
+                        .as_deref()
                         .or(tag.as_deref())
                         .or(branch.as_deref())
                         .unwrap_or("HEAD");
@@ -208,7 +214,12 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                         .args(["checkout", checkout_ref])
                         .current_dir(&clone_dir)
                         .status()
-                        .with_context(|| format!("failed to checkout {checkout_ref} in {}", clone_dir.display()))?;
+                        .with_context(|| {
+                            format!(
+                                "failed to checkout {checkout_ref} in {}",
+                                clone_dir.display()
+                            )
+                        })?;
                     if !status.success() {
                         bail!("failed to checkout {checkout_ref} for {git}");
                     }
@@ -218,14 +229,19 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                     if dest.exists() {
                         std::fs::remove_dir_all(&dest)?;
                     }
-                    copy_dir_recursive(&clone_dir, &dest)
-                        .with_context(|| format!("failed to copy git dep {git} to {}", dest.display()))?;
+                    copy_dir_recursive(&clone_dir, &dest).with_context(|| {
+                        format!("failed to copy git dep {git} to {}", dest.display())
+                    })?;
 
                     eprintln!("  \u{2193} {git} -> {}", dest.display());
                 }
-                DependencySpec::Registry { registry, name: dep_name } => {
-                    let registry_url = config.registries.get(registry)
-                        .with_context(|| format!("registry '{registry}' not defined in [registries] of vsync.toml"))?;
+                DependencySpec::Registry {
+                    registry,
+                    name: dep_name,
+                } => {
+                    let registry_url = config.registries.get(registry).with_context(|| {
+                        format!("registry '{registry}' not defined in [registries] of vsync.toml")
+                    })?;
                     let custom_client = RegistryClient::new(registry_url.clone())?;
 
                     // Parse name as scope/name@version
@@ -244,14 +260,19 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                     // Resolve and download using the custom registry client
                     let versions = retry_async(3, &format!("{scope}/{pkg_name}"), || {
                         custom_client.fetch_versions(&scope, &pkg_name)
-                    }).await?;
+                    })
+                    .await?;
                     let entry = select_version(&versions, &version_req)
-                        .with_context(|| format!("no version of {scope}/{pkg_name} satisfies {version_req}"))?
+                        .with_context(|| {
+                            format!("no version of {scope}/{pkg_name} satisfies {version_req}")
+                        })?
                         .clone();
                     let version = entry.version.clone();
-                    let bytes = retry_async(3, &format!("download {scope}/{pkg_name}@{version}"), || {
-                        custom_client.download_package(&scope, &pkg_name, &version)
-                    }).await?;
+                    let bytes =
+                        retry_async(3, &format!("download {scope}/{pkg_name}@{version}"), || {
+                            custom_client.download_package(&scope, &pkg_name, &version)
+                        })
+                        .await?;
                     let checksum = hex_sha256(&bytes);
 
                     let dest = packages_dir.join(&scope).join(&pkg_name);
@@ -268,10 +289,13 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                     let version_clone = version.clone();
                     tokio::task::spawn_blocking(move || -> Result<()> {
                         std::fs::write(&cache_path, &bytes)?;
-                        extract_zip(&bytes, &dest_clone)
-                            .with_context(|| format!("failed to extract {scope_clone}/{name_clone}@{version_clone}"))?;
+                        extract_zip(&bytes, &dest_clone).with_context(|| {
+                            format!("failed to extract {scope_clone}/{name_clone}@{version_clone}")
+                        })?;
                         Ok(())
-                    }).await.context("extract task panicked")??;
+                    })
+                    .await
+                    .context("extract task panicked")??;
 
                     lockfile.packages.retain(|p| p.name != full_name);
                     lockfile.packages.push(LockedPackage {
@@ -280,7 +304,11 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                         realm: realm.to_string(),
                         checksum,
                         source: format!("registry:{registry}"),
-                        dependencies: entry.dependencies.iter().map(|(k, v)| format!("{k}@{v}")).collect(),
+                        dependencies: entry
+                            .dependencies
+                            .iter()
+                            .map(|(k, v)| format!("{k}@{v}"))
+                            .collect(),
                     });
                     lockfile.save(&lock_path)?;
                 }
@@ -388,7 +416,10 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
             resolved_names.insert(pd.full_name.clone());
 
             // Gather transitive deps from both dependencies and server_dependencies.
-            let all_dep_specs = pd.entry.dependencies.values()
+            let all_dep_specs = pd
+                .entry
+                .dependencies
+                .values()
                 .chain(pd.entry.server_dependencies.values());
             for dep_spec in all_dep_specs {
                 if let Ok((scope, name, version_req)) = parse_version_req(dep_spec) {
@@ -434,9 +465,7 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
                     async move {
                         reg.download_package(&scope, &name, &version)
                             .await
-                            .with_context(|| {
-                                format!("failed to download {scope}/{name}@{version}")
-                            })
+                            .with_context(|| format!("failed to download {scope}/{name}@{version}"))
                     }
                 })
                 .await?;
@@ -493,18 +522,19 @@ pub async fn install(project_root: &Path, config: &VsyncConfig) -> Result<Instal
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             // Write to cache
-            std::fs::write(&cache_path, &bytes)
-                .with_context(|| {
-                    format!("failed to write cache file {}", cache_path_for_err.display())
-                })?;
+            std::fs::write(&cache_path, &bytes).with_context(|| {
+                format!(
+                    "failed to write cache file {}",
+                    cache_path_for_err.display()
+                )
+            })?;
             // Extract from same bytes — no extra clone
-            extract_zip(&bytes, &dest_clone)
-                .with_context(|| {
-                    format!(
-                        "failed to extract {scope}/{name}@{version} into {}",
-                        dest_clone.display()
-                    )
-                })?;
+            extract_zip(&bytes, &dest_clone).with_context(|| {
+                format!(
+                    "failed to extract {scope}/{name}@{version} into {}",
+                    dest_clone.display()
+                )
+            })?;
             Ok(())
         })
         .await
@@ -574,7 +604,11 @@ fn warn_peer_deps(config: &VsyncConfig) {
         eprintln!(
             "warning: {} peer dependenc{} declared but not yet resolved (coming in v2)",
             config.peer_dependencies.len(),
-            if config.peer_dependencies.len() == 1 { "y" } else { "ies" }
+            if config.peer_dependencies.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
         );
     }
 }
@@ -611,7 +645,12 @@ fn select_version<'a>(versions: &'a [IndexEntry], req_str: &str) -> Result<&'a I
 
 /// Validate that a git ref string contains only safe characters.
 fn validate_git_ref(s: &str) -> Result<()> {
-    if s.is_empty() || s.starts_with('-') || !s.chars().all(|c| c.is_ascii_alphanumeric() || ".-_/".contains(c)) {
+    if s.is_empty()
+        || s.starts_with('-')
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-_/".contains(c))
+    {
         bail!("invalid git ref: {s}");
     }
     Ok(())
@@ -639,14 +678,13 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
-            std::fs::copy(&src_path, &dst_path)
-                .with_context(|| {
-                    format!(
-                        "failed to copy {} to {}",
-                        src_path.display(),
-                        dst_path.display()
-                    )
-                })?;
+            std::fs::copy(&src_path, &dst_path).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
         }
     }
     Ok(())
@@ -698,9 +736,8 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
         let out_path = dest.join(enclosed_name);
 
         if file.is_dir() {
-            std::fs::create_dir_all(&out_path).with_context(|| {
-                format!("failed to create directory {}", out_path.display())
-            })?;
+            std::fs::create_dir_all(&out_path)
+                .with_context(|| format!("failed to create directory {}", out_path.display()))?;
         } else {
             if let Some(parent) = out_path.parent() {
                 if !parent.exists() {
@@ -709,16 +746,17 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
                     })?;
                 }
             }
-            let mut outfile = std::fs::File::create(&out_path).with_context(|| {
-                format!("failed to create file {}", out_path.display())
-            })?;
+            let mut outfile = std::fs::File::create(&out_path)
+                .with_context(|| format!("failed to create file {}", out_path.display()))?;
             let mut limited = (&mut file).take(MAX_FILE_BYTES);
-            let written = std::io::copy(&mut limited, &mut outfile).with_context(|| {
-                format!("failed to write file {}", out_path.display())
-            })?;
+            let written = std::io::copy(&mut limited, &mut outfile)
+                .with_context(|| format!("failed to write file {}", out_path.display()))?;
             total_written += written;
             if total_written > MAX_TOTAL_BYTES {
-                bail!("zip total uncompressed size exceeds {} byte limit", MAX_TOTAL_BYTES);
+                bail!(
+                    "zip total uncompressed size exceeds {} byte limit",
+                    MAX_TOTAL_BYTES
+                );
             }
         }
     }
