@@ -3871,6 +3871,13 @@ mod tests {
             "embedded plugin should publish snapshot and command busy facts for server-owned readiness evaluation"
         );
         assert!(
+            !body.contains("ready =")
+                && !body.contains("status_class =")
+                && !body.contains("code =")
+                && !body.contains("incarnation_id ="),
+            "embedded plugin must not publish server-owned readiness outputs from Runtime.reportPluginState()"
+        );
+        assert!(
             !body.contains("VertigoSyncProjectReadinessReady")
                 && !body.contains("VertigoSyncProjectReadinessCode")
                 && !body.contains("VertigoSyncProjectReadinessMessage")
@@ -3915,6 +3922,13 @@ mod tests {
                 && body.contains("snapshot_apply_in_progress =")
                 && body.contains("plugin_command_busy ="),
             "plugin source module should publish snapshot and command busy facts for server-owned readiness evaluation"
+        );
+        assert!(
+            !body.contains("ready =")
+                && !body.contains("status_class =")
+                && !body.contains("code =")
+                && !body.contains("incarnation_id ="),
+            "plugin source module must not publish server-owned readiness outputs from Runtime.reportPluginState()"
         );
         assert!(
             !body.contains("VertigoSyncProjectReadinessReady")
