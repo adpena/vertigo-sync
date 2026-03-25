@@ -322,7 +322,6 @@ pub struct ReadinessRecord {
     pub incarnation_id: String,
     pub status_class: ReadinessStatusClass,
     pub code: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
@@ -369,6 +368,7 @@ pub enum ReadinessRejection {
 pub struct ReadinessState {
     incarnation_seq: u64,
     incarnation_id: String,
+    full_bake_start_success_incarnation_id: Option<String>,
     records: BTreeMap<ReadinessTarget, ReadinessRecord>,
 }
 
@@ -388,6 +388,7 @@ impl ReadinessState {
         Self {
             incarnation_seq: 1,
             incarnation_id,
+            full_bake_start_success_incarnation_id: None,
             records,
         }
     }
@@ -401,18 +402,6 @@ impl ReadinessState {
             "plugin_unavailable",
             Some("plugin_unavailable".to_string()),
         )
-    }
-
-    fn ready_record(target: ReadinessTarget, incarnation_id: &str, epoch: u64) -> ReadinessRecord {
-        ReadinessRecord {
-            target,
-            ready: true,
-            epoch,
-            incarnation_id: incarnation_id.to_string(),
-            status_class: ReadinessStatusClass::Ready,
-            code: "ready".to_string(),
-            reason: None,
-        }
     }
 
     fn non_ready_record(
@@ -487,6 +476,13 @@ impl ReadinessState {
     }
 
     fn demote_dependents(&mut self, prerequisite: ReadinessTarget, reason: Option<String>) {
+        if matches!(
+            prerequisite,
+            ReadinessTarget::EditSync | ReadinessTarget::FullBakeStart
+        ) {
+            self.full_bake_start_success_incarnation_id = None;
+        }
+
         let dependent_targets: &[ReadinessTarget] = match prerequisite {
             ReadinessTarget::EditSync => &[
                 ReadinessTarget::Preview,
@@ -538,6 +534,7 @@ impl ReadinessState {
     pub fn rotate_incarnation(&mut self, reason: impl Into<String>) -> String {
         self.incarnation_seq = self.incarnation_seq.saturating_add(1);
         self.incarnation_id = format!("inc-{}", self.incarnation_seq);
+        self.full_bake_start_success_incarnation_id = None;
         let reason = reason.into();
         for target in ReadinessTarget::ALL {
             let epoch = self.read_record(target).epoch;
@@ -569,33 +566,39 @@ impl ReadinessState {
                 target,
                 ReadinessTarget::Preview | ReadinessTarget::FullBakeStart
             ) {
-                let incarnation_id = self.incarnation_id.clone();
-                let edit_sync_epoch = {
-                    let edit_sync = self.read_record_mut(ReadinessTarget::EditSync);
-                    if edit_sync.ready {
-                        None
-                    } else {
-                        Some(edit_sync.epoch)
-                    }
-                };
-                if let Some(epoch) = edit_sync_epoch {
-                    *self.read_record_mut(ReadinessTarget::EditSync) =
-                        Self::ready_record(ReadinessTarget::EditSync, &incarnation_id, epoch);
+                let edit_sync = self.read_record(ReadinessTarget::EditSync);
+                if !edit_sync.ready || edit_sync.incarnation_id != self.incarnation_id {
+                    return Err(ReadinessRejection::DependencyViolation {
+                        target,
+                        prerequisite: ReadinessTarget::EditSync,
+                        message:
+                            "preview and full_bake_start require ready edit_sync for the same incarnation"
+                                .to_string(),
+                    });
                 }
             }
 
+            if target == ReadinessTarget::FullBakeStart {
+                self.full_bake_start_success_incarnation_id = Some(self.incarnation_id.clone());
+            }
+
             if target == ReadinessTarget::FullBakeResult {
-                let start = self.read_record(ReadinessTarget::FullBakeStart);
-                if !start.ready || start.incarnation_id != self.incarnation_id {
+                if self.full_bake_start_success_incarnation_id.as_deref()
+                    != Some(self.incarnation_id.as_str())
+                {
                     return Err(ReadinessRejection::DependencyViolation {
                         target: ReadinessTarget::FullBakeResult,
                         prerequisite: ReadinessTarget::FullBakeStart,
-                        message: "full_bake_result requires a ready full_bake_start for the same incarnation"
-                            .to_string(),
+                        message:
+                            "full_bake_result requires a successful full_bake_start for the same incarnation"
+                                .to_string(),
                     });
                 }
             }
         } else {
+            if target == ReadinessTarget::FullBakeStart {
+                self.full_bake_start_success_incarnation_id = None;
+            }
             self.demote_dependents(target, record.reason.clone());
         }
 
@@ -641,6 +644,14 @@ impl ReadinessState {
         }
 
         Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn override_full_bake_start_success_marker_for_testing(
+        &mut self,
+        incarnation_id: Option<String>,
+    ) {
+        self.full_bake_start_success_incarnation_id = incarnation_id;
     }
 }
 
