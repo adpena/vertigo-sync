@@ -3840,45 +3840,46 @@ mod tests {
 
     #[test]
     fn embedded_plugin_contains_generic_project_readiness_contract() {
+        let start = PLUGIN_SOURCE
+            .find("function Runtime.reportPluginState()")
+            .expect("plugin state reporter should exist");
+        let end = PLUGIN_SOURCE[start..]
+            .find("function Runtime.reportPluginManaged()")
+            .map(|offset| start + offset)
+            .expect("plugin managed reporter should follow state reporter");
+        let body = &PLUGIN_SOURCE[start..end];
+
         assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncProjectReadinessCode"),
-            "embedded plugin should expose a generic project readiness code"
+            body.contains("connection = {"),
+            "embedded plugin should publish a connection fact envelope"
         );
         assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncProjectReadinessReady"),
-            "embedded plugin should expose whether the current project state is actually ready"
+            body.contains("sync_status = currentStatus")
+                && body.contains("transport_mode = transportMode")
+                && body.contains("ws_connected = wsConnected")
+                && body.contains("has_ever_connected = hasEverConnected"),
+            "embedded plugin should publish connection-local facts, not a derived readiness verdict"
         );
         assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncProjectReadinessMessage"),
-            "embedded plugin should expose a generic project readiness message"
+            body.contains("project_loaded = PROJECT.loaded"),
+            "embedded plugin should publish whether the project is loaded"
         );
         assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncWebSocketAvailable"),
-            "embedded plugin should expose websocket transport capability"
+            body.contains("snapshot_state = {")
+                && body.contains("snapshot_apply_in_progress =")
+                && body.contains("plugin_command_busy ="),
+            "embedded plugin should publish snapshot and command busy facts for server-owned readiness evaluation"
         );
         assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncEditPreviewEnabled"),
-            "embedded plugin should expose whether edit preview is configured"
-        );
-        assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncEditPreviewSuspended"),
-            "embedded plugin should expose a generic workspace-level preview suspension contract"
-        );
-        assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncPreviewInvalidationEpoch"),
-            "embedded plugin should expose a generic preview invalidation epoch for geometry-affecting history transitions"
-        );
-        assert!(
-            PLUGIN_SOURCE.contains("\"project_bootstrap_pending\""),
-            "embedded plugin should expose a precise bootstrapping readiness code"
-        );
-        assert!(
-            PLUGIN_SOURCE.contains("\"sync_disabled\""),
-            "embedded plugin should expose a precise sync-disabled readiness code"
-        );
-        assert!(
-            PLUGIN_SOURCE.contains("Waiting for /project"),
-            "embedded plugin should surface a precise bootstrapping readiness message"
+            !body.contains("VertigoSyncProjectReadinessReady")
+                && !body.contains("VertigoSyncProjectReadinessCode")
+                && !body.contains("VertigoSyncProjectReadinessMessage")
+                && !body.contains("project_mode = PROJECT.mode")
+                && !body.contains("project_message = PROJECT.message")
+                && !body.contains("project_blocked = PROJECT.blocked")
+                && !body.contains("builders_enabled = BUILDERS.enabled")
+                && !body.contains("time_travel_active = HISTORY.active"),
+            "embedded plugin must not shadow server-owned readiness outputs or publish project-owned readiness heuristics"
         );
     }
 
@@ -3886,33 +3887,45 @@ mod tests {
     fn plugin_source_module_contains_generic_project_readiness_contract() {
         let source = std::fs::read_to_string("assets/plugin_src/00_main.lua")
             .expect("plugin source module should be readable");
+        let start = source
+            .find("function Runtime.reportPluginState()")
+            .expect("plugin state reporter should exist");
+        let end = source[start..]
+            .find("function Runtime.reportPluginManaged()")
+            .map(|offset| start + offset)
+            .expect("plugin managed reporter should follow state reporter");
+        let body = &source[start..end];
         assert!(
-            source.contains("VertigoSyncProjectReadinessCode"),
-            "plugin source module should expose a generic project readiness code"
+            body.contains("connection = {"),
+            "plugin source module should publish a connection fact envelope"
         );
         assert!(
-            source.contains("VertigoSyncProjectReadinessReady"),
-            "plugin source module should expose whether the project is actually ready"
+            body.contains("sync_status = currentStatus")
+                && body.contains("transport_mode = transportMode")
+                && body.contains("ws_connected = wsConnected")
+                && body.contains("has_ever_connected = hasEverConnected"),
+            "plugin source module should publish connection-local facts, not a derived readiness verdict"
         );
         assert!(
-            source.contains("VertigoSyncProjectReadinessMessage"),
-            "plugin source module should expose a generic project readiness message"
+            body.contains("project_loaded = PROJECT.loaded"),
+            "plugin source module should publish whether the project is loaded"
         );
         assert!(
-            source.contains("\"project_bootstrap_pending\""),
-            "plugin source module should expose a precise bootstrapping readiness code"
+            body.contains("snapshot_state = {")
+                && body.contains("snapshot_apply_in_progress =")
+                && body.contains("plugin_command_busy ="),
+            "plugin source module should publish snapshot and command busy facts for server-owned readiness evaluation"
         );
         assert!(
-            source.contains("\"sync_disabled\""),
-            "plugin source module should expose a precise sync-disabled readiness code"
-        );
-        assert!(
-            source.contains("VertigoSyncEditPreviewSuspended"),
-            "plugin source module should expose a generic workspace-level preview suspension contract"
-        );
-        assert!(
-            source.contains("VertigoSyncPreviewInvalidationEpoch"),
-            "plugin source module should expose a generic preview invalidation epoch for geometry-affecting history transitions"
+            !body.contains("VertigoSyncProjectReadinessReady")
+                && !body.contains("VertigoSyncProjectReadinessCode")
+                && !body.contains("VertigoSyncProjectReadinessMessage")
+                && !body.contains("project_mode = PROJECT.mode")
+                && !body.contains("project_message = PROJECT.message")
+                && !body.contains("project_blocked = PROJECT.blocked")
+                && !body.contains("builders_enabled = BUILDERS.enabled")
+                && !body.contains("time_travel_active = HISTORY.active"),
+            "plugin source module must not shadow server-owned readiness outputs or publish project-owned readiness heuristics"
         );
     }
 

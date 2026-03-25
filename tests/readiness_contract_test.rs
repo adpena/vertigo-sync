@@ -364,6 +364,51 @@ fn readiness_contract_test_profiling_checkpoint_records_hot_path_timings() {
     black_box(sink);
 }
 
+#[test]
+fn readiness_contract_test_plugin_state_fact_payload_profile_records_size_and_cost() {
+    let payload = json!({
+        "plugin_version": "2026-03-16-v9-trillion-dollar",
+        "connection": {
+            "sync_status": "connected",
+            "transport_mode": "ws",
+            "ws_connected": true,
+            "has_ever_connected": true,
+            "reconnect_attempt": 2,
+        },
+        "project_loaded": true,
+        "snapshot_state": {
+            "hash": "test-fingerprint",
+            "history_loaded": true,
+            "history_active": false,
+            "history_busy": false,
+            "fetch_failed": false,
+            "fetch_in_flight": 0,
+            "fetch_queue_depth": 0,
+            "pending_queue_depth": 0,
+            "resync_requested": false,
+        },
+        "snapshot_apply_in_progress": false,
+        "plugin_command_busy": false,
+    });
+
+    let iterations = 25_000u64;
+    let payload_bytes = serde_json::to_vec(&payload).expect("serialize plugin state payload");
+    let start = Instant::now();
+    let mut sink = 0usize;
+    for _ in 0..iterations {
+        let encoded = serde_json::to_vec(&payload).expect("serialize plugin state payload");
+        sink ^= encoded.len();
+        black_box(&encoded);
+    }
+    let encode_ns_per_op = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+    eprintln!(
+        "plugin state profiling checkpoint: payload_bytes={} publish_cadence_s=3 managed_cadence_s=30 encode_ns_per_op={encode_ns_per_op:.2} hot_path_outside_rust=HttpService::JSONEncode in assets/plugin_src/00_main.lua",
+        payload_bytes.len()
+    );
+    black_box(sink);
+}
+
 mod readiness_contract_test {
     pub mod query_and_events {
         use super::super::*;
