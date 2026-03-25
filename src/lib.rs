@@ -332,6 +332,23 @@ pub struct ReadinessExpectation {
     pub incarnation_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandReadinessExpectation {
+    pub expected_target: ReadinessTarget,
+    pub expected_epoch: u64,
+    pub expected_incarnation_id: String,
+}
+
+impl CommandReadinessExpectation {
+    pub fn to_readiness_expectation(&self) -> ReadinessExpectation {
+        ReadinessExpectation {
+            target: self.expected_target,
+            epoch: self.expected_epoch,
+            incarnation_id: self.expected_incarnation_id.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ReadinessEvent {
     sequence: u64,
@@ -926,6 +943,8 @@ pub struct PluginCommand {
     pub command: String,
     #[serde(default)]
     pub params: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<CommandReadinessExpectation>,
     /// Epoch seconds when the command was created (serialization-friendly).
     pub created_at_epoch: f64,
     /// Monotonic instant for GC — not serialized.
@@ -1912,6 +1931,58 @@ impl ServerState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         queue.drain(..).collect()
+    }
+
+    fn record_plugin_command_rejection(
+        &self,
+        command_id: &str,
+        rejection: ReadinessRejection,
+    ) {
+        let mut acks = self
+            .plugin_command_acks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        acks.insert(
+            command_id.to_string(),
+            PluginCommandAck {
+                command_id: command_id.to_string(),
+                success: false,
+                message: format!("readiness precondition rejected: {rejection:?}"),
+            },
+        );
+    }
+
+    /// Drain pending plugin commands, dropping readiness-stale commands before
+    /// they reach the Studio plugin and recording a rejection ack for them.
+    pub fn drain_ready_plugin_commands(&self) -> Vec<PluginCommand> {
+        self.gc_plugin_commands();
+        let drained = {
+            let mut queue = self
+                .plugin_commands
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            queue.drain(..).collect::<Vec<_>>()
+        };
+
+        let mut accepted = Vec::with_capacity(drained.len());
+        for command in drained {
+            if let Some(readiness) = &command.readiness {
+                let expectation = readiness.to_readiness_expectation();
+                match self.validate_readiness_expectation(
+                    readiness.expected_target,
+                    &expectation,
+                ) {
+                    Ok(()) => accepted.push(command),
+                    Err(rejection) => {
+                        self.record_plugin_command_rejection(&command.id, rejection);
+                    }
+                }
+            } else {
+                accepted.push(command);
+            }
+        }
+
+        accepted
     }
 
     pub fn current_readiness(&self, target: ReadinessTarget) -> ReadinessRecord {

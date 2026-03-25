@@ -812,14 +812,315 @@ mod readiness_contract_test {
                 }
                 let fanout_ns_total = fanout_start.elapsed().as_nanos() as f64;
 
-                eprintln!(
-                    "readiness profiling checkpoint: query_ns_per_op={query_ns_per_op:.2} sse_fanout_ns_total={fanout_ns_total:.2} serialization_ns_per_op={serialization_ns_per_op:.2} hot_path_outside_rust=none"
-                );
+            eprintln!(
+                "readiness profiling checkpoint: query_ns_per_op={query_ns_per_op:.2} sse_fanout_ns_total={fanout_ns_total:.2} serialization_ns_per_op={serialization_ns_per_op:.2} hot_path_outside_rust=none"
+            );
 
                 black_box(query_sink);
                 black_box(serialization_sink);
                 server.abort();
             });
+        }
+    }
+
+    pub mod action_preconditions {
+        use super::super::*;
+        use std::sync::Arc;
+
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::Json;
+        use reqwest::Client;
+        use serde_json::Value;
+        use tempfile::tempdir;
+        use tokio::net::TcpListener;
+        use vertigo_sync::mcp::McpExecuteRequest;
+        use vertigo_sync::server::build_router;
+        use vertigo_sync::{
+            ReadinessExpectation, ReadinessStatusClass, ReadinessTarget, ServerState,
+            ServerStateOptions, Snapshot,
+        };
+
+        fn empty_snapshot() -> Snapshot {
+            Snapshot {
+                version: 1,
+                include: Vec::new(),
+                fingerprint: "test-fingerprint".to_string(),
+                entries: Vec::new(),
+            }
+        }
+
+        fn test_server_state() -> (tempfile::TempDir, Arc<ServerState>) {
+            let root = tempdir().expect("tempdir");
+            let state = ServerState::with_full_config(
+                root.path().to_path_buf(),
+                Vec::new(),
+                empty_snapshot(),
+                ServerStateOptions {
+                    channel_capacity: 64,
+                    turbo: false,
+                    coalesce_ms: 50,
+                    binary_models: false,
+                    glob_ignores: vertigo_sync::GlobIgnoreSet::empty(),
+                    project_path: Some(root.path().join("default.project.json")),
+                },
+            );
+
+            (root, state)
+        }
+
+        async fn spawn_server(state: Arc<ServerState>) -> (String, tokio::task::JoinHandle<()>) {
+            let app = build_router(state);
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let addr = listener.local_addr().expect("listener addr");
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            (format!("http://{}:{}", addr.ip(), addr.port()), server)
+        }
+
+        fn ready_record_for(state: &ServerState, target: ReadinessTarget) -> ReadinessRecord {
+            let mut record = state.current_readiness(target);
+            record.ready = true;
+            record.status_class = ReadinessStatusClass::Ready;
+            record.code = "ready".to_string();
+            record.reason = None;
+            record
+        }
+
+        async fn post_status(client: &Client, url: &str, body: &Value) -> StatusCode {
+            client
+                .post(url)
+                .json(body)
+                .send()
+                .await
+                .expect("request")
+                .status()
+        }
+
+        async fn post_json(client: &Client, url: &str, body: &Value) -> Value {
+            client
+                .post(url)
+                .json(body)
+                .send()
+                .await
+                .expect("request")
+                .error_for_status()
+                .expect("successful response")
+                .json::<Value>()
+                .await
+                .expect("json body")
+        }
+
+        #[tokio::test]
+        async fn readiness_contract_test_target_sensitive_commands_reject_when_current_record_is_not_ready()
+         {
+            let (_root, state) = test_server_state();
+            let (base_url, server) = spawn_server(state.clone()).await;
+            let client = Client::new();
+            let current = state.current_readiness(ReadinessTarget::Preview);
+
+            let status = post_status(
+                &client,
+                &format!("{base_url}/mcp/execute"),
+                &serde_json::json!({
+                    "tool": "sync_plugin_command",
+                    "arguments": {
+                        "command": "run_builders",
+                        "params": {},
+                        "wait": false,
+                        "readiness": {
+                            "expected_target": current.target,
+                            "expected_epoch": current.epoch,
+                            "expected_incarnation_id": current.incarnation_id,
+                        }
+                    }
+                }),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn readiness_contract_test_stale_queued_plugin_commands_are_rejected_after_incarnation_rollover()
+         {
+            let (_root, state) = test_server_state();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::EditSync))
+                .unwrap();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::Preview))
+                .unwrap();
+
+            let (base_url, server) = spawn_server(state.clone()).await;
+            let client = Client::new();
+            let current = state.current_readiness(ReadinessTarget::Preview);
+
+            let queued = post_json(
+                &client,
+                &format!("{base_url}/mcp/execute"),
+                &serde_json::json!({
+                    "tool": "sync_plugin_command",
+                    "arguments": {
+                        "command": "run_builders",
+                        "params": {},
+                        "wait": false,
+                        "readiness": {
+                            "expected_target": current.target,
+                            "expected_epoch": current.epoch,
+                            "expected_incarnation_id": current.incarnation_id,
+                        }
+                    }
+                }),
+            )
+            .await;
+
+            assert_eq!(queued["queued"], true);
+
+            state.rotate_readiness_incarnation("studio_restart");
+
+            let status = post_status(
+                &client,
+                &format!("{base_url}/plugin/state"),
+                &serde_json::json!({
+                    "plugin_version": "test",
+                    "connection": {
+                        "sync_status": "connected"
+                    }
+                }),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn readiness_contract_test_non_readiness_sensitive_commands_remain_available_without_expectations()
+         {
+            let (_root, state) = test_server_state();
+            let (base_url, server) = spawn_server(state).await;
+            let client = Client::new();
+
+            let payload = post_json(
+                &client,
+                &format!("{base_url}/mcp/execute"),
+                &serde_json::json!({
+                    "tool": "vsync_health",
+                    "arguments": {}
+                }),
+            )
+            .await;
+
+            assert_eq!(payload["status"], "ok");
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn readiness_contract_test_profiling_checkpoint_records_validation_and_command_path_costs()
+         {
+            let (_root, state) = test_server_state();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::EditSync))
+                .unwrap();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::Preview))
+                .unwrap();
+
+            let current = state.current_readiness(ReadinessTarget::Preview);
+            let ready_expectation = ReadinessExpectation {
+                target: ReadinessTarget::Preview,
+                epoch: current.epoch,
+                incarnation_id: current.incarnation_id.clone(),
+            };
+
+            let iterations = 10_000u64;
+
+            let validation_start = Instant::now();
+            let mut validation_sink = 0u64;
+            for _ in 0..iterations {
+                state
+                    .validate_readiness_expectation(ReadinessTarget::Preview, &ready_expectation)
+                    .expect("ready expectation");
+                validation_sink ^= ready_expectation.epoch;
+                black_box(validation_sink);
+            }
+            let validation_ns_per_op = validation_start.elapsed().as_nanos() as f64 / iterations as f64;
+
+            state.rotate_readiness_incarnation("studio_restart");
+            let stale_current = state.current_readiness(ReadinessTarget::Preview);
+            let stale_expectation = ReadinessExpectation {
+                target: ReadinessTarget::Preview,
+                epoch: stale_current.epoch,
+                incarnation_id: current.incarnation_id.clone(),
+            };
+
+            let stale_start = Instant::now();
+            let mut stale_sink = 0u64;
+            for _ in 0..iterations {
+                let rejection = state
+                    .validate_readiness_expectation(ReadinessTarget::Preview, &stale_expectation)
+                    .expect_err("stale incarnation must be rejected");
+                stale_sink ^= match rejection {
+                    ReadinessRejection::IncarnationMismatch { .. } => 1,
+                    ReadinessRejection::EpochMismatch { .. } => 2,
+                    ReadinessRejection::NotReady { .. } => 3,
+                    ReadinessRejection::TargetMismatch { .. }
+                    | ReadinessRejection::DependencyViolation { .. }
+                    | ReadinessRejection::InvalidRecord { .. } => 4,
+                };
+                black_box(stale_sink);
+            }
+            let stale_ns_per_op = stale_start.elapsed().as_nanos() as f64 / iterations as f64;
+
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::EditSync))
+                .unwrap();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::Preview))
+                .unwrap();
+
+            let command_start = Instant::now();
+            let mut command_sink = 0usize;
+            for _ in 0..1_000u64 {
+                let response = vertigo_sync::mcp::handle_mcp_execute(
+                    State(state.clone()),
+                    Json(McpExecuteRequest {
+                        tool: "sync_plugin_command".to_string(),
+                        arguments: serde_json::json!({
+                            "command": "run_builders",
+                            "params": {},
+                            "wait": false,
+                            "readiness": {
+                                "expected_target": "preview",
+                                "expected_epoch": state.current_readiness(ReadinessTarget::Preview).epoch,
+                                "expected_incarnation_id": state.current_readiness(ReadinessTarget::Preview).incarnation_id,
+                            }
+                        }),
+                    }),
+                )
+                .await;
+                command_sink ^= response
+                    .as_ref()
+                    .ok()
+                    .map(|value| value.0.to_string().len())
+                    .unwrap_or_default();
+                state.drain_plugin_commands();
+            }
+            let command_ns_per_op = command_start.elapsed().as_nanos() as f64 / 1_000f64;
+
+            eprintln!(
+                "readiness action profiling checkpoint: validation_ns_per_op={validation_ns_per_op:.2} stale_rejection_ns_per_op={stale_ns_per_op:.2} normal_command_ns_per_op={command_ns_per_op:.2} hot_path_outside_rust=none"
+            );
+
+            black_box(validation_sink);
+            black_box(stale_sink);
+            black_box(command_sink);
         }
     }
 }

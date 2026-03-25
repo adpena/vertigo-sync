@@ -439,7 +439,7 @@ async fn handle_post_plugin_state(
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
 
-    let commands = state.drain_plugin_commands();
+    let commands = state.drain_ready_plugin_commands();
     if commands.is_empty() {
         (
             StatusCode::NO_CONTENT,
