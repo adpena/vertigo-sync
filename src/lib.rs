@@ -561,6 +561,15 @@ impl ReadinessState {
             });
         }
 
+        let current_epoch = self.read_record(target).epoch;
+        if record.epoch != current_epoch {
+            return Err(ReadinessRejection::EpochMismatch {
+                target,
+                expected: record.epoch,
+                actual: current_epoch,
+            });
+        }
+
         if record.ready {
             if matches!(
                 target,
@@ -642,8 +651,28 @@ impl ReadinessState {
         Ok(())
     }
 
-    pub fn record_successful_full_bake_start_for_current_incarnation(&mut self) {
+    pub fn record_successful_full_bake_start_for_current_incarnation(
+        &mut self,
+    ) -> Result<(), ReadinessRejection> {
+        let edit_sync = self.read_record(ReadinessTarget::EditSync);
+        let full_bake_start = self.read_record(ReadinessTarget::FullBakeStart);
+
+        if !edit_sync.ready
+            || !full_bake_start.ready
+            || edit_sync.incarnation_id != self.incarnation_id
+            || full_bake_start.incarnation_id != self.incarnation_id
+        {
+            return Err(ReadinessRejection::DependencyViolation {
+                target: ReadinessTarget::FullBakeStart,
+                prerequisite: ReadinessTarget::EditSync,
+                message:
+                    "full_bake_start success can only be recorded when edit_sync and full_bake_start are ready for the current incarnation"
+                        .to_string(),
+            });
+        }
+
         self.full_bake_start_success_incarnation_id = Some(self.incarnation_id.clone());
+        Ok(())
     }
 }
 

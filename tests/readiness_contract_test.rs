@@ -16,6 +16,16 @@ fn ready_record(state: &ReadinessState, target: ReadinessTarget) -> ReadinessRec
     record
 }
 
+fn ready_record_with_epoch(
+    state: &ReadinessState,
+    target: ReadinessTarget,
+    epoch: u64,
+) -> ReadinessRecord {
+    let mut record = ready_record(state, target);
+    record.epoch = epoch;
+    record
+}
+
 #[test]
 fn readiness_contract_test_default_preview_readiness_uses_the_public_contract_shape() {
     let state = ReadinessState::new();
@@ -130,7 +140,9 @@ fn readiness_contract_test_full_bake_result_succeeds_only_after_explicit_success
         .update_readiness(ready_record(&state, ReadinessTarget::FullBakeStart))
         .unwrap();
 
-    state.record_successful_full_bake_start_for_current_incarnation();
+    state
+        .record_successful_full_bake_start_for_current_incarnation()
+        .unwrap();
 
     assert!(
         state
@@ -142,6 +154,45 @@ fn readiness_contract_test_full_bake_result_succeeds_only_after_explicit_success
             .current_readiness(ReadinessTarget::FullBakeResult)
             .ready
     );
+}
+
+#[test]
+fn readiness_contract_test_full_bake_success_marker_rejects_fresh_state_bypass() {
+    let mut state = ReadinessState::new();
+
+    assert!(matches!(
+        state.record_successful_full_bake_start_for_current_incarnation(),
+        Err(ReadinessRejection::DependencyViolation {
+            target: ReadinessTarget::FullBakeStart,
+            prerequisite: ReadinessTarget::EditSync,
+            ..
+        })
+    ));
+    assert!(matches!(
+        state.update_readiness(ready_record(&state, ReadinessTarget::FullBakeResult)),
+        Err(ReadinessRejection::DependencyViolation {
+            target: ReadinessTarget::FullBakeResult,
+            prerequisite: ReadinessTarget::FullBakeStart,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn readiness_contract_test_update_readiness_rejects_epoch_rewrites() {
+    let mut state = ReadinessState::new();
+    let result =
+        state.update_readiness(ready_record_with_epoch(&state, ReadinessTarget::Preview, 7));
+
+    assert!(matches!(
+        result,
+        Err(ReadinessRejection::EpochMismatch {
+            target: ReadinessTarget::Preview,
+            expected: 7,
+            actual: 0,
+        })
+    ));
+    assert_eq!(state.current_readiness(ReadinessTarget::Preview).epoch, 0);
 }
 
 #[test]
@@ -186,7 +237,9 @@ fn readiness_contract_test_dependent_targets_do_not_remain_ready_after_edit_sync
     state
         .update_readiness(ready_record(&state, ReadinessTarget::FullBakeStart))
         .unwrap();
-    state.record_successful_full_bake_start_for_current_incarnation();
+    state
+        .record_successful_full_bake_start_for_current_incarnation()
+        .unwrap();
     state
         .update_readiness(ready_record(&state, ReadinessTarget::FullBakeResult))
         .unwrap();
