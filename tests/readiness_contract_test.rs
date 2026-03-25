@@ -102,7 +102,6 @@ fn readiness_contract_test_full_bake_result_requires_success_marker_not_only_cur
     state
         .update_readiness(ready_record(&state, ReadinessTarget::FullBakeStart))
         .unwrap();
-    state.override_full_bake_start_success_marker_for_testing(None);
 
     let result = state.update_readiness(ready_record(&state, ReadinessTarget::FullBakeResult));
 
@@ -116,6 +115,30 @@ fn readiness_contract_test_full_bake_result_requires_success_marker_not_only_cur
     ));
     assert!(
         !state
+            .current_readiness(ReadinessTarget::FullBakeResult)
+            .ready
+    );
+}
+
+#[test]
+fn readiness_contract_test_full_bake_result_succeeds_only_after_explicit_success_marker() {
+    let mut state = ReadinessState::new();
+    state
+        .update_readiness(ready_record(&state, ReadinessTarget::EditSync))
+        .unwrap();
+    state
+        .update_readiness(ready_record(&state, ReadinessTarget::FullBakeStart))
+        .unwrap();
+
+    state.record_successful_full_bake_start_for_current_incarnation();
+
+    assert!(
+        state
+            .update_readiness(ready_record(&state, ReadinessTarget::FullBakeResult))
+            .is_ok()
+    );
+    assert!(
+        state
             .current_readiness(ReadinessTarget::FullBakeResult)
             .ready
     );
@@ -163,6 +186,7 @@ fn readiness_contract_test_dependent_targets_do_not_remain_ready_after_edit_sync
     state
         .update_readiness(ready_record(&state, ReadinessTarget::FullBakeStart))
         .unwrap();
+    state.record_successful_full_bake_start_for_current_incarnation();
     state
         .update_readiness(ready_record(&state, ReadinessTarget::FullBakeResult))
         .unwrap();

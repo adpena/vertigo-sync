@@ -578,10 +578,6 @@ impl ReadinessState {
                 }
             }
 
-            if target == ReadinessTarget::FullBakeStart {
-                self.full_bake_start_success_incarnation_id = Some(self.incarnation_id.clone());
-            }
-
             if target == ReadinessTarget::FullBakeResult {
                 if self.full_bake_start_success_incarnation_id.as_deref()
                     != Some(self.incarnation_id.as_str())
@@ -646,12 +642,8 @@ impl ReadinessState {
         Ok(())
     }
 
-    #[doc(hidden)]
-    pub fn override_full_bake_start_success_marker_for_testing(
-        &mut self,
-        incarnation_id: Option<String>,
-    ) {
-        self.full_bake_start_success_incarnation_id = incarnation_id;
+    pub fn record_successful_full_bake_start_for_current_incarnation(&mut self) {
+        self.full_bake_start_success_incarnation_id = Some(self.incarnation_id.clone());
     }
 }
 
