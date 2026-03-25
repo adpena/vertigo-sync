@@ -5,6 +5,8 @@
 //!   GET  /snapshot           — current snapshot JSON (or exact historical snapshot via ?at=...)
 //!   GET  /diff?since=<hash>  — diff from historical hash to current
 //!   GET  /events             — SSE stream of SyncDiffEvent
+//!   GET  /readiness?target=...        — authoritative readiness record
+//!   GET  /readiness/events?target=... — SSE stream of readiness records
 //!   GET  /sources/content    — batched source fetch for high-rate hotload
 //!   POST /sync/patch         — apply file patches, return ack
 //!   GET  /validate            — run source validation, return report
@@ -38,8 +40,8 @@ use sha2::{Digest, Sha256};
 use crate::mcp::{handle_mcp_execute, handle_mcp_tools};
 use crate::serve_rbxl::{new_shared_rbxl_state, rbxl_router};
 use crate::{
-    EventCoalescer, GlobIgnoreSet, ServerState, ServerStateOptions, Snapshot, SnapshotDiff,
-    build_snapshot, build_snapshot_with_ignores,
+    EventCoalescer, GlobIgnoreSet, ReadinessRecord, ReadinessTarget, ServerState,
+    ServerStateOptions, Snapshot, SnapshotDiff, build_snapshot, build_snapshot_with_ignores,
 };
 use std::sync::atomic::Ordering;
 
@@ -235,6 +237,8 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/snapshot", get(handle_snapshot))
         .route("/diff", get(handle_diff))
         .route("/events", get(handle_events))
+        .route("/readiness", get(handle_readiness))
+        .route("/readiness/events", get(handle_readiness_events))
         .route("/ws", get(handle_ws))
         .route("/sources", get(handle_sources))
         .route("/sources/content", get(handle_sources_content))
@@ -586,6 +590,43 @@ async fn handle_events(
         }
         Err(_) => None,
     });
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReadinessQuery {
+    target: ReadinessTarget,
+}
+
+fn readiness_event(record: ReadinessRecord) -> Event {
+    let data = serde_json::to_string(&record).unwrap_or_else(|_| "{}".to_string());
+    Event::default().event("readiness").data(data)
+}
+
+async fn handle_readiness(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<ReadinessQuery>,
+) -> Json<ReadinessRecord> {
+    Json(state.current_readiness(query.target))
+}
+
+async fn handle_readiness_events(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<ReadinessQuery>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let initial = tokio_stream::iter([Ok(readiness_event(state.current_readiness(query.target)))]);
+    let target = query.target;
+    let updates =
+        BroadcastStream::new(state.readiness_events()).filter_map(move |result| match result {
+            Ok(record) if record.target == target => Some(Ok(readiness_event(record))),
+            _ => None,
+        });
+    let stream = initial.chain(updates);
 
     Sse::new(stream).keep_alive(
         KeepAlive::new()

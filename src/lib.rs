@@ -1722,6 +1722,8 @@ pub struct ServerState {
     pub binary_models: bool,
     /// Authoritative readiness records for edit_sync, preview, and full-bake targets.
     pub readiness: Mutex<ReadinessState>,
+    /// Broadcast readiness updates for SSE consumers.
+    readiness_events_tx: tokio::sync::broadcast::Sender<ReadinessRecord>,
     /// Cached model manifests, keyed by content SHA-256.
     pub model_cache: Mutex<ModelManifestCache>,
     /// Server boot timestamp (set once at construction, never changes).
@@ -1797,6 +1799,8 @@ impl ServerState {
         let capacity = options.channel_capacity.clamp(32, 16_384);
         let (tx, _rx) = tokio::sync::broadcast::channel::<SyncDiffEvent>(capacity);
         let metrics = Arc::new(Metrics::new());
+        let (readiness_events_tx, _readiness_events_rx) =
+            tokio::sync::broadcast::channel::<ReadinessRecord>(capacity);
         metrics
             .entries
             .store(initial.entries.len() as u64, Ordering::Relaxed);
@@ -1834,6 +1838,7 @@ impl ServerState {
             coalesce_ms: options.coalesce_ms,
             binary_models: options.binary_models,
             readiness: Mutex::new(ReadinessState::new()),
+            readiness_events_tx,
             model_cache: Mutex::new(ModelManifestCache::new()),
             boot_time: Instant::now(),
             plugin_state: Mutex::new(None),
@@ -1895,10 +1900,15 @@ impl ServerState {
     }
 
     pub fn update_readiness(&self, record: ReadinessRecord) -> Result<(), ReadinessRejection> {
-        self.readiness
+        let result = self
+            .readiness
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .update_readiness(record)
+            .update_readiness(record);
+        if result.is_ok() {
+            self.broadcast_readiness_snapshot();
+        }
+        result
     }
 
     pub fn advance_readiness_epoch_if_invalidated(
@@ -1906,17 +1916,25 @@ impl ServerState {
         target: ReadinessTarget,
         invalidated: bool,
     ) -> ReadinessRecord {
-        self.readiness
+        let record = self
+            .readiness
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .advance_epoch_if_invalidated(target, invalidated)
+            .advance_epoch_if_invalidated(target, invalidated);
+        if invalidated {
+            self.broadcast_readiness_snapshot();
+        }
+        record
     }
 
     pub fn rotate_readiness_incarnation(&self, reason: impl Into<String>) -> String {
-        self.readiness
+        let incarnation_id = self
+            .readiness
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .rotate_incarnation(reason)
+            .rotate_incarnation(reason);
+        self.broadcast_readiness_snapshot();
+        incarnation_id
     }
 
     pub fn validate_readiness_expectation(
@@ -1928,6 +1946,17 @@ impl ServerState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .validate_expectation(expected_target, expectation)
+    }
+
+    pub fn readiness_events(&self) -> tokio::sync::broadcast::Receiver<ReadinessRecord> {
+        self.readiness_events_tx.subscribe()
+    }
+
+    fn broadcast_readiness_snapshot(&self) {
+        for target in ReadinessTarget::ALL {
+            let record = self.current_readiness(target);
+            let _ = self.readiness_events_tx.send(record);
+        }
     }
 
     /// Return up to `limit` cached history rows in chronological order

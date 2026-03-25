@@ -363,3 +363,331 @@ fn readiness_contract_test_profiling_checkpoint_records_hot_path_timings() {
     );
     black_box(sink);
 }
+
+mod readiness_contract_test {
+    pub mod query_and_events {
+        use super::super::*;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use axum::http::StatusCode;
+        use reqwest::Client;
+        use serde_json::Value;
+        use tempfile::tempdir;
+        use tokio::net::TcpListener;
+        use tokio::time::timeout;
+        use vertigo_sync::server::build_router;
+        use vertigo_sync::{ServerState, ServerStateOptions, Snapshot};
+
+        fn empty_snapshot() -> Snapshot {
+            Snapshot {
+                version: 1,
+                include: Vec::new(),
+                fingerprint: "test-fingerprint".to_string(),
+                entries: Vec::new(),
+            }
+        }
+
+        fn test_server_state() -> (tempfile::TempDir, Arc<ServerState>) {
+            let root = tempdir().expect("tempdir");
+            let state = ServerState::with_full_config(
+                root.path().to_path_buf(),
+                Vec::new(),
+                empty_snapshot(),
+                ServerStateOptions {
+                    channel_capacity: 64,
+                    turbo: false,
+                    coalesce_ms: 50,
+                    binary_models: false,
+                    glob_ignores: vertigo_sync::GlobIgnoreSet::empty(),
+                    project_path: Some(root.path().join("default.project.json")),
+                },
+            );
+
+            (root, state)
+        }
+
+        async fn spawn_server(state: Arc<ServerState>) -> (String, tokio::task::JoinHandle<()>) {
+            let app = build_router(state);
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let addr = listener.local_addr().expect("listener addr");
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            (format!("http://{}:{}", addr.ip(), addr.port()), server)
+        }
+
+        fn ready_record_for(state: &ServerState, target: ReadinessTarget) -> ReadinessRecord {
+            let mut record = state.current_readiness(target);
+            record.ready = true;
+            record.status_class = ReadinessStatusClass::Ready;
+            record.code = "ready".to_string();
+            record.reason = None;
+            record
+        }
+
+        async fn get_json(client: &Client, url: &str) -> Value {
+            client
+                .get(url)
+                .send()
+                .await
+                .expect("request")
+                .error_for_status()
+                .expect("successful response")
+                .json::<Value>()
+                .await
+                .expect("json body")
+        }
+
+        async fn get_status(client: &Client, url: &str) -> StatusCode {
+            client.get(url).send().await.expect("request").status()
+        }
+
+        fn take_next_sse_payload(buffer: &mut String) -> Option<String> {
+            let normalized = buffer.replace("\r\n", "\n");
+            let end = normalized.find("\n\n")?;
+            let block = normalized[..end].to_string();
+            let remainder = normalized[end + 2..].to_string();
+            *buffer = remainder;
+
+            let payload = block
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if payload.is_empty() {
+                None
+            } else {
+                Some(payload)
+            }
+        }
+
+        async fn read_next_sse_record(
+            response: &mut reqwest::Response,
+            buffer: &mut String,
+        ) -> Value {
+            loop {
+                if let Some(payload) = take_next_sse_payload(buffer) {
+                    return serde_json::from_str(&payload).expect("readiness event json");
+                }
+
+                let chunk = timeout(Duration::from_secs(5), response.chunk())
+                    .await
+                    .expect("timed out waiting for SSE chunk")
+                    .expect("response chunk");
+                let chunk = chunk.expect("SSE stream ended before readiness event");
+                buffer.push_str(std::str::from_utf8(&chunk).expect("utf8 readiness event"));
+            }
+        }
+
+        async fn open_readiness_stream(
+            client: &Client,
+            base_url: &str,
+            target: ReadinessTarget,
+        ) -> reqwest::Response {
+            let target = serde_json::to_value(target)
+                .expect("target json")
+                .as_str()
+                .expect("target string")
+                .to_string();
+            client
+                .get(format!("{base_url}/readiness/events?target={target}"))
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .send()
+                .await
+                .expect("readiness events response")
+                .error_for_status()
+                .expect("successful readiness events response")
+        }
+
+        #[tokio::test]
+        async fn readiness_contract_test_query_returns_authoritative_payload_and_rejects_invalid_targets()
+         {
+            let (_root, state) = test_server_state();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::EditSync))
+                .unwrap();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::Preview))
+                .unwrap();
+
+            let (base_url, server) = spawn_server(state.clone()).await;
+            let client = Client::new();
+
+            let payload = get_json(&client, &format!("{base_url}/readiness?target=preview")).await;
+
+            assert_eq!(
+                payload,
+                serde_json::to_value(state.current_readiness(ReadinessTarget::Preview)).unwrap()
+            );
+
+            assert_eq!(
+                get_status(&client, &format!("{base_url}/readiness?target=bogus")).await,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                get_status(
+                    &client,
+                    &format!("{base_url}/readiness/events?target=bogus")
+                )
+                .await,
+                StatusCode::BAD_REQUEST
+            );
+
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn readiness_contract_test_event_stream_matches_query_shape_and_rejects_stale_epoch()
+        {
+            let (_root, state) = test_server_state();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::EditSync))
+                .unwrap();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::Preview))
+                .unwrap();
+
+            let (base_url, server) = spawn_server(state.clone()).await;
+            let client = Client::new();
+
+            let query_payload =
+                get_json(&client, &format!("{base_url}/readiness?target=preview")).await;
+            let mut response =
+                open_readiness_stream(&client, &base_url, ReadinessTarget::Preview).await;
+            let mut buffer = String::new();
+            let first_event = read_next_sse_record(&mut response, &mut buffer).await;
+
+            assert_eq!(first_event, query_payload);
+
+            let stale_expectation = ReadinessExpectation {
+                target: ReadinessTarget::Preview,
+                epoch: first_event["epoch"].as_u64().expect("epoch"),
+                incarnation_id: first_event["incarnation_id"]
+                    .as_str()
+                    .expect("incarnation")
+                    .to_string(),
+            };
+
+            state.advance_readiness_epoch_if_invalidated(ReadinessTarget::Preview, true);
+
+            let second_event = read_next_sse_record(&mut response, &mut buffer).await;
+            assert_eq!(
+                second_event,
+                get_json(&client, &format!("{base_url}/readiness?target=preview")).await
+            );
+            assert!(matches!(
+                state.validate_readiness_expectation(ReadinessTarget::Preview, &stale_expectation),
+                Err(ReadinessRejection::EpochMismatch { .. })
+            ));
+
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn readiness_contract_test_event_stream_rejects_stale_incarnation() {
+            let (_root, state) = test_server_state();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::EditSync))
+                .unwrap();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::Preview))
+                .unwrap();
+
+            let (base_url, server) = spawn_server(state.clone()).await;
+            let client = Client::new();
+
+            let mut response =
+                open_readiness_stream(&client, &base_url, ReadinessTarget::Preview).await;
+            let mut buffer = String::new();
+            let first_event = read_next_sse_record(&mut response, &mut buffer).await;
+            let stale_expectation = ReadinessExpectation {
+                target: ReadinessTarget::Preview,
+                epoch: first_event["epoch"].as_u64().expect("epoch"),
+                incarnation_id: first_event["incarnation_id"]
+                    .as_str()
+                    .expect("incarnation")
+                    .to_string(),
+            };
+
+            state.rotate_readiness_incarnation("studio_restart");
+
+            let second_event = read_next_sse_record(&mut response, &mut buffer).await;
+            assert_eq!(
+                second_event,
+                get_json(&client, &format!("{base_url}/readiness?target=preview")).await
+            );
+            assert!(matches!(
+                state.validate_readiness_expectation(ReadinessTarget::Preview, &stale_expectation),
+                Err(ReadinessRejection::IncarnationMismatch { .. })
+            ));
+
+            server.abort();
+        }
+
+        #[test]
+        fn readiness_contract_test_profiling_checkpoint_records_query_and_sse_costs() {
+            let runtime = tokio::runtime::Runtime::new().expect("runtime");
+            runtime.block_on(async {
+                let (_root, state) = test_server_state();
+                state
+                    .update_readiness(ready_record_for(&state, ReadinessTarget::EditSync))
+                    .unwrap();
+                state
+                    .update_readiness(ready_record_for(&state, ReadinessTarget::Preview))
+                    .unwrap();
+
+                let (base_url, server) = spawn_server(state.clone()).await;
+                let client = Client::new();
+                let target_url = format!("{base_url}/readiness?target=preview");
+                let iterations = 250u64;
+
+                let query_start = Instant::now();
+                let mut query_sink = 0u64;
+                for _ in 0..iterations {
+                    let payload = get_json(&client, &target_url).await;
+                    query_sink ^= payload["epoch"].as_u64().unwrap_or_default();
+                }
+                let query_ns_per_op = query_start.elapsed().as_nanos() as f64 / iterations as f64;
+
+                let serialization_record = state.current_readiness(ReadinessTarget::Preview);
+                let serialization_start = Instant::now();
+                let mut serialization_sink = 0usize;
+                for _ in 0..25_000u64 {
+                    let json = serde_json::to_string(&serialization_record).expect("serialize");
+                    serialization_sink ^= json.len();
+                    black_box(&json);
+                }
+                let serialization_ns_per_op =
+                    serialization_start.elapsed().as_nanos() as f64 / 25_000f64;
+
+                let mut streams = Vec::new();
+                for _ in 0..4 {
+                    streams.push(open_readiness_stream(&client, &base_url, ReadinessTarget::Preview).await);
+                }
+                let fanout_start = Instant::now();
+                state
+                    .advance_readiness_epoch_if_invalidated(ReadinessTarget::Preview, true)
+                    ;
+                for response in &mut streams {
+                    let mut buffer = String::new();
+                    let payload = read_next_sse_record(response, &mut buffer).await;
+                    query_sink ^= payload["epoch"].as_u64().unwrap_or_default();
+                }
+                let fanout_ns_total = fanout_start.elapsed().as_nanos() as f64;
+
+                eprintln!(
+                    "readiness profiling checkpoint: query_ns_per_op={query_ns_per_op:.2} sse_fanout_ns_total={fanout_ns_total:.2} serialization_ns_per_op={serialization_ns_per_op:.2} hot_path_outside_rust=none"
+                );
+
+                black_box(query_sink);
+                black_box(serialization_sink);
+                server.abort();
+            });
+        }
+    }
+}
