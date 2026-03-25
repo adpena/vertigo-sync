@@ -33,6 +33,7 @@ use base64::Engine;
 use serde::Deserialize;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use sha2::{Digest, Sha256};
@@ -639,10 +640,27 @@ where
 {
     let rx = state.readiness_events();
     before_initial_snapshot();
-    let initial = tokio_stream::iter([state.current_readiness(target)]);
-    let updates = BroadcastStream::new(rx).filter_map(move |result| match result {
-        Ok(record) if record.target == target => Some(record),
-        _ => None,
+    let (baseline_sequence, initial_record) = state.current_readiness_snapshot(target);
+    let initial = tokio_stream::iter([initial_record]);
+    let mut last_sequence = baseline_sequence;
+    let updates = BroadcastStream::new(rx).filter_map(move |result| {
+        let state = state.clone();
+        match result {
+            Ok(event) if event.record.target == target => {
+                if event.sequence <= last_sequence {
+                    None
+                } else {
+                    last_sequence = event.sequence;
+                    Some(event.record)
+                }
+            }
+            Err(BroadcastStreamRecvError::Lagged(_)) => {
+                let (sequence, record) = state.current_readiness_snapshot(target);
+                last_sequence = sequence;
+                Some(record)
+            }
+            _ => None,
+        }
     });
     initial.chain(updates)
 }
@@ -1667,7 +1685,9 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::Path;
+    use std::time::Duration;
     use tempfile::tempdir;
+    use tokio::time::timeout;
     use tokio_stream::StreamExt;
 
     fn write_project(path: &Path, name: &str, source_root: &str) {
@@ -1840,14 +1860,27 @@ mod tests {
                 hook_state
                     .update_readiness(record)
                     .expect("publish preview");
+
+                let mut record = hook_state.current_readiness(ReadinessTarget::Preview);
+                record.ready = false;
+                record.status_class = ReadinessStatusClass::Blocked;
+                record.code = "preview_not_ready".to_string();
+                record.reason = Some("preview_not_ready".to_string());
+                hook_state
+                    .update_readiness(record)
+                    .expect("publish stale preview state");
             });
 
         let first_record = stream.next().await.expect("first readiness record");
         assert_eq!(first_record.target, ReadinessTarget::Preview);
-        assert!(first_record.ready);
-        assert_eq!(first_record.status_class, ReadinessStatusClass::Ready);
-        assert_eq!(first_record.code, "ready");
-        assert_eq!(first_record.reason, None);
+        assert!(!first_record.ready);
+        assert_eq!(first_record.status_class, ReadinessStatusClass::Blocked);
+        assert_eq!(first_record.code, "preview_not_ready");
+        assert_eq!(first_record.reason, Some("preview_not_ready".to_string()));
+
+        timeout(Duration::from_millis(100), stream.next())
+            .await
+            .expect_err("stale queued readiness records must not follow a newer initial snapshot");
     }
 
     #[test]

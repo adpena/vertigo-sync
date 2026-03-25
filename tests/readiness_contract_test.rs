@@ -672,6 +672,50 @@ mod readiness_contract_test {
             server.abort();
         }
 
+        #[tokio::test]
+        async fn readiness_contract_test_event_stream_resyncs_after_lag() {
+            let (_root, state) = test_server_state();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::EditSync))
+                .unwrap();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::Preview))
+                .unwrap();
+
+            let (base_url, server) = spawn_server(state.clone()).await;
+            let client = Client::new();
+
+            let mut response =
+                open_readiness_stream(&client, &base_url, ReadinessTarget::Preview).await;
+            let mut buffer = String::new();
+            let _initial = read_next_sse_record(&mut response, &mut buffer).await;
+
+            for i in 0..128 {
+                if i % 2 == 0 {
+                    let mut record = state.current_readiness(ReadinessTarget::Preview);
+                    record.ready = false;
+                    record.status_class = ReadinessStatusClass::Blocked;
+                    record.code = "preview_not_ready".to_string();
+                    record.reason = Some("preview_not_ready".to_string());
+                    state.update_readiness(record).unwrap();
+                } else {
+                    state
+                        .update_readiness(ready_record_for(&state, ReadinessTarget::Preview))
+                        .unwrap();
+                }
+            }
+
+            let expected = get_json(&client, &format!("{base_url}/readiness?target=preview")).await;
+            let resynced = read_next_sse_record(&mut response, &mut buffer).await;
+
+            assert_eq!(
+                resynced, expected,
+                "lagged readiness consumers must resync to the authoritative snapshot instead of replaying stale events"
+            );
+
+            server.abort();
+        }
+
         #[test]
         fn readiness_contract_test_profiling_checkpoint_records_query_and_sse_costs() {
             let runtime = tokio::runtime::Runtime::new().expect("runtime");

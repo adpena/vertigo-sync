@@ -332,6 +332,12 @@ pub struct ReadinessExpectation {
     pub incarnation_id: String,
 }
 
+#[derive(Debug, Clone)]
+struct ReadinessEvent {
+    sequence: u64,
+    record: ReadinessRecord,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadinessRejection {
     TargetMismatch {
@@ -369,6 +375,7 @@ pub struct ReadinessState {
     incarnation_seq: u64,
     incarnation_id: String,
     full_bake_start_success_incarnation_id: Option<String>,
+    event_seq: u64,
     records: BTreeMap<ReadinessTarget, ReadinessRecord>,
 }
 
@@ -389,6 +396,7 @@ impl ReadinessState {
             incarnation_seq: 1,
             incarnation_id,
             full_bake_start_success_incarnation_id: None,
+            event_seq: 0,
             records,
         }
     }
@@ -503,6 +511,20 @@ impl ReadinessState {
 
     pub fn current_readiness(&self, target: ReadinessTarget) -> ReadinessRecord {
         self.read_record(target).clone()
+    }
+
+    pub fn current_readiness_snapshot(&self, target: ReadinessTarget) -> (u64, ReadinessRecord) {
+        (self.event_seq, self.current_readiness(target))
+    }
+
+    pub fn next_readiness_snapshot(&mut self) -> (u64, Vec<ReadinessRecord>) {
+        self.event_seq = self.event_seq.saturating_add(1);
+        let sequence = self.event_seq;
+        let records = ReadinessTarget::ALL
+            .into_iter()
+            .map(|target| self.current_readiness(target))
+            .collect();
+        (sequence, records)
     }
 
     pub fn advance_epoch_if_invalidated(
@@ -1723,7 +1745,7 @@ pub struct ServerState {
     /// Authoritative readiness records for edit_sync, preview, and full-bake targets.
     pub readiness: Mutex<ReadinessState>,
     /// Broadcast readiness updates for SSE consumers.
-    readiness_events_tx: tokio::sync::broadcast::Sender<ReadinessRecord>,
+    readiness_events_tx: tokio::sync::broadcast::Sender<ReadinessEvent>,
     /// Cached model manifests, keyed by content SHA-256.
     pub model_cache: Mutex<ModelManifestCache>,
     /// Server boot timestamp (set once at construction, never changes).
@@ -1800,7 +1822,7 @@ impl ServerState {
         let (tx, _rx) = tokio::sync::broadcast::channel::<SyncDiffEvent>(capacity);
         let metrics = Arc::new(Metrics::new());
         let (readiness_events_tx, _readiness_events_rx) =
-            tokio::sync::broadcast::channel::<ReadinessRecord>(capacity);
+            tokio::sync::broadcast::channel::<ReadinessEvent>(capacity);
         metrics
             .entries
             .store(initial.entries.len() as u64, Ordering::Relaxed);
@@ -1899,14 +1921,20 @@ impl ServerState {
             .current_readiness(target)
     }
 
-    pub fn update_readiness(&self, record: ReadinessRecord) -> Result<(), ReadinessRejection> {
-        let result = self
-            .readiness
+    pub fn current_readiness_snapshot(&self, target: ReadinessTarget) -> (u64, ReadinessRecord) {
+        self.readiness
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .update_readiness(record);
+            .current_readiness_snapshot(target)
+    }
+
+    pub fn update_readiness(&self, record: ReadinessRecord) -> Result<(), ReadinessRejection> {
+        let mut readiness = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
+        let result = readiness.update_readiness(record);
         if result.is_ok() {
-            self.broadcast_readiness_snapshot();
+            let (sequence, records) = readiness.next_readiness_snapshot();
+            drop(readiness);
+            self.broadcast_readiness_snapshot(sequence, records);
         }
         result
     }
@@ -1916,24 +1944,22 @@ impl ServerState {
         target: ReadinessTarget,
         invalidated: bool,
     ) -> ReadinessRecord {
-        let record = self
-            .readiness
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .advance_epoch_if_invalidated(target, invalidated);
+        let mut readiness = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
+        let record = readiness.advance_epoch_if_invalidated(target, invalidated);
         if invalidated {
-            self.broadcast_readiness_snapshot();
+            let (sequence, records) = readiness.next_readiness_snapshot();
+            drop(readiness);
+            self.broadcast_readiness_snapshot(sequence, records);
         }
         record
     }
 
     pub fn rotate_readiness_incarnation(&self, reason: impl Into<String>) -> String {
-        let incarnation_id = self
-            .readiness
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .rotate_incarnation(reason);
-        self.broadcast_readiness_snapshot();
+        let mut readiness = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
+        let incarnation_id = readiness.rotate_incarnation(reason);
+        let (sequence, records) = readiness.next_readiness_snapshot();
+        drop(readiness);
+        self.broadcast_readiness_snapshot(sequence, records);
         incarnation_id
     }
 
@@ -1957,14 +1983,15 @@ impl ServerState {
             .record_successful_full_bake_start_for_current_incarnation()
     }
 
-    pub fn readiness_events(&self) -> tokio::sync::broadcast::Receiver<ReadinessRecord> {
+    pub(crate) fn readiness_events(&self) -> tokio::sync::broadcast::Receiver<ReadinessEvent> {
         self.readiness_events_tx.subscribe()
     }
 
-    fn broadcast_readiness_snapshot(&self) {
-        for target in ReadinessTarget::ALL {
-            let record = self.current_readiness(target);
-            let _ = self.readiness_events_tx.send(record);
+    fn broadcast_readiness_snapshot(&self, sequence: u64, records: Vec<ReadinessRecord>) {
+        for record in records {
+            let _ = self
+                .readiness_events_tx
+                .send(ReadinessEvent { sequence, record });
         }
     }
 
