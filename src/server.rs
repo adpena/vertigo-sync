@@ -619,20 +619,32 @@ async fn handle_readiness_events(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<ReadinessQuery>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let initial = tokio_stream::iter([Ok(readiness_event(state.current_readiness(query.target)))]);
-    let target = query.target;
-    let updates =
-        BroadcastStream::new(state.readiness_events()).filter_map(move |result| match result {
-            Ok(record) if record.target == target => Some(Ok(readiness_event(record))),
-            _ => None,
-        });
-    let stream = initial.chain(updates);
+    let stream = readiness_records_stream(state, query.target, || {})
+        .map(|record| Ok(readiness_event(record)));
 
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("ping"),
     )
+}
+
+fn readiness_records_stream<F>(
+    state: Arc<ServerState>,
+    target: ReadinessTarget,
+    before_initial_snapshot: F,
+) -> impl tokio_stream::Stream<Item = ReadinessRecord>
+where
+    F: FnOnce(),
+{
+    let rx = state.readiness_events();
+    before_initial_snapshot();
+    let initial = tokio_stream::iter([state.current_readiness(target)]);
+    let updates = BroadcastStream::new(rx).filter_map(move |result| match result {
+        Ok(record) if record.target == target => Some(record),
+        _ => None,
+    });
+    initial.chain(updates)
 }
 
 // ---------------------------------------------------------------------------
@@ -1650,11 +1662,13 @@ fn resolve_patch_target(source_root: &Path, raw_path: &str) -> anyhow::Result<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReadinessStatusClass;
     use base64::Engine;
     use serde_json::json;
     use std::fs;
     use std::path::Path;
     use tempfile::tempdir;
+    use tokio_stream::StreamExt;
 
     fn write_project(path: &Path, name: &str, source_root: &str) {
         if let Some(parent) = path.parent() {
@@ -1783,6 +1797,57 @@ mod tests {
 
         assert_eq!(error.0, StatusCode::NOT_FOUND);
         assert!(error.1.contains("active snapshot"));
+    }
+
+    #[tokio::test]
+    async fn readiness_event_stream_subscribes_before_initial_snapshot() {
+        let root_dir = tempdir().expect("tempdir");
+        let includes: Vec<String> = Vec::new();
+        let snapshot = build_snapshot(root_dir.path(), &includes).expect("snapshot");
+        let state = ServerState::with_full_config(
+            root_dir.path().to_path_buf(),
+            includes,
+            snapshot,
+            ServerStateOptions {
+                channel_capacity: 64,
+                turbo: false,
+                coalesce_ms: 50,
+                binary_models: false,
+                glob_ignores: crate::GlobIgnoreSet::empty(),
+                project_path: Some(root_dir.path().join("default.project.json")),
+            },
+        );
+
+        state
+            .update_readiness({
+                let mut record = state.current_readiness(ReadinessTarget::EditSync);
+                record.ready = true;
+                record.status_class = ReadinessStatusClass::Ready;
+                record.code = "ready".to_string();
+                record.reason = None;
+                record
+            })
+            .expect("seed edit_sync");
+
+        let hook_state = state.clone();
+        let mut stream =
+            readiness_records_stream(state.clone(), ReadinessTarget::Preview, move || {
+                let mut record = hook_state.current_readiness(ReadinessTarget::Preview);
+                record.ready = true;
+                record.status_class = ReadinessStatusClass::Ready;
+                record.code = "ready".to_string();
+                record.reason = None;
+                hook_state
+                    .update_readiness(record)
+                    .expect("publish preview");
+            });
+
+        let first_record = stream.next().await.expect("first readiness record");
+        assert_eq!(first_record.target, ReadinessTarget::Preview);
+        assert!(first_record.ready);
+        assert_eq!(first_record.status_class, ReadinessStatusClass::Ready);
+        assert_eq!(first_record.code, "ready");
+        assert_eq!(first_record.reason, None);
     }
 
     #[test]

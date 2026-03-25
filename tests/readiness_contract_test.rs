@@ -542,6 +542,49 @@ mod readiness_contract_test {
         }
 
         #[tokio::test]
+        async fn readiness_contract_test_query_covers_all_required_targets() {
+            let (_root, state) = test_server_state();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::EditSync))
+                .unwrap();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::Preview))
+                .unwrap();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::FullBakeStart))
+                .unwrap();
+            state
+                .record_successful_full_bake_start_for_current_incarnation()
+                .unwrap();
+            state
+                .update_readiness(ready_record_for(&state, ReadinessTarget::FullBakeResult))
+                .unwrap();
+
+            let (base_url, server) = spawn_server(state.clone()).await;
+            let client = Client::new();
+
+            for target in ReadinessTarget::ALL {
+                let target = serde_json::to_value(target)
+                    .expect("target json")
+                    .as_str()
+                    .expect("target string")
+                    .to_string();
+                let payload =
+                    get_json(&client, &format!("{base_url}/readiness?target={target}")).await;
+                let expected = match target.as_str() {
+                    "edit_sync" => state.current_readiness(ReadinessTarget::EditSync),
+                    "preview" => state.current_readiness(ReadinessTarget::Preview),
+                    "full_bake_start" => state.current_readiness(ReadinessTarget::FullBakeStart),
+                    "full_bake_result" => state.current_readiness(ReadinessTarget::FullBakeResult),
+                    other => panic!("unexpected target {other}"),
+                };
+                assert_eq!(payload, serde_json::to_value(expected).unwrap());
+            }
+
+            server.abort();
+        }
+
+        #[tokio::test]
         async fn readiness_contract_test_event_stream_matches_query_shape_and_rejects_stale_epoch()
         {
             let (_root, state) = test_server_state();

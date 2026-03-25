@@ -1948,6 +1948,15 @@ impl ServerState {
             .validate_expectation(expected_target, expectation)
     }
 
+    pub fn record_successful_full_bake_start_for_current_incarnation(
+        &self,
+    ) -> Result<(), ReadinessRejection> {
+        self.readiness
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_successful_full_bake_start_for_current_incarnation()
+    }
+
     pub fn readiness_events(&self) -> tokio::sync::broadcast::Receiver<ReadinessRecord> {
         self.readiness_events_tx.subscribe()
     }
