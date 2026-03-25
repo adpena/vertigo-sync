@@ -3840,14 +3840,13 @@ mod tests {
 
     #[test]
     fn embedded_plugin_contains_generic_project_readiness_contract() {
-        let start = PLUGIN_SOURCE
-            .find("function Runtime.reportPluginState()")
+        let state_reporting_start = PLUGIN_SOURCE
+            .find("function Runtime.reportPluginState(force: boolean?)")
             .expect("plugin state reporter should exist");
-        let end = PLUGIN_SOURCE[start..]
-            .find("function Runtime.reportPluginManaged()")
-            .map(|offset| start + offset)
-            .expect("plugin managed reporter should follow state reporter");
-        let body = &PLUGIN_SOURCE[start..end];
+        let state_reporting_end = PLUGIN_SOURCE
+            .find("function Runtime.initInstancePool()")
+            .expect("instance pool initialization should follow state reporting");
+        let body = &PLUGIN_SOURCE[state_reporting_start..state_reporting_end];
 
         assert!(
             body.contains("connection = {"),
@@ -3888,20 +3887,35 @@ mod tests {
                 && !body.contains("time_travel_active = HISTORY.active"),
             "embedded plugin must not shadow server-owned readiness outputs or publish project-owned readiness heuristics"
         );
+
+        let loop_start = PLUGIN_SOURCE
+            .find("-- ─── State Reporting Loop (3s timer, independent of sync) ────────────────────")
+            .expect("state reporting loop should exist");
+        let loop_end = PLUGIN_SOURCE
+            .find("-- ─── Managed Index Reporting Loop (30s timer) ────────────────────────────────")
+            .expect("managed index reporting loop should exist");
+        let loop_body = &PLUGIN_SOURCE[loop_start..loop_end];
+        assert!(
+            loop_body.contains("Runtime.reportPluginState()"),
+            "embedded plugin should keep state reporting active even when disconnected or errored"
+        );
+        assert!(
+            !loop_body.contains("currentStatus == \"connected\""),
+            "embedded plugin should not gate state reporting on connected status"
+        );
     }
 
     #[test]
     fn plugin_source_module_contains_generic_project_readiness_contract() {
         let source = std::fs::read_to_string("assets/plugin_src/00_main.lua")
             .expect("plugin source module should be readable");
-        let start = source
-            .find("function Runtime.reportPluginState()")
+        let state_reporting_start = source
+            .find("function Runtime.reportPluginState(force: boolean?)")
             .expect("plugin state reporter should exist");
-        let end = source[start..]
-            .find("function Runtime.reportPluginManaged()")
-            .map(|offset| start + offset)
-            .expect("plugin managed reporter should follow state reporter");
-        let body = &source[start..end];
+        let state_reporting_end = source
+            .find("function Runtime.initInstancePool()")
+            .expect("instance pool initialization should follow state reporting");
+        let body = &source[state_reporting_start..state_reporting_end];
         assert!(
             body.contains("connection = {"),
             "plugin source module should publish a connection fact envelope"
@@ -3940,6 +3954,48 @@ mod tests {
                 && !body.contains("builders_enabled = BUILDERS.enabled")
                 && !body.contains("time_travel_active = HISTORY.active"),
             "plugin source module must not shadow server-owned readiness outputs or publish project-owned readiness heuristics"
+        );
+
+        let loop_start = source
+            .find("-- ─── State Reporting Loop (3s timer, independent of sync) ────────────────────")
+            .expect("state reporting loop should exist");
+        let loop_end = source
+            .find("-- ─── Managed Index Reporting Loop (30s timer) ────────────────────────────────")
+            .expect("managed index reporting loop should exist");
+        let loop_body = &source[loop_start..loop_end];
+        assert!(
+            loop_body.contains("Runtime.reportPluginState()"),
+            "plugin source module should keep state reporting active even when disconnected or errored"
+        );
+        assert!(
+            !loop_body.contains("currentStatus == \"connected\""),
+            "plugin source module should not gate state reporting on connected status"
+        );
+
+        let command_start = source
+            .find("local function processPluginCommands(commands: { any })")
+            .expect("plugin command processor should exist");
+        let command_end = source[command_start..]
+            .find("-- ─── State Reporting (POST to server, never crashes, never logs on failure) ─")
+            .map(|offset| command_start + offset)
+            .expect("state reporting section should follow the command processor");
+        let command_body = &source[command_start..command_end];
+        let busy_true = command_body
+            .find("pluginCommandBusy = true")
+            .expect("busy flag should be raised before command execution");
+        let busy_flush = command_body
+            .find("Runtime.reportPluginState(true)")
+            .expect("busy fact should be force-published while commands are in flight");
+        let busy_false = command_body
+            .rfind("pluginCommandBusy = false")
+            .expect("busy flag should be cleared after command execution");
+        assert!(
+            busy_true < busy_flush && busy_flush < busy_false,
+            "plugin command busy facts should be published while command execution is in flight"
+        );
+        assert!(
+            command_body.contains("Runtime.updatePluginFactAttributes()"),
+            "plugin command busy transitions should update observable workspace facts"
         );
     }
 

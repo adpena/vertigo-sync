@@ -1775,6 +1775,8 @@ end
 -- @native
 local function processPluginCommands(commands: { any })
 	pluginCommandBusy = true
+	Runtime.updatePluginFactAttributes()
+	Runtime.reportPluginState(true)
 	for _, cmd in commands do
 		if type(cmd) ~= "table" or type(cmd.command) ~= "string" then
 			continue
@@ -1935,6 +1937,8 @@ local function processPluginCommands(commands: { any })
 		task.defer(ackPluginCommand, cmdId, success, message)
 	end
 	pluginCommandBusy = false
+	Runtime.updatePluginFactAttributes()
+	Runtime.reportPluginState(true)
 end
 
 -- ─── State Reporting (POST to server, never crashes, never logs on failure) ─
@@ -2303,9 +2307,9 @@ function Runtime.tickEditPreview()
 	end
 end
 
-function Runtime.reportPluginState()
+function Runtime.reportPluginState(force: boolean?)
 	local now: number = os.clock()
-	if now - lastStateReportAt < STATE_REPORT_INTERVAL_SECONDS then
+	if not force and now - lastStateReportAt < STATE_REPORT_INTERVAL_SECONDS then
 		return
 	end
 	lastStateReportAt = now
@@ -7055,12 +7059,9 @@ end)
 -- ─── State Reporting Loop (3s timer, independent of sync) ────────────────────
 
 task.spawn(function()
-	-- Wait for initial connection before first report
 	task.wait(STATE_REPORT_INTERVAL_SECONDS)
 	while true do
-		if currentStatus == "connected" then
-			Runtime.reportPluginState()
-		end
+		Runtime.reportPluginState()
 		task.wait(STATE_REPORT_INTERVAL_SECONDS)
 	end
 end)
