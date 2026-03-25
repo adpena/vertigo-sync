@@ -284,6 +284,367 @@ const SKIP_FILE_SUFFIXES: &[&str] = &[".log", ".tmp", ".swp"];
 const MMAP_THRESHOLD: u64 = 4096;
 
 // ---------------------------------------------------------------------------
+// Readiness contract
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessTarget {
+    EditSync,
+    Preview,
+    FullBakeStart,
+    FullBakeResult,
+}
+
+impl ReadinessTarget {
+    pub const ALL: [Self; 4] = [
+        Self::EditSync,
+        Self::Preview,
+        Self::FullBakeStart,
+        Self::FullBakeResult,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessStatusClass {
+    Ready,
+    Transient,
+    Blocked,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadinessRecord {
+    pub target: ReadinessTarget,
+    pub ready: bool,
+    pub epoch: u64,
+    pub incarnation_id: String,
+    pub status_class: ReadinessStatusClass,
+    pub code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadinessExpectation {
+    pub target: ReadinessTarget,
+    pub epoch: u64,
+    pub incarnation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadinessRejection {
+    TargetMismatch {
+        expected: ReadinessTarget,
+        actual: ReadinessTarget,
+    },
+    EpochMismatch {
+        target: ReadinessTarget,
+        expected: u64,
+        actual: u64,
+    },
+    IncarnationMismatch {
+        target: ReadinessTarget,
+        expected: String,
+        actual: String,
+    },
+    NotReady {
+        target: ReadinessTarget,
+        status_class: ReadinessStatusClass,
+        code: String,
+    },
+    DependencyViolation {
+        target: ReadinessTarget,
+        prerequisite: ReadinessTarget,
+        message: String,
+    },
+    InvalidRecord {
+        target: ReadinessTarget,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadinessState {
+    incarnation_seq: u64,
+    incarnation_id: String,
+    records: BTreeMap<ReadinessTarget, ReadinessRecord>,
+}
+
+impl Default for ReadinessState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReadinessState {
+    pub fn new() -> Self {
+        let incarnation_id = "inc-1".to_string();
+        let mut records = BTreeMap::new();
+        for target in ReadinessTarget::ALL {
+            records.insert(target, Self::bootstrap_record(target, &incarnation_id));
+        }
+        Self {
+            incarnation_seq: 1,
+            incarnation_id,
+            records,
+        }
+    }
+
+    fn bootstrap_record(target: ReadinessTarget, incarnation_id: &str) -> ReadinessRecord {
+        Self::non_ready_record(
+            target,
+            incarnation_id,
+            0,
+            ReadinessStatusClass::Transient,
+            "plugin_unavailable",
+            Some("plugin_unavailable".to_string()),
+        )
+    }
+
+    fn ready_record(target: ReadinessTarget, incarnation_id: &str, epoch: u64) -> ReadinessRecord {
+        ReadinessRecord {
+            target,
+            ready: true,
+            epoch,
+            incarnation_id: incarnation_id.to_string(),
+            status_class: ReadinessStatusClass::Ready,
+            code: "ready".to_string(),
+            reason: None,
+        }
+    }
+
+    fn non_ready_record(
+        target: ReadinessTarget,
+        incarnation_id: &str,
+        epoch: u64,
+        status_class: ReadinessStatusClass,
+        code: &str,
+        reason: Option<String>,
+    ) -> ReadinessRecord {
+        ReadinessRecord {
+            target,
+            ready: false,
+            epoch,
+            incarnation_id: incarnation_id.to_string(),
+            status_class,
+            code: code.to_string(),
+            reason,
+        }
+    }
+
+    fn read_record(&self, target: ReadinessTarget) -> &ReadinessRecord {
+        self.records
+            .get(&target)
+            .unwrap_or_else(|| panic!("missing readiness record for {target:?}"))
+    }
+
+    fn read_record_mut(&mut self, target: ReadinessTarget) -> &mut ReadinessRecord {
+        self.records
+            .get_mut(&target)
+            .unwrap_or_else(|| panic!("missing readiness record for {target:?}"))
+    }
+
+    fn validate_record_shape(record: &ReadinessRecord) -> Result<(), ReadinessRejection> {
+        if record.ready {
+            if record.status_class != ReadinessStatusClass::Ready {
+                return Err(ReadinessRejection::InvalidRecord {
+                    target: record.target,
+                    message: "ready records must use status_class=ready".to_string(),
+                });
+            }
+            if record.code != "ready" {
+                return Err(ReadinessRejection::InvalidRecord {
+                    target: record.target,
+                    message: "ready records must use code=ready".to_string(),
+                });
+            }
+            if record.reason.is_some() {
+                return Err(ReadinessRejection::InvalidRecord {
+                    target: record.target,
+                    message: "ready records must not carry a reason".to_string(),
+                });
+            }
+        } else if record.status_class == ReadinessStatusClass::Ready {
+            return Err(ReadinessRejection::InvalidRecord {
+                target: record.target,
+                message: "status_class=ready requires ready=true".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn demote_record(
+        record: &mut ReadinessRecord,
+        prerequisite: ReadinessTarget,
+        reason: Option<String>,
+    ) {
+        record.ready = false;
+        record.status_class = ReadinessStatusClass::Blocked;
+        record.code = "prerequisite_invalidated".to_string();
+        record.reason = Some(reason.unwrap_or_else(|| format!("{prerequisite:?} invalidated")));
+    }
+
+    fn demote_dependents(&mut self, prerequisite: ReadinessTarget, reason: Option<String>) {
+        let dependent_targets: &[ReadinessTarget] = match prerequisite {
+            ReadinessTarget::EditSync => &[
+                ReadinessTarget::Preview,
+                ReadinessTarget::FullBakeStart,
+                ReadinessTarget::FullBakeResult,
+            ],
+            ReadinessTarget::FullBakeStart => &[ReadinessTarget::FullBakeResult],
+            ReadinessTarget::Preview | ReadinessTarget::FullBakeResult => &[],
+        };
+
+        for target in dependent_targets {
+            let record = self.read_record_mut(*target);
+            if record.ready {
+                Self::demote_record(record, prerequisite, reason.clone());
+            }
+        }
+    }
+
+    pub fn current_readiness(&self, target: ReadinessTarget) -> ReadinessRecord {
+        self.read_record(target).clone()
+    }
+
+    pub fn advance_epoch_if_invalidated(
+        &mut self,
+        target: ReadinessTarget,
+        invalidated: bool,
+    ) -> ReadinessRecord {
+        if !invalidated {
+            return self.current_readiness(target);
+        }
+
+        let epoch = {
+            let record = self.read_record_mut(target);
+            record.epoch = record.epoch.saturating_add(1);
+            record.epoch
+        };
+        *self.read_record_mut(target) = Self::non_ready_record(
+            target,
+            &self.incarnation_id,
+            epoch,
+            ReadinessStatusClass::Transient,
+            "target_invalidated",
+            Some("target_invalidated".to_string()),
+        );
+        self.demote_dependents(target, Some(format!("{target:?} invalidated")));
+        self.current_readiness(target)
+    }
+
+    pub fn rotate_incarnation(&mut self, reason: impl Into<String>) -> String {
+        self.incarnation_seq = self.incarnation_seq.saturating_add(1);
+        self.incarnation_id = format!("inc-{}", self.incarnation_seq);
+        let reason = reason.into();
+        for target in ReadinessTarget::ALL {
+            let epoch = self.read_record(target).epoch;
+            *self.read_record_mut(target) = Self::non_ready_record(
+                target,
+                &self.incarnation_id,
+                epoch,
+                ReadinessStatusClass::Transient,
+                "incarnation_rotated",
+                Some(reason.clone()),
+            );
+        }
+        self.incarnation_id.clone()
+    }
+
+    pub fn update_readiness(&mut self, record: ReadinessRecord) -> Result<(), ReadinessRejection> {
+        Self::validate_record_shape(&record)?;
+        let target = record.target;
+        if record.incarnation_id != self.incarnation_id {
+            return Err(ReadinessRejection::IncarnationMismatch {
+                target,
+                expected: self.incarnation_id.clone(),
+                actual: record.incarnation_id,
+            });
+        }
+
+        if record.ready {
+            if matches!(
+                target,
+                ReadinessTarget::Preview | ReadinessTarget::FullBakeStart
+            ) {
+                let incarnation_id = self.incarnation_id.clone();
+                let edit_sync_epoch = {
+                    let edit_sync = self.read_record_mut(ReadinessTarget::EditSync);
+                    if edit_sync.ready {
+                        None
+                    } else {
+                        Some(edit_sync.epoch)
+                    }
+                };
+                if let Some(epoch) = edit_sync_epoch {
+                    *self.read_record_mut(ReadinessTarget::EditSync) =
+                        Self::ready_record(ReadinessTarget::EditSync, &incarnation_id, epoch);
+                }
+            }
+
+            if target == ReadinessTarget::FullBakeResult {
+                let start = self.read_record(ReadinessTarget::FullBakeStart);
+                if !start.ready || start.incarnation_id != self.incarnation_id {
+                    return Err(ReadinessRejection::DependencyViolation {
+                        target: ReadinessTarget::FullBakeResult,
+                        prerequisite: ReadinessTarget::FullBakeStart,
+                        message: "full_bake_result requires a ready full_bake_start for the same incarnation"
+                            .to_string(),
+                    });
+                }
+            }
+        } else {
+            self.demote_dependents(target, record.reason.clone());
+        }
+
+        *self.read_record_mut(target) = record;
+        Ok(())
+    }
+
+    pub fn validate_expectation(
+        &self,
+        expected_target: ReadinessTarget,
+        expectation: &ReadinessExpectation,
+    ) -> Result<(), ReadinessRejection> {
+        if expectation.target != expected_target {
+            return Err(ReadinessRejection::TargetMismatch {
+                expected: expected_target,
+                actual: expectation.target,
+            });
+        }
+
+        let current = self.read_record(expected_target);
+        if current.epoch != expectation.epoch {
+            return Err(ReadinessRejection::EpochMismatch {
+                target: expected_target,
+                expected: expectation.epoch,
+                actual: current.epoch,
+            });
+        }
+
+        if current.incarnation_id != expectation.incarnation_id {
+            return Err(ReadinessRejection::IncarnationMismatch {
+                target: expected_target,
+                expected: expectation.incarnation_id.clone(),
+                actual: current.incarnation_id.clone(),
+            });
+        }
+
+        if !current.ready {
+            return Err(ReadinessRejection::NotReady {
+                target: expected_target,
+                status_class: current.status_class,
+                code: current.code.clone(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Incremental snapshot cache
 // ---------------------------------------------------------------------------
 
@@ -1327,6 +1688,8 @@ pub struct ServerState {
     pub coalesce_ms: u64,
     /// Whether binary model support is enabled.
     pub binary_models: bool,
+    /// Authoritative readiness records for edit_sync, preview, and full-bake targets.
+    pub readiness: Mutex<ReadinessState>,
     /// Cached model manifests, keyed by content SHA-256.
     pub model_cache: Mutex<ModelManifestCache>,
     /// Server boot timestamp (set once at construction, never changes).
@@ -1438,6 +1801,7 @@ impl ServerState {
             turbo: options.turbo,
             coalesce_ms: options.coalesce_ms,
             binary_models: options.binary_models,
+            readiness: Mutex::new(ReadinessState::new()),
             model_cache: Mutex::new(ModelManifestCache::new()),
             boot_time: Instant::now(),
             plugin_state: Mutex::new(None),
@@ -1489,6 +1853,49 @@ impl ServerState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         queue.drain(..).collect()
+    }
+
+    pub fn current_readiness(&self, target: ReadinessTarget) -> ReadinessRecord {
+        self.readiness
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current_readiness(target)
+    }
+
+    pub fn update_readiness(&self, record: ReadinessRecord) -> Result<(), ReadinessRejection> {
+        self.readiness
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .update_readiness(record)
+    }
+
+    pub fn advance_readiness_epoch_if_invalidated(
+        &self,
+        target: ReadinessTarget,
+        invalidated: bool,
+    ) -> ReadinessRecord {
+        self.readiness
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .advance_epoch_if_invalidated(target, invalidated)
+    }
+
+    pub fn rotate_readiness_incarnation(&self, reason: impl Into<String>) -> String {
+        self.readiness
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rotate_incarnation(reason)
+    }
+
+    pub fn validate_readiness_expectation(
+        &self,
+        expected_target: ReadinessTarget,
+        expectation: &ReadinessExpectation,
+    ) -> Result<(), ReadinessRejection> {
+        self.readiness
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .validate_expectation(expected_target, expectation)
     }
 
     /// Return up to `limit` cached history rows in chronological order
