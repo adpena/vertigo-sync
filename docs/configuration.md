@@ -359,13 +359,16 @@ workspace:SetAttribute("VertigoSyncServerUrl", "http://127.0.0.1:7575")
 workspace:SetAttribute("VertigoSyncProjectId", "your-project-id")
 ```
 
-The plugin also emits generic readiness/capability attributes on `Workspace` for diagnostics:
+The plugin now emits fact-only attributes on `Workspace` for diagnostics. These are inputs for the server-owned readiness contract, not the final readiness answer:
 
 | Attribute | Type | Meaning |
 |-----------|------|---------|
-| `VertigoSyncProjectReadinessReady` | boolean | Whether the current place is ready for sync/edit preview. |
-| `VertigoSyncProjectReadinessCode` | string | Generic readiness code such as `ready`, `project_bootstrap_pending`, `project_blocked`, `edit_preview_misconfigured`, or `sync_disconnected`. |
-| `VertigoSyncProjectReadinessMessage` | string | Human-readable explanation of the current readiness state. |
-| `VertigoSyncWebSocketAvailable` | boolean | Whether Studio exposes `WebSocketService` in this session. |
-| `VertigoSyncBuildersEnabled` | boolean | Whether builder execution is enabled in the current plugin session. |
-| `VertigoSyncEditPreviewEnabled` | boolean | Whether the loaded project requested edit preview integration. |
+| `VertigoSyncPluginConnectionStatus` | string | Current plugin connection status, such as `connected`, `disconnected`, or `error`. |
+| `VertigoSyncPluginTransportMode` | string | Current transport mode, such as `ws`, `poll`, or `idle`. |
+| `VertigoSyncPluginConnected` | boolean | Whether the plugin currently considers itself connected. |
+| `VertigoSyncPluginProjectLoaded` | boolean | Whether the project has been loaded in the Studio session. |
+| `VertigoSyncPluginSnapshotState` | string | Snapshot/apply state fact, such as `live`, `fetching`, `apply_in_progress`, `historical`, or `resync_requested`. |
+| `VertigoSyncPluginSnapshotApplyInProgress` | boolean | Whether snapshot fetch/apply work is in flight. |
+| `VertigoSyncPluginCommandBusy` | boolean | Whether plugin commands are currently being processed. |
+
+For the authoritative readiness answer, query `GET /readiness?target=...` on `vertigo-sync` rather than reading these facts directly.
