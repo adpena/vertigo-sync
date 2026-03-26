@@ -433,11 +433,12 @@ async fn handle_post_plugin_state(
     State(state): State<Arc<ServerState>>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, axum::response::Response) {
-    *state.plugin_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(body);
+    *state.plugin_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(body.clone());
     *state
         .plugin_state_at
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    let _ = state.merge_plugin_state_facts(&body);
 
     let commands = state.drain_ready_plugin_commands();
     if commands.is_empty() {

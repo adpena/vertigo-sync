@@ -823,6 +823,278 @@ mod readiness_contract_test {
         }
     }
 
+    pub mod project_fact_merge {
+        use std::sync::Arc;
+
+        use axum::http::StatusCode;
+        use reqwest::Client;
+        use serde_json::Value;
+        use tempfile::tempdir;
+        use tokio::net::TcpListener;
+        use vertigo_sync::server::build_router;
+        use vertigo_sync::{ReadinessTarget, ServerState, ServerStateOptions, Snapshot};
+
+        fn empty_snapshot() -> Snapshot {
+            Snapshot {
+                version: 1,
+                include: Vec::new(),
+                fingerprint: "test-fingerprint".to_string(),
+                entries: Vec::new(),
+            }
+        }
+
+        fn test_server_state() -> (tempfile::TempDir, Arc<ServerState>) {
+            let root = tempdir().expect("tempdir");
+            let state = ServerState::with_full_config(
+                root.path().to_path_buf(),
+                Vec::new(),
+                empty_snapshot(),
+                ServerStateOptions {
+                    channel_capacity: 64,
+                    turbo: false,
+                    coalesce_ms: 50,
+                    binary_models: false,
+                    glob_ignores: vertigo_sync::GlobIgnoreSet::empty(),
+                    project_path: Some(root.path().join("default.project.json")),
+                },
+            );
+
+            (root, state)
+        }
+
+        async fn spawn_server(state: Arc<ServerState>) -> (String, tokio::task::JoinHandle<()>) {
+            let app = build_router(state);
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let addr = listener.local_addr().expect("listener addr");
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            (format!("http://{}:{}", addr.ip(), addr.port()), server)
+        }
+
+        async fn post_status(client: &Client, url: &str, body: &Value) -> StatusCode {
+            client
+                .post(url)
+                .json(body)
+                .send()
+                .await
+                .expect("request")
+                .status()
+        }
+
+        async fn get_json(client: &Client, url: &str) -> Value {
+            client
+                .get(url)
+                .send()
+                .await
+                .expect("request")
+                .error_for_status()
+                .expect("successful response")
+                .json::<Value>()
+                .await
+                .expect("json body")
+        }
+
+        #[tokio::test]
+        async fn readiness_contract_test_preview_project_facts_drive_preview_and_full_bake_readiness()
+        {
+            let (_root, state) = test_server_state();
+            let (base_url, server) = spawn_server(state.clone()).await;
+            let client = Client::new();
+
+            let status = post_status(
+                &client,
+                &format!("{base_url}/plugin/state"),
+                &serde_json::json!({
+                    "preview_runtime": {
+                        "studio_connected": true,
+                        "plugin_attached": true,
+                        "project_loaded": true,
+                        "sync_status": "connected"
+                    },
+                    "preview_project": {
+                        "preview": {
+                            "build_active": false,
+                            "state_apply_pending": false,
+                            "sync_state": "idle"
+                        },
+                        "full_bake": {
+                            "active": false,
+                            "last_result": null
+                        }
+                    }
+                }),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            assert_eq!(
+                get_json(&client, &format!("{base_url}/readiness?target=edit_sync")).await["ready"],
+                true,
+                "expected plugin/runtime facts to make edit_sync authoritative"
+            );
+            assert_eq!(
+                get_json(&client, &format!("{base_url}/readiness?target=preview")).await["ready"],
+                true,
+                "expected project facts to drive preview readiness once edit_sync is satisfied"
+            );
+            assert_eq!(
+                get_json(&client, &format!("{base_url}/readiness?target=full_bake_start")).await["ready"],
+                true,
+                "expected settled project facts to make full_bake_start ready when prerequisites are met"
+            );
+            assert_eq!(
+                get_json(&client, &format!("{base_url}/readiness?target=full_bake_result")).await["ready"],
+                false,
+                "expected full_bake_result to remain false until a successful result is reported"
+            );
+
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn readiness_contract_test_prerequisite_invalidation_keeps_dependent_targets_false_even_with_stale_project_facts()
+        {
+            let (_root, state) = test_server_state();
+            let (base_url, server) = spawn_server(state.clone()).await;
+            let client = Client::new();
+
+            let ready_payload = serde_json::json!({
+                "preview_runtime": {
+                    "studio_connected": true,
+                    "plugin_attached": true,
+                    "project_loaded": true,
+                    "sync_status": "connected"
+                },
+                "preview_project": {
+                    "preview": {
+                        "build_active": false,
+                        "state_apply_pending": false,
+                        "sync_state": "idle"
+                    },
+                    "full_bake": {
+                        "active": false,
+                        "last_result": "success"
+                    }
+                }
+            });
+
+            assert_eq!(
+                post_status(&client, &format!("{base_url}/plugin/state"), &ready_payload).await,
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                get_json(&client, &format!("{base_url}/readiness?target=preview")).await["ready"],
+                true
+            );
+            assert_eq!(
+                get_json(&client, &format!("{base_url}/readiness?target=full_bake_start")).await["ready"],
+                true
+            );
+
+            state
+                .advance_readiness_epoch_if_invalidated(ReadinessTarget::EditSync, true);
+
+            assert_eq!(
+                post_status(&client, &format!("{base_url}/plugin/state"), &ready_payload).await,
+                StatusCode::NO_CONTENT
+            );
+
+            assert_eq!(
+                get_json(&client, &format!("{base_url}/readiness?target=preview")).await["ready"],
+                false,
+                "expected stale project facts not to resurrect preview readiness after a prerequisite invalidation"
+            );
+            assert_eq!(
+                get_json(&client, &format!("{base_url}/readiness?target=full_bake_start")).await["ready"],
+                false,
+                "expected stale project facts not to resurrect full_bake_start readiness after a prerequisite invalidation"
+            );
+            assert_eq!(
+                get_json(&client, &format!("{base_url}/readiness?target=full_bake_result")).await["ready"],
+                false,
+                "expected stale project facts not to resurrect full_bake_result readiness after a prerequisite invalidation"
+            );
+
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn readiness_contract_test_state_only_preview_churn_keeps_preview_epoch_stable() {
+            let (_root, state) = test_server_state();
+            let (base_url, server) = spawn_server(state.clone()).await;
+            let client = Client::new();
+
+            let settled_payload = serde_json::json!({
+                "preview_runtime": {
+                    "studio_connected": true,
+                    "plugin_attached": true,
+                    "project_loaded": true,
+                    "sync_status": "connected"
+                },
+                "preview_project": {
+                    "preview": {
+                        "build_active": false,
+                        "state_apply_pending": false,
+                        "sync_state": "idle"
+                    },
+                    "full_bake": {
+                        "active": false,
+                        "last_result": null
+                    }
+                }
+            });
+
+            assert_eq!(
+                post_status(&client, &format!("{base_url}/plugin/state"), &settled_payload).await,
+                StatusCode::NO_CONTENT
+            );
+
+            let initial_preview = get_json(&client, &format!("{base_url}/readiness?target=preview")).await;
+            assert_eq!(initial_preview["ready"], true);
+            let initial_epoch = initial_preview["epoch"].as_u64().expect("preview epoch");
+
+            let state_only_churn = serde_json::json!({
+                "preview_runtime": {
+                    "studio_connected": true,
+                    "plugin_attached": true,
+                    "project_loaded": true,
+                    "sync_status": "connected",
+                    "reconnect_attempt": 2
+                },
+                "preview_project": {
+                    "preview": {
+                        "build_active": false,
+                        "state_apply_pending": false,
+                        "sync_state": "idle"
+                    },
+                    "full_bake": {
+                        "active": false,
+                        "last_result": null
+                    }
+                }
+            });
+
+            assert_eq!(
+                post_status(&client, &format!("{base_url}/plugin/state"), &state_only_churn).await,
+                StatusCode::NO_CONTENT
+            );
+
+            let updated_preview = get_json(&client, &format!("{base_url}/readiness?target=preview")).await;
+            assert_eq!(updated_preview["ready"], true);
+            assert_eq!(
+                updated_preview["epoch"].as_u64().expect("preview epoch"),
+                initial_epoch,
+                "expected state-only preview churn to keep the preview epoch stable"
+            );
+
+            server.abort();
+        }
+    }
+
     pub mod action_preconditions {
         use super::super::*;
         use std::sync::Arc;

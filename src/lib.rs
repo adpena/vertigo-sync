@@ -332,6 +332,64 @@ pub struct ReadinessExpectation {
     pub incarnation_id: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PluginConnectionFacts {
+    #[serde(default)]
+    pub sync_status: Option<String>,
+    #[serde(default)]
+    pub ws_connected: Option<bool>,
+    #[serde(default)]
+    pub has_ever_connected: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PluginRuntimeFacts {
+    #[serde(default)]
+    pub studio_connected: Option<bool>,
+    #[serde(default)]
+    pub plugin_attached: Option<bool>,
+    #[serde(default)]
+    pub project_loaded: Option<bool>,
+    #[serde(default)]
+    pub sync_status: Option<String>,
+    #[serde(default)]
+    pub connection: Option<PluginConnectionFacts>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PreviewProjectPreviewFacts {
+    #[serde(default)]
+    pub build_active: Option<bool>,
+    #[serde(default)]
+    pub state_apply_pending: Option<bool>,
+    #[serde(default)]
+    pub sync_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PreviewProjectFullBakeFacts {
+    #[serde(default)]
+    pub active: Option<bool>,
+    #[serde(default)]
+    pub last_result: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PreviewProjectFacts {
+    #[serde(default)]
+    pub preview: Option<PreviewProjectPreviewFacts>,
+    #[serde(default)]
+    pub full_bake: Option<PreviewProjectFullBakeFacts>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PluginReadinessFacts {
+    #[serde(default)]
+    pub preview_runtime: Option<PluginRuntimeFacts>,
+    #[serde(default, alias = "projectFacts")]
+    pub preview_project: Option<PreviewProjectFacts>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandReadinessExpectation {
     pub expected_target: ReadinessTarget,
@@ -392,6 +450,7 @@ pub struct ReadinessState {
     incarnation_seq: u64,
     incarnation_id: String,
     full_bake_start_success_incarnation_id: Option<String>,
+    last_project_signature: Option<String>,
     event_seq: u64,
     records: BTreeMap<ReadinessTarget, ReadinessRecord>,
 }
@@ -413,6 +472,7 @@ impl ReadinessState {
             incarnation_seq: 1,
             incarnation_id,
             full_bake_start_success_incarnation_id: None,
+            last_project_signature: None,
             event_seq: 0,
             records,
         }
@@ -489,18 +549,7 @@ impl ReadinessState {
         Ok(())
     }
 
-    fn demote_record(
-        record: &mut ReadinessRecord,
-        prerequisite: ReadinessTarget,
-        reason: Option<String>,
-    ) {
-        record.ready = false;
-        record.status_class = ReadinessStatusClass::Blocked;
-        record.code = "prerequisite_invalidated".to_string();
-        record.reason = Some(reason.unwrap_or_else(|| format!("{prerequisite:?} invalidated")));
-    }
-
-    fn demote_dependents(&mut self, prerequisite: ReadinessTarget, reason: Option<String>) {
+    fn demote_dependents(&mut self, prerequisite: ReadinessTarget) {
         if matches!(
             prerequisite,
             ReadinessTarget::EditSync | ReadinessTarget::FullBakeStart
@@ -519,10 +568,28 @@ impl ReadinessState {
         };
 
         for target in dependent_targets {
-            let record = self.read_record_mut(*target);
-            if record.ready {
-                Self::demote_record(record, prerequisite, reason.clone());
+            if self.read_record(*target).ready {
+                let _ = self.advance_epoch_if_invalidated(*target, true);
             }
+        }
+    }
+
+    fn promote_ready_record(&mut self, target: ReadinessTarget) -> Result<(), ReadinessRejection> {
+        let mut record = self.current_readiness(target);
+        if record.ready {
+            return Ok(());
+        }
+
+        record.ready = true;
+        record.status_class = ReadinessStatusClass::Ready;
+        record.code = "ready".to_string();
+        record.reason = None;
+        self.update_readiness(record)
+    }
+
+    fn invalidate_target(&mut self, target: ReadinessTarget) {
+        if self.current_readiness(target).ready {
+            let _ = self.advance_epoch_if_invalidated(target, true);
         }
     }
 
@@ -566,7 +633,7 @@ impl ReadinessState {
             "target_invalidated",
             Some("target_invalidated".to_string()),
         );
-        self.demote_dependents(target, Some(format!("{target:?} invalidated")));
+        self.demote_dependents(target);
         self.current_readiness(target)
     }
 
@@ -574,6 +641,7 @@ impl ReadinessState {
         self.incarnation_seq = self.incarnation_seq.saturating_add(1);
         self.incarnation_id = format!("inc-{}", self.incarnation_seq);
         self.full_bake_start_success_incarnation_id = None;
+        self.last_project_signature = None;
         let reason = reason.into();
         for target in ReadinessTarget::ALL {
             let epoch = self.read_record(target).epoch;
@@ -643,7 +711,7 @@ impl ReadinessState {
             if target == ReadinessTarget::FullBakeStart {
                 self.full_bake_start_success_incarnation_id = None;
             }
-            self.demote_dependents(target, record.reason.clone());
+            self.demote_dependents(target);
         }
 
         *self.read_record_mut(target) = record;
@@ -712,6 +780,139 @@ impl ReadinessState {
 
         self.full_bake_start_success_incarnation_id = Some(self.incarnation_id.clone());
         Ok(())
+    }
+
+    fn runtime_is_connected(runtime: &PluginRuntimeFacts) -> Option<bool> {
+        if runtime.studio_connected.is_some()
+            || runtime.plugin_attached.is_some()
+            || runtime.project_loaded.is_some()
+        {
+            return Some(
+                runtime.studio_connected == Some(true)
+                    && runtime.plugin_attached == Some(true)
+                    && runtime.project_loaded == Some(true),
+            );
+        }
+
+        if let Some(sync_status) = runtime.sync_status.as_deref() {
+            return Some(sync_status == "connected");
+        }
+
+        runtime
+            .connection
+            .as_ref()
+            .and_then(|connection| connection.sync_status.as_deref())
+            .map(|sync_status| sync_status == "connected")
+    }
+
+    fn preview_project_is_settled(project: &PreviewProjectPreviewFacts) -> Option<bool> {
+        let build_active = project.build_active?;
+        let state_apply_pending = project.state_apply_pending?;
+        let sync_state = project.sync_state.as_deref()?;
+        Some(!build_active && !state_apply_pending && sync_state == "idle")
+    }
+
+    fn full_bake_start_is_ready(project: &PreviewProjectFullBakeFacts) -> Option<bool> {
+        project.active.map(|active| !active)
+    }
+
+    fn full_bake_result_is_ready(project: &PreviewProjectFullBakeFacts) -> Option<bool> {
+        let active = project.active?;
+        let last_result = project.last_result.as_ref()?;
+        Some(!active && last_result.as_deref() == Some("success"))
+    }
+
+    pub fn merge_plugin_state_facts(
+        &mut self,
+        payload: &serde_json::Value,
+    ) -> Result<bool, ReadinessRejection> {
+        let facts: PluginReadinessFacts = match serde_json::from_value(payload.clone()) {
+            Ok(facts) => facts,
+            Err(_) => return Ok(false),
+        };
+
+        let mut changed = false;
+
+        if let Some(runtime) = facts.preview_runtime.as_ref() {
+            if let Some(runtime_ready) = Self::runtime_is_connected(runtime) {
+                let current = self.current_readiness(ReadinessTarget::EditSync);
+                if current.ready != runtime_ready {
+                    changed = true;
+                    if runtime_ready {
+                        self.promote_ready_record(ReadinessTarget::EditSync)?;
+                    } else {
+                        self.invalidate_target(ReadinessTarget::EditSync);
+                    }
+                }
+            }
+        }
+
+        if let Some(project) = facts.preview_project.as_ref() {
+            let project_signature = serde_json::to_string(project).unwrap_or_default();
+            let project_is_fresh = self
+                .last_project_signature
+                .as_deref()
+                != Some(project_signature.as_str());
+            if project_is_fresh {
+                self.last_project_signature = Some(project_signature);
+
+                if let Some(preview_section) = project.preview.as_ref() {
+                    if let Some(preview_ready) = Self::preview_project_is_settled(preview_section) {
+                        let current = self.current_readiness(ReadinessTarget::Preview);
+                        if current.ready != preview_ready {
+                            changed = true;
+                            if preview_ready {
+                                self.promote_ready_record(ReadinessTarget::Preview)?;
+                            } else {
+                                self.invalidate_target(ReadinessTarget::Preview);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(full_bake_section) = project.full_bake.as_ref() {
+                    if let Some(full_bake_start_ready) =
+                        Self::full_bake_start_is_ready(full_bake_section)
+                    {
+                        let current = self.current_readiness(ReadinessTarget::FullBakeStart);
+                        if current.ready != full_bake_start_ready {
+                            changed = true;
+                            if full_bake_start_ready {
+                                self.promote_ready_record(ReadinessTarget::FullBakeStart)?;
+                            } else {
+                                self.invalidate_target(ReadinessTarget::FullBakeStart);
+                            }
+                        }
+                    }
+
+                    if let Some(full_bake_result_ready) =
+                        Self::full_bake_result_is_ready(full_bake_section)
+                    {
+                        if full_bake_result_ready {
+                            let edit_sync = self.current_readiness(ReadinessTarget::EditSync);
+                            let full_bake_start =
+                                self.current_readiness(ReadinessTarget::FullBakeStart);
+                            if edit_sync.ready && full_bake_start.ready {
+                                let _ =
+                                    self.record_successful_full_bake_start_for_current_incarnation();
+                            }
+                        }
+
+                        let current = self.current_readiness(ReadinessTarget::FullBakeResult);
+                        if current.ready != full_bake_result_ready {
+                            changed = true;
+                            if full_bake_result_ready {
+                                self.promote_ready_record(ReadinessTarget::FullBakeResult)?;
+                            } else {
+                                self.invalidate_target(ReadinessTarget::FullBakeResult);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(changed)
     }
 }
 
@@ -2052,6 +2253,20 @@ impl ServerState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .record_successful_full_bake_start_for_current_incarnation()
+    }
+
+    pub fn merge_plugin_state_facts(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<bool, ReadinessRejection> {
+        let mut readiness = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
+        let result = readiness.merge_plugin_state_facts(payload);
+        if matches!(result, Ok(true)) {
+            let (sequence, records) = readiness.next_readiness_snapshot();
+            drop(readiness);
+            self.broadcast_readiness_snapshot(sequence, records);
+        }
+        result
     }
 
     pub(crate) fn readiness_events(&self) -> tokio::sync::broadcast::Receiver<ReadinessEvent> {
