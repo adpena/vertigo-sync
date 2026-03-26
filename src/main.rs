@@ -3847,10 +3847,18 @@ mod tests {
             .find("function Runtime.initInstancePool()")
             .expect("instance pool initialization should follow state reporting");
         let body = &PLUGIN_SOURCE[state_reporting_start..state_reporting_end];
+        let preview_project_helper_start = PLUGIN_SOURCE
+            .find("local function decodePreviewProjectFacts()")
+            .expect("plugin preview project decoder should exist");
+        let preview_project_helper_body = &PLUGIN_SOURCE[preview_project_helper_start..state_reporting_end];
 
         assert!(
             body.contains("connection = {"),
             "embedded plugin should publish a connection fact envelope"
+        );
+        assert!(
+            body.contains("preview_runtime = {"),
+            "embedded plugin should publish the canonical preview_runtime readiness facts"
         );
         assert!(
             body.contains("sync_status = currentStatus")
@@ -3858,6 +3866,12 @@ mod tests {
                 && body.contains("ws_connected = wsConnected")
                 && body.contains("has_ever_connected = hasEverConnected"),
             "embedded plugin should publish connection-local facts, not a derived readiness verdict"
+        );
+        assert!(
+            body.contains("project_loaded = PROJECT.loaded")
+                && body.contains("preview_runtime = {")
+                && body.contains("project_loaded = PROJECT.loaded"),
+            "embedded plugin should mirror project load state into the canonical preview_runtime envelope"
         );
         assert!(
             body.contains("project_loaded = PROJECT.loaded"),
@@ -3868,6 +3882,12 @@ mod tests {
                 && body.contains("snapshot_apply_in_progress =")
                 && body.contains("plugin_command_busy ="),
             "embedded plugin should publish snapshot and command busy facts for server-owned readiness evaluation"
+        );
+        assert!(
+            body.contains("preview_project = previewProjectFacts")
+                && preview_project_helper_body.contains("VertigoPreviewTelemetryJson")
+                && preview_project_helper_body.contains("HttpService:JSONDecode"),
+            "embedded plugin should forward canonical preview_project telemetry from Workspace"
         );
         assert!(
             !body.contains("ready =")
@@ -3916,9 +3936,17 @@ mod tests {
             .find("function Runtime.initInstancePool()")
             .expect("instance pool initialization should follow state reporting");
         let body = &source[state_reporting_start..state_reporting_end];
+        let preview_project_helper_start = source
+            .find("local function decodePreviewProjectFacts()")
+            .expect("plugin preview project decoder should exist");
+        let preview_project_helper_body = &source[preview_project_helper_start..state_reporting_end];
         assert!(
             body.contains("connection = {"),
             "plugin source module should publish a connection fact envelope"
+        );
+        assert!(
+            body.contains("preview_runtime = {"),
+            "plugin source module should publish the canonical preview_runtime readiness facts"
         );
         assert!(
             body.contains("sync_status = currentStatus")
@@ -3926,6 +3954,12 @@ mod tests {
                 && body.contains("ws_connected = wsConnected")
                 && body.contains("has_ever_connected = hasEverConnected"),
             "plugin source module should publish connection-local facts, not a derived readiness verdict"
+        );
+        assert!(
+            body.contains("project_loaded = PROJECT.loaded")
+                && body.contains("preview_runtime = {")
+                && body.contains("project_loaded = PROJECT.loaded"),
+            "plugin source module should mirror project load state into the canonical preview_runtime envelope"
         );
         assert!(
             body.contains("project_loaded = PROJECT.loaded"),
@@ -3936,6 +3970,12 @@ mod tests {
                 && body.contains("snapshot_apply_in_progress =")
                 && body.contains("plugin_command_busy ="),
             "plugin source module should publish snapshot and command busy facts for server-owned readiness evaluation"
+        );
+        assert!(
+            body.contains("preview_project = previewProjectFacts")
+                && preview_project_helper_body.contains("VertigoPreviewTelemetryJson")
+                && preview_project_helper_body.contains("HttpService:JSONDecode"),
+            "plugin source module should forward canonical preview_project telemetry from Workspace"
         );
         assert!(
             !body.contains("ready =")

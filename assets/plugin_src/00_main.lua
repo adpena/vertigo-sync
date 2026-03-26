@@ -2307,6 +2307,27 @@ function Runtime.tickEditPreview()
 	end
 end
 
+local function decodePreviewProjectFacts(): { [string]: any }?
+	local encoded: any = Workspace:GetAttribute("VertigoPreviewTelemetryJson")
+	if type(encoded) ~= "string" or encoded == "" then
+		return nil
+	end
+
+	local decodeOk, decoded = pcall(function()
+		return HttpService:JSONDecode(encoded)
+	end)
+	if not decodeOk or type(decoded) ~= "table" then
+		return nil
+	end
+
+	local projectFacts: any = decoded.projectFacts
+	if type(projectFacts) ~= "table" then
+		return nil
+	end
+
+	return projectFacts
+end
+
 function Runtime.reportPluginState(force: boolean?)
 	local now: number = os.clock()
 	if not force and now - lastStateReportAt < STATE_REPORT_INTERVAL_SECONDS then
@@ -2316,9 +2337,22 @@ function Runtime.reportPluginState(force: boolean?)
 
 	local queueDepth: number = math.max(#pendingQueue - pendingQueueHead + 1, 0)
 	local fetchQueueDepth: number = math.max(#fetchQueue - fetchQueueHead + 1, 0)
+	local previewProjectFacts = decodePreviewProjectFacts()
 
 	local payload: { [string]: any } = {
 		plugin_version = CORE.PLUGIN_VERSION,
+		preview_runtime = {
+			studio_connected = true,
+			plugin_attached = true,
+			project_loaded = PROJECT.loaded,
+			sync_status = currentStatus,
+			connection = {
+				sync_status = currentStatus,
+				ws_connected = wsConnected,
+				has_ever_connected = hasEverConnected,
+			},
+		},
+		preview_project = previewProjectFacts,
 		connection = {
 			sync_status = currentStatus,
 			transport_mode = transportMode,
