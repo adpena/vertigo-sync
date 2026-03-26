@@ -13,9 +13,9 @@ use vertigo_sync::project::parse_project;
 use vertigo_sync::server::{ServeOptions, run_serve};
 use vertigo_sync::validate;
 use vertigo_sync::{
-    DiffEvent, EventDiffCounts, EventPaths, append_event, build_snapshot, diff_snapshots,
-    next_event_seq, read_snapshot, run_doctor, run_health_doctor, run_watch, run_watch_native,
-    write_json_file,
+    DiffEvent, EventDiffCounts, EventPaths, GlobIgnoreSet, append_event, build_snapshot,
+    diff_snapshots, next_event_seq, read_snapshot, run_doctor, run_health_doctor, run_watch,
+    run_watch_native, write_json_file,
 };
 
 #[derive(Debug, Parser)]
@@ -1967,6 +1967,7 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
     let project_path = project_context.project_path;
     let project_root = project_context.project_root;
     let tree = project_context.tree;
+    let glob_ignores = GlobIgnoreSet::new(&tree.glob_ignore_paths);
 
     output::header("Build");
     output::kv("Project", &project_path.display().to_string());
@@ -2091,8 +2092,11 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
 
         let fs_full = project_root.join(&mapping.fs_path);
         if fs_full.is_dir() {
-            populate_from_dir(&mut dom, parent_ref, &fs_full, &project_root)?;
+            populate_from_dir(&mut dom, parent_ref, &fs_full, &project_root, &glob_ignores)?;
         } else if fs_full.is_file() {
+            if glob_ignores.is_ignored(&normalize_project_path(Path::new(&mapping.fs_path))) {
+                continue;
+            }
             populate_file(&mut dom, parent_ref, &fs_full)?;
         }
     }
@@ -2855,7 +2859,8 @@ fn populate_from_dir(
     dom: &mut rbx_dom_weak::WeakDom,
     parent_ref: rbx_dom_weak::types::Ref,
     dir: &Path,
-    _root: &Path,
+    root: &Path,
+    ignores: &GlobIgnoreSet,
 ) -> Result<()> {
     use vertigo_sync::project::resolve_instance_class;
 
@@ -2896,6 +2901,10 @@ fn populate_from_dir(
         }
 
         if path.is_dir() {
+            if !dir_has_buildable_content(&path, root, ignores)? {
+                continue;
+            }
+
             let class = resolve_container_class(&path);
 
             let folder_ref = dom.insert(
@@ -2913,24 +2922,48 @@ fn populate_from_dir(
                 "init.lua",
             ] {
                 let init_path = path.join(init_name);
-                if init_path.exists() {
-                    if let Ok(source) = std::fs::read_to_string(&init_path)
-                        && let Some(inst) = dom.get_by_ref_mut(folder_ref)
-                    {
-                        inst.properties.insert(
-                            "Source".into(),
-                            rbx_dom_weak::types::Variant::String(source),
-                        );
-                    }
-                    break;
+                if !init_path.exists() {
+                    continue;
                 }
+
+                let rel_path = init_path.strip_prefix(root).with_context(|| {
+                    format!(
+                        "failed to strip root {} from {}",
+                        root.display(),
+                        init_path.display()
+                    )
+                })?;
+                if ignores.is_ignored(&normalize_project_path(rel_path)) {
+                    continue;
+                }
+
+                if let Ok(source) = std::fs::read_to_string(&init_path)
+                    && let Some(inst) = dom.get_by_ref_mut(folder_ref)
+                {
+                    inst.properties.insert(
+                        "Source".into(),
+                        rbx_dom_weak::types::Variant::String(source),
+                    );
+                }
+                break;
             }
 
             // Recurse into subdirectory (skip init scripts).
-            populate_from_dir(dom, folder_ref, &path, _root)?;
+            populate_from_dir(dom, folder_ref, &path, root, ignores)?;
         } else if path.is_file() {
             // Skip init scripts (already handled by parent directory).
             if name_str.starts_with("init.") {
+                continue;
+            }
+
+            let rel_path = path.strip_prefix(root).with_context(|| {
+                format!(
+                    "failed to strip root {} from {}",
+                    root.display(),
+                    path.display()
+                )
+            })?;
+            if ignores.is_ignored(&normalize_project_path(rel_path)) {
                 continue;
             }
 
@@ -3031,6 +3064,71 @@ fn populate_from_dir(
     }
 
     Ok(())
+}
+
+fn dir_has_buildable_content(dir: &Path, root: &Path, ignores: &GlobIgnoreSet) -> Result<bool> {
+    use vertigo_sync::project::resolve_instance_class;
+
+    let rel_path = dir.strip_prefix(root).with_context(|| {
+        format!(
+            "failed to strip root {} from {}",
+            root.display(),
+            dir.display()
+        )
+    })?;
+
+    if ignores.is_ignored(&normalize_project_path(rel_path)) {
+        return Ok(false);
+    }
+
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+
+        if name_str.starts_with('.') || name_str.ends_with(".meta.json") {
+            continue;
+        }
+
+        if path.is_dir() {
+            if dir_has_buildable_content(&path, root, ignores)? {
+                return Ok(true);
+            }
+            continue;
+        }
+
+        let rel_path = path.strip_prefix(root).with_context(|| {
+            format!(
+                "failed to strip root {} from {}",
+                root.display(),
+                path.display()
+            )
+        })?;
+        if ignores.is_ignored(&normalize_project_path(rel_path)) {
+            continue;
+        }
+
+        if name_str.starts_with("init.") {
+            return Ok(true);
+        }
+
+        let class = resolve_instance_class(&name_str);
+        if class != "Skip" {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn normalize_project_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 /// Apply InstanceMeta properties to a builder.
@@ -3295,7 +3393,14 @@ mod tests {
         let root_ref = dom.root_ref();
         let parent_ref = dom.insert(root_ref, InstanceBuilder::new("Folder").with_name("Test"));
 
-        populate_from_dir(&mut dom, parent_ref, &src, temp.path()).expect("populate");
+        populate_from_dir(
+            &mut dom,
+            parent_ref,
+            &src,
+            temp.path(),
+            &vertigo_sync::GlobIgnoreSet::empty(),
+        )
+        .expect("populate");
 
         let parent = dom.get_by_ref(parent_ref).unwrap();
         let child_names: Vec<String> = parent
@@ -3351,7 +3456,14 @@ mod tests {
         let root_ref = dom.root_ref();
         let parent_ref = dom.insert(root_ref, InstanceBuilder::new("Folder").with_name("Test"));
 
-        populate_from_dir(&mut dom, parent_ref, &src, temp.path()).expect("populate");
+        populate_from_dir(
+            &mut dom,
+            parent_ref,
+            &src,
+            temp.path(),
+            &vertigo_sync::GlobIgnoreSet::empty(),
+        )
+        .expect("populate");
 
         let parent = dom.get_by_ref(parent_ref).unwrap();
         let child_names: Vec<String> = parent
@@ -4328,6 +4440,66 @@ mod tests {
         assert_eq!(
             attributes.get("VertigoSyncEnabled"),
             Some(&Variant::Bool(true))
+        );
+    }
+
+    #[test]
+    fn build_honors_glob_ignore_paths_for_mapped_files_and_directories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let project_path = root.join("default.project.json");
+        let output_path = root.join("out/test.rbxlx");
+        let sample_data = root.join("src/ServerStorage/SampleData");
+        let ignored_chunks = sample_data.join("AustinManifestChunks");
+
+        fs::create_dir_all(&ignored_chunks).expect("create ignored subtree");
+        fs::write(
+            sample_data.join("AustinManifestIndex.lua"),
+            "-- ignore me index payload",
+        )
+        .expect("write ignored file");
+        fs::write(
+            ignored_chunks.join("Chunk1.lua"),
+            "-- ignore me chunk payload",
+        )
+        .expect("write ignored subtree file");
+        fs::write(sample_data.join("Keep.lua"), "-- keep me").expect("write kept file");
+
+        fs::write(
+            &project_path,
+            serde_json::to_vec_pretty(&json!({
+                "name": "IgnoreBuild",
+                "globIgnorePaths": [
+                    "src/ServerStorage/SampleData/AustinManifestIndex.lua",
+                    "src/ServerStorage/SampleData/AustinManifestChunks/**"
+                ],
+                "tree": {
+                    "$className": "DataModel",
+                    "ServerStorage": {
+                        "$className": "ServerStorage",
+                        "$path": "src/ServerStorage"
+                    }
+                }
+            }))
+            .expect("serialize project"),
+        )
+        .expect("write project");
+
+        command_build(root, &output_path, Path::new("default.project.json"), false)
+            .expect("build project with ignores");
+
+        let output = fs::read_to_string(&output_path).expect("read built rbxlx");
+        assert!(
+            !output.contains("AustinManifestIndex.lua"),
+            "ignored file should not appear in rbxlx output"
+        );
+        assert!(
+            !output.contains("AustinManifestChunks"),
+            "ignored subtree should not appear in rbxlx output"
+        );
+        assert!(
+            output.contains("Keep.lua") || output.contains("Keep"),
+            "expected kept file to remain in rbxlx output"
         );
     }
 }
