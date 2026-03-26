@@ -30,7 +30,10 @@ use sha2::{Digest, Sha256};
 use crate::project::parse_project;
 use crate::rbxl::RbxlLoader;
 use crate::validate;
-use crate::{ServerState, build_snapshot, diff_snapshots, run_doctor, run_health_doctor};
+use crate::{
+    CommandReadinessExpectation, ReadinessTarget, ServerState, build_snapshot, diff_snapshots,
+    run_doctor, run_health_doctor,
+};
 
 // ---------------------------------------------------------------------------
 // Tool definition helpers
@@ -537,6 +540,12 @@ pub async fn handle_mcp_tools() -> Json<Vec<serde_json::Value>> {
                     "wait",
                     "boolean",
                     "Wait for plugin acknowledgment (default false, max 10s)",
+                    false,
+                ),
+                param(
+                    "readiness",
+                    "object",
+                    "Optional readiness precondition object with expected_target, expected_epoch, and expected_incarnation_id",
                     false,
                 ),
             ],
@@ -3865,6 +3874,7 @@ mod tests {
             id: "cmd-1".into(),
             command: "toggle_sync".into(),
             params: serde_json::Value::Null,
+            readiness: None,
             created_at_epoch: 0.0,
             created_at: Some(std::time::Instant::now()),
         };
@@ -3881,6 +3891,51 @@ mod tests {
     }
 
     #[test]
+    fn plugin_command_enqueue_and_drain_rejects_stale_readiness_expectations() {
+        let state = make_test_state();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        runtime.block_on(async {
+            let mut edit_sync = state.current_readiness(crate::ReadinessTarget::EditSync);
+            edit_sync.ready = true;
+            edit_sync.status_class = crate::ReadinessStatusClass::Ready;
+            edit_sync.code = "ready".to_string();
+            edit_sync.reason = None;
+            state.update_readiness(edit_sync).expect("edit_sync ready");
+
+            let mut preview = state.current_readiness(crate::ReadinessTarget::Preview);
+            preview.ready = true;
+            preview.status_class = crate::ReadinessStatusClass::Ready;
+            preview.code = "ready".to_string();
+            preview.reason = None;
+            state.update_readiness(preview).expect("preview ready");
+
+            state.advance_readiness_epoch_if_invalidated(crate::ReadinessTarget::Preview, true);
+            let current = state.current_readiness(crate::ReadinessTarget::Preview);
+
+            let result = exec_sync_plugin_command(
+                &state,
+                &serde_json::json!({
+                    "command": "run_builders",
+                    "params": {},
+                    "wait": false,
+                    "readiness": {
+                        "expected_target": current.target,
+                        "expected_epoch": current.epoch,
+                        "expected_incarnation_id": current.incarnation_id,
+                    }
+                }),
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err((StatusCode::PRECONDITION_FAILED, _))
+            ));
+        });
+    }
+
+    #[test]
     fn plugin_command_gc_expires_old() {
         let state = make_test_state();
         // Insert a command with a created_at far in the past.
@@ -3888,6 +3943,7 @@ mod tests {
             id: "old-cmd".into(),
             command: "force_resync".into(),
             params: serde_json::Value::Null,
+            readiness: None,
             created_at_epoch: 0.0,
             created_at: Some(std::time::Instant::now() - std::time::Duration::from_secs(120)),
         };
@@ -3895,6 +3951,7 @@ mod tests {
             id: "fresh-cmd".into(),
             command: "toggle_sync".into(),
             params: serde_json::Value::Null,
+            readiness: None,
             created_at_epoch: 0.0,
             created_at: Some(std::time::Instant::now()),
         };
@@ -3935,6 +3992,7 @@ mod tests {
                     id: format!("cmd-{i}"),
                     command: "toggle_sync".into(),
                     params: serde_json::Value::Null,
+                    readiness: None,
                     created_at_epoch: 0.0,
                     created_at: Some(std::time::Instant::now()),
                 });
@@ -4424,6 +4482,33 @@ fn exec_sync_plugin_managed(
 // Plugin command channel
 // ---------------------------------------------------------------------------
 
+fn plugin_command_readiness_target(command: &str) -> Option<ReadinessTarget> {
+    match command {
+        "run_builders" | "time_travel" => Some(ReadinessTarget::Preview),
+        _ => None,
+    }
+}
+
+fn parse_command_readiness(
+    args: &serde_json::Value,
+) -> Result<Option<CommandReadinessExpectation>, (StatusCode, String)> {
+    match args.get("readiness") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) if value.is_object() => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid readiness precondition: {error}"),
+                )
+            }),
+        Some(_) => Err((
+            StatusCode::BAD_REQUEST,
+            "readiness must be an object when provided".to_string(),
+        )),
+    }
+}
+
 async fn exec_sync_plugin_command(
     state: &Arc<ServerState>,
     args: &serde_json::Value,
@@ -4465,6 +4550,28 @@ async fn exec_sync_plugin_command(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let wait = args["wait"].as_bool().unwrap_or(false);
+    let readiness = parse_command_readiness(args)?;
+    let command_target = plugin_command_readiness_target(&command);
+
+    if command_target.is_some() && readiness.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "missing required param: readiness".to_string(),
+        ));
+    }
+
+    if let Some(readiness) = &readiness {
+        let expectation = readiness.to_readiness_expectation();
+        let validation_target = command_target.unwrap_or(readiness.expected_target);
+        state
+            .validate_readiness_expectation(validation_target, &expectation)
+            .map_err(|rejection| {
+                (
+                    StatusCode::PRECONDITION_FAILED,
+                    format!("readiness precondition rejected: {rejection:?}"),
+                )
+            })?;
+    }
 
     // GC expired commands first.
     state.gc_plugin_commands();
@@ -4480,6 +4587,7 @@ async fn exec_sync_plugin_command(
         id: cmd_id.clone(),
         command: command.clone(),
         params,
+        readiness,
         created_at_epoch: epoch,
         created_at: Some(now),
     };

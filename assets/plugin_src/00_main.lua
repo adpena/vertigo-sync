@@ -837,22 +837,37 @@ function Runtime.isEditPreviewSuspended(): (boolean, string?)
 	return false, nil
 end
 
-function Runtime.updateProjectReadinessAttributes()
-	local ready, code, message = Runtime.evaluateProjectReadiness()
-	Workspace:SetAttribute("VertigoSyncProjectReadinessReady", ready)
-	Workspace:SetAttribute("VertigoSyncProjectReadinessCode", code)
-	Workspace:SetAttribute("VertigoSyncProjectReadinessMessage", message)
+local pluginCommandBusy: boolean = false
 
-	local nextKey = string.format("%s::%s", code, message)
-	if nextKey == PROJECT.lastReadinessKey then
-		return
-	end
-	PROJECT.lastReadinessKey = nextKey
-	if ready then
-		info(string.format("Project readiness: %s", message))
+function Runtime.updatePluginFactAttributes()
+	Workspace:SetAttribute("VertigoSyncProjectReadinessReady", nil)
+	Workspace:SetAttribute("VertigoSyncProjectReadinessCode", nil)
+	Workspace:SetAttribute("VertigoSyncProjectReadinessMessage", nil)
+	Workspace:SetAttribute("VertigoSyncPluginConnectionStatus", currentStatus)
+	Workspace:SetAttribute("VertigoSyncPluginTransportMode", transportMode)
+	Workspace:SetAttribute("VertigoSyncPluginConnected", currentStatus == "connected")
+	Workspace:SetAttribute("VertigoSyncPluginProjectLoaded", PROJECT.loaded)
+	Workspace:SetAttribute("VertigoSyncPluginSnapshotHash", lastHash)
+	Workspace:SetAttribute("VertigoSyncPluginSnapshotApplyInProgress", HISTORY.busy or fetchInFlight > 0)
+	Workspace:SetAttribute("VertigoSyncPluginCommandBusy", pluginCommandBusy)
+
+	local snapshotState: string
+	if HISTORY.fetchFailed then
+		snapshotState = "fetch_failed"
+	elseif HISTORY.busy then
+		snapshotState = "apply_in_progress"
+	elseif HISTORY.active then
+		snapshotState = "historical"
+	elseif resyncRequested then
+		snapshotState = "resync_requested"
+	elseif fetchInFlight > 0 then
+		snapshotState = "fetching"
+	elseif PROJECT.loaded then
+		snapshotState = "live"
 	else
-		warnMsg(string.format("Project readiness blocked (%s): %s", code, message))
+		snapshotState = "project_pending"
 	end
+	Workspace:SetAttribute("VertigoSyncPluginSnapshotState", snapshotState)
 end
 
 local function setStatusAttributes(status: SyncStatus, hash: string?)
@@ -862,7 +877,7 @@ local function setStatusAttributes(status: SyncStatus, hash: string?)
 		Workspace:SetAttribute("VertigoSyncHash", hash)
 	end
 	Workspace:SetAttribute("VertigoSyncLastUpdate", os.date("!%Y-%m-%dT%H:%M:%SZ"))
-	Runtime.updateProjectReadinessAttributes()
+	Runtime.updatePluginFactAttributes()
 end
 
 local function setProjectStatus(mode: ProjectBootstrapMode, message: string, projectName: string?, blocked: boolean)
@@ -879,7 +894,7 @@ local function setProjectStatus(mode: ProjectBootstrapMode, message: string, pro
 	Workspace:SetAttribute("VertigoSyncProjectMismatch", mode == "mismatch")
 	Workspace:SetAttribute("VertigoSyncProjectMappingCount", PROJECT.mappingCount)
 	Workspace:SetAttribute("VertigoSyncEmitLegacyScripts", PROJECT.emitLegacyScripts)
-	Runtime.updateProjectReadinessAttributes()
+	Runtime.updatePluginFactAttributes()
 
 	if mode == "mismatch" and message ~= "" then
 		local toastKey = "mismatch::" .. message
@@ -1759,6 +1774,9 @@ end
 
 -- @native
 local function processPluginCommands(commands: { any })
+	pluginCommandBusy = true
+	Runtime.updatePluginFactAttributes()
+	Runtime.reportPluginState(true)
 	for _, cmd in commands do
 		if type(cmd) ~= "table" or type(cmd.command) ~= "string" then
 			continue
@@ -1918,6 +1936,9 @@ local function processPluginCommands(commands: { any })
 		-- Ack the command back to the server
 		task.defer(ackPluginCommand, cmdId, success, message)
 	end
+	pluginCommandBusy = false
+	Runtime.updatePluginFactAttributes()
+	Runtime.reportPluginState(true)
 end
 
 -- ─── State Reporting (POST to server, never crashes, never logs on failure) ─
@@ -2286,52 +2307,52 @@ function Runtime.tickEditPreview()
 	end
 end
 
-function Runtime.reportPluginState()
+function Runtime.reportPluginState(force: boolean?)
 	local now: number = os.clock()
-	if now - lastStateReportAt < STATE_REPORT_INTERVAL_SECONDS then
+	if not force and now - lastStateReportAt < STATE_REPORT_INTERVAL_SECONDS then
 		return
 	end
 	lastStateReportAt = now
 
 	local queueDepth: number = math.max(#pendingQueue - pendingQueueHead + 1, 0)
 	local fetchQueueDepth: number = math.max(#fetchQueue - fetchQueueHead + 1, 0)
-	local managedCount: number = 0
-	for _ in managedIndex do
-		managedCount += 1
-	end
-
-	local builderLastRebuild: number? = Workspace:GetAttribute("VertigoBuilderLastRebuild") :: number?
-	local builderLastPath: string? = Workspace:GetAttribute("VertigoBuilderLastRebuildPath") :: string?
 
 	local payload: { [string]: any } = {
 		plugin_version = CORE.PLUGIN_VERSION,
-		status = currentStatus,
-		transport = transportMode,
-		hash = lastHash,
-		queue_depth = queueDepth,
-		fetch_queue_depth = fetchQueueDepth,
-		fetch_in_flight = fetchInFlight,
-		applies_per_second = appliedPerSecond,
-		apply_budget_ms = math.floor(adaptiveApplyBudgetSeconds * 1000 + 0.5),
-		apply_cost_us = math.floor(applyCostEwmaSeconds * 1000000 + 0.5),
-		reconnects = reconnectCount,
-		lagged_events = laggedEvents,
-		dropped_updates = droppedUpdates,
-		managed_count = managedCount,
-		time_travel_active = HISTORY.active,
-		time_travel_seq = if HISTORY.active then HISTORY.currentIndex else nil,
-		binary_models_enabled = SETTINGS.binaryModels,
-		builders_enabled = BUILDERS.enabled,
-		builders_last_rebuild = builderLastRebuild,
-		builders_last_path = builderLastPath,
-		project_mode = PROJECT.mode,
-		project_name = PROJECT.name,
-		project_message = PROJECT.message,
-		project_blocked = PROJECT.blocked,
-		project_mapping_count = PROJECT.mappingCount,
-		project_emit_legacy_scripts = PROJECT.emitLegacyScripts,
-		studio_mode = describeStudioMode(),
-		uptime_seconds = math.floor(now - pluginBootTime + 0.5),
+		connection = {
+			sync_status = currentStatus,
+			transport_mode = transportMode,
+			ws_connected = wsConnected,
+			has_ever_connected = hasEverConnected,
+			reconnect_attempt = connectionReconnectAttempt,
+		},
+		project_loaded = PROJECT.loaded,
+		snapshot_state = {
+			state = if HISTORY.fetchFailed
+				then "fetch_failed"
+				elseif HISTORY.busy
+				then "apply_in_progress"
+				elseif HISTORY.active
+				then "historical"
+				elseif resyncRequested
+				then "resync_requested"
+				elseif fetchInFlight > 0
+				then "fetching"
+				elseif PROJECT.loaded
+				then "live"
+				else "project_pending",
+			hash = lastHash,
+			history_loaded = HISTORY.loaded,
+			history_active = HISTORY.active,
+			history_busy = HISTORY.busy,
+			fetch_failed = HISTORY.fetchFailed,
+			fetch_in_flight = fetchInFlight,
+			fetch_queue_depth = fetchQueueDepth,
+			pending_queue_depth = queueDepth,
+			resync_requested = resyncRequested,
+		},
+		snapshot_apply_in_progress = HISTORY.busy or fetchInFlight > 0,
+		plugin_command_busy = pluginCommandBusy,
 	}
 
 	pcall(function()
@@ -7038,12 +7059,9 @@ end)
 -- ─── State Reporting Loop (3s timer, independent of sync) ────────────────────
 
 task.spawn(function()
-	-- Wait for initial connection before first report
 	task.wait(STATE_REPORT_INTERVAL_SECONDS)
 	while true do
-		if currentStatus == "connected" then
-			Runtime.reportPluginState()
-		end
+		Runtime.reportPluginState()
 		task.wait(STATE_REPORT_INTERVAL_SECONDS)
 	end
 end)

@@ -5,6 +5,8 @@
 //!   GET  /snapshot           — current snapshot JSON (or exact historical snapshot via ?at=...)
 //!   GET  /diff?since=<hash>  — diff from historical hash to current
 //!   GET  /events             — SSE stream of SyncDiffEvent
+//!   GET  /readiness?target=...        — authoritative readiness record
+//!   GET  /readiness/events?target=... — SSE stream of readiness records
 //!   GET  /sources/content    — batched source fetch for high-rate hotload
 //!   POST /sync/patch         — apply file patches, return ack
 //!   GET  /validate            — run source validation, return report
@@ -31,6 +33,7 @@ use base64::Engine;
 use serde::Deserialize;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use sha2::{Digest, Sha256};
@@ -38,8 +41,8 @@ use sha2::{Digest, Sha256};
 use crate::mcp::{handle_mcp_execute, handle_mcp_tools};
 use crate::serve_rbxl::{new_shared_rbxl_state, rbxl_router};
 use crate::{
-    EventCoalescer, GlobIgnoreSet, ServerState, ServerStateOptions, Snapshot, SnapshotDiff,
-    build_snapshot, build_snapshot_with_ignores,
+    EventCoalescer, GlobIgnoreSet, ReadinessRecord, ReadinessTarget, ServerState,
+    ServerStateOptions, Snapshot, SnapshotDiff, build_snapshot, build_snapshot_with_ignores,
 };
 use std::sync::atomic::Ordering;
 
@@ -235,6 +238,8 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/snapshot", get(handle_snapshot))
         .route("/diff", get(handle_diff))
         .route("/events", get(handle_events))
+        .route("/readiness", get(handle_readiness))
+        .route("/readiness/events", get(handle_readiness_events))
         .route("/ws", get(handle_ws))
         .route("/sources", get(handle_sources))
         .route("/sources/content", get(handle_sources_content))
@@ -428,13 +433,14 @@ async fn handle_post_plugin_state(
     State(state): State<Arc<ServerState>>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, axum::response::Response) {
-    *state.plugin_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(body);
+    *state.plugin_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(body.clone());
     *state
         .plugin_state_at
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    let _ = state.merge_plugin_state_facts(&body);
 
-    let commands = state.drain_plugin_commands();
+    let commands = state.drain_ready_plugin_commands();
     if commands.is_empty() {
         (
             StatusCode::NO_CONTENT,
@@ -592,6 +598,72 @@ async fn handle_events(
             .interval(Duration::from_secs(15))
             .text("ping"),
     )
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReadinessQuery {
+    target: ReadinessTarget,
+}
+
+fn readiness_event(record: ReadinessRecord) -> Event {
+    let data = serde_json::to_string(&record).unwrap_or_else(|_| "{}".to_string());
+    Event::default().event("readiness").data(data)
+}
+
+async fn handle_readiness(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<ReadinessQuery>,
+) -> Json<ReadinessRecord> {
+    Json(state.current_readiness(query.target))
+}
+
+async fn handle_readiness_events(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<ReadinessQuery>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let stream = readiness_records_stream(state, query.target, || {})
+        .map(|record| Ok(readiness_event(record)));
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+fn readiness_records_stream<F>(
+    state: Arc<ServerState>,
+    target: ReadinessTarget,
+    before_initial_snapshot: F,
+) -> impl tokio_stream::Stream<Item = ReadinessRecord>
+where
+    F: FnOnce(),
+{
+    let rx = state.readiness_events();
+    before_initial_snapshot();
+    let (baseline_sequence, initial_record) = state.current_readiness_snapshot(target);
+    let initial = tokio_stream::iter([initial_record]);
+    let mut last_sequence = baseline_sequence;
+    let updates = BroadcastStream::new(rx).filter_map(move |result| {
+        let state = state.clone();
+        match result {
+            Ok(event) if event.record.target == target => {
+                if event.sequence <= last_sequence {
+                    None
+                } else {
+                    last_sequence = event.sequence;
+                    Some(event.record)
+                }
+            }
+            Err(BroadcastStreamRecvError::Lagged(_)) => {
+                let (sequence, record) = state.current_readiness_snapshot(target);
+                last_sequence = sequence;
+                Some(record)
+            }
+            _ => None,
+        }
+    });
+    initial.chain(updates)
 }
 
 // ---------------------------------------------------------------------------
@@ -1609,11 +1681,15 @@ fn resolve_patch_target(source_root: &Path, raw_path: &str) -> anyhow::Result<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReadinessStatusClass;
     use base64::Engine;
     use serde_json::json;
     use std::fs;
     use std::path::Path;
+    use std::time::Duration;
     use tempfile::tempdir;
+    use tokio::time::timeout;
+    use tokio_stream::StreamExt;
 
     fn write_project(path: &Path, name: &str, source_root: &str) {
         if let Some(parent) = path.parent() {
@@ -1742,6 +1818,70 @@ mod tests {
 
         assert_eq!(error.0, StatusCode::NOT_FOUND);
         assert!(error.1.contains("active snapshot"));
+    }
+
+    #[tokio::test]
+    async fn readiness_event_stream_subscribes_before_initial_snapshot() {
+        let root_dir = tempdir().expect("tempdir");
+        let includes: Vec<String> = Vec::new();
+        let snapshot = build_snapshot(root_dir.path(), &includes).expect("snapshot");
+        let state = ServerState::with_full_config(
+            root_dir.path().to_path_buf(),
+            includes,
+            snapshot,
+            ServerStateOptions {
+                channel_capacity: 64,
+                turbo: false,
+                coalesce_ms: 50,
+                binary_models: false,
+                glob_ignores: crate::GlobIgnoreSet::empty(),
+                project_path: Some(root_dir.path().join("default.project.json")),
+            },
+        );
+
+        state
+            .update_readiness({
+                let mut record = state.current_readiness(ReadinessTarget::EditSync);
+                record.ready = true;
+                record.status_class = ReadinessStatusClass::Ready;
+                record.code = "ready".to_string();
+                record.reason = None;
+                record
+            })
+            .expect("seed edit_sync");
+
+        let hook_state = state.clone();
+        let mut stream =
+            readiness_records_stream(state.clone(), ReadinessTarget::Preview, move || {
+                let mut record = hook_state.current_readiness(ReadinessTarget::Preview);
+                record.ready = true;
+                record.status_class = ReadinessStatusClass::Ready;
+                record.code = "ready".to_string();
+                record.reason = None;
+                hook_state
+                    .update_readiness(record)
+                    .expect("publish preview");
+
+                let mut record = hook_state.current_readiness(ReadinessTarget::Preview);
+                record.ready = false;
+                record.status_class = ReadinessStatusClass::Blocked;
+                record.code = "preview_not_ready".to_string();
+                record.reason = Some("preview_not_ready".to_string());
+                hook_state
+                    .update_readiness(record)
+                    .expect("publish stale preview state");
+            });
+
+        let first_record = stream.next().await.expect("first readiness record");
+        assert_eq!(first_record.target, ReadinessTarget::Preview);
+        assert!(!first_record.ready);
+        assert_eq!(first_record.status_class, ReadinessStatusClass::Blocked);
+        assert_eq!(first_record.code, "preview_not_ready");
+        assert_eq!(first_record.reason, Some("preview_not_ready".to_string()));
+
+        timeout(Duration::from_millis(100), stream.next())
+            .await
+            .expect_err("stale queued readiness records must not follow a newer initial snapshot");
     }
 
     #[test]

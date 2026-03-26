@@ -3840,45 +3840,68 @@ mod tests {
 
     #[test]
     fn embedded_plugin_contains_generic_project_readiness_contract() {
+        let state_reporting_start = PLUGIN_SOURCE
+            .find("function Runtime.reportPluginState(force: boolean?)")
+            .expect("plugin state reporter should exist");
+        let state_reporting_end = PLUGIN_SOURCE
+            .find("function Runtime.initInstancePool()")
+            .expect("instance pool initialization should follow state reporting");
+        let body = &PLUGIN_SOURCE[state_reporting_start..state_reporting_end];
+
         assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncProjectReadinessCode"),
-            "embedded plugin should expose a generic project readiness code"
+            body.contains("connection = {"),
+            "embedded plugin should publish a connection fact envelope"
         );
         assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncProjectReadinessReady"),
-            "embedded plugin should expose whether the current project state is actually ready"
+            body.contains("sync_status = currentStatus")
+                && body.contains("transport_mode = transportMode")
+                && body.contains("ws_connected = wsConnected")
+                && body.contains("has_ever_connected = hasEverConnected"),
+            "embedded plugin should publish connection-local facts, not a derived readiness verdict"
         );
         assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncProjectReadinessMessage"),
-            "embedded plugin should expose a generic project readiness message"
+            body.contains("project_loaded = PROJECT.loaded"),
+            "embedded plugin should publish whether the project is loaded"
         );
         assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncWebSocketAvailable"),
-            "embedded plugin should expose websocket transport capability"
+            body.contains("snapshot_state = {")
+                && body.contains("snapshot_apply_in_progress =")
+                && body.contains("plugin_command_busy ="),
+            "embedded plugin should publish snapshot and command busy facts for server-owned readiness evaluation"
         );
         assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncEditPreviewEnabled"),
-            "embedded plugin should expose whether edit preview is configured"
+            !body.contains("ready =")
+                && !body.contains("status_class =")
+                && !body.contains("code =")
+                && !body.contains("incarnation_id ="),
+            "embedded plugin must not publish server-owned readiness outputs from Runtime.reportPluginState()"
         );
         assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncEditPreviewSuspended"),
-            "embedded plugin should expose a generic workspace-level preview suspension contract"
+            !body.contains("VertigoSyncProjectReadinessReady")
+                && !body.contains("VertigoSyncProjectReadinessCode")
+                && !body.contains("VertigoSyncProjectReadinessMessage")
+                && !body.contains("project_mode = PROJECT.mode")
+                && !body.contains("project_message = PROJECT.message")
+                && !body.contains("project_blocked = PROJECT.blocked")
+                && !body.contains("builders_enabled = BUILDERS.enabled")
+                && !body.contains("time_travel_active = HISTORY.active"),
+            "embedded plugin must not shadow server-owned readiness outputs or publish project-owned readiness heuristics"
+        );
+
+        let loop_start = PLUGIN_SOURCE
+            .find("-- ─── State Reporting Loop (3s timer, independent of sync) ────────────────────")
+            .expect("state reporting loop should exist");
+        let loop_end = PLUGIN_SOURCE
+            .find("-- ─── Managed Index Reporting Loop (30s timer) ────────────────────────────────")
+            .expect("managed index reporting loop should exist");
+        let loop_body = &PLUGIN_SOURCE[loop_start..loop_end];
+        assert!(
+            loop_body.contains("Runtime.reportPluginState()"),
+            "embedded plugin should keep state reporting active even when disconnected or errored"
         );
         assert!(
-            PLUGIN_SOURCE.contains("VertigoSyncPreviewInvalidationEpoch"),
-            "embedded plugin should expose a generic preview invalidation epoch for geometry-affecting history transitions"
-        );
-        assert!(
-            PLUGIN_SOURCE.contains("\"project_bootstrap_pending\""),
-            "embedded plugin should expose a precise bootstrapping readiness code"
-        );
-        assert!(
-            PLUGIN_SOURCE.contains("\"sync_disabled\""),
-            "embedded plugin should expose a precise sync-disabled readiness code"
-        );
-        assert!(
-            PLUGIN_SOURCE.contains("Waiting for /project"),
-            "embedded plugin should surface a precise bootstrapping readiness message"
+            !loop_body.contains("currentStatus == \"connected\""),
+            "embedded plugin should not gate state reporting on connected status"
         );
     }
 
@@ -3886,33 +3909,93 @@ mod tests {
     fn plugin_source_module_contains_generic_project_readiness_contract() {
         let source = std::fs::read_to_string("assets/plugin_src/00_main.lua")
             .expect("plugin source module should be readable");
+        let state_reporting_start = source
+            .find("function Runtime.reportPluginState(force: boolean?)")
+            .expect("plugin state reporter should exist");
+        let state_reporting_end = source
+            .find("function Runtime.initInstancePool()")
+            .expect("instance pool initialization should follow state reporting");
+        let body = &source[state_reporting_start..state_reporting_end];
         assert!(
-            source.contains("VertigoSyncProjectReadinessCode"),
-            "plugin source module should expose a generic project readiness code"
+            body.contains("connection = {"),
+            "plugin source module should publish a connection fact envelope"
         );
         assert!(
-            source.contains("VertigoSyncProjectReadinessReady"),
-            "plugin source module should expose whether the project is actually ready"
+            body.contains("sync_status = currentStatus")
+                && body.contains("transport_mode = transportMode")
+                && body.contains("ws_connected = wsConnected")
+                && body.contains("has_ever_connected = hasEverConnected"),
+            "plugin source module should publish connection-local facts, not a derived readiness verdict"
         );
         assert!(
-            source.contains("VertigoSyncProjectReadinessMessage"),
-            "plugin source module should expose a generic project readiness message"
+            body.contains("project_loaded = PROJECT.loaded"),
+            "plugin source module should publish whether the project is loaded"
         );
         assert!(
-            source.contains("\"project_bootstrap_pending\""),
-            "plugin source module should expose a precise bootstrapping readiness code"
+            body.contains("snapshot_state = {")
+                && body.contains("snapshot_apply_in_progress =")
+                && body.contains("plugin_command_busy ="),
+            "plugin source module should publish snapshot and command busy facts for server-owned readiness evaluation"
         );
         assert!(
-            source.contains("\"sync_disabled\""),
-            "plugin source module should expose a precise sync-disabled readiness code"
+            !body.contains("ready =")
+                && !body.contains("status_class =")
+                && !body.contains("code =")
+                && !body.contains("incarnation_id ="),
+            "plugin source module must not publish server-owned readiness outputs from Runtime.reportPluginState()"
         );
         assert!(
-            source.contains("VertigoSyncEditPreviewSuspended"),
-            "plugin source module should expose a generic workspace-level preview suspension contract"
+            !body.contains("VertigoSyncProjectReadinessReady")
+                && !body.contains("VertigoSyncProjectReadinessCode")
+                && !body.contains("VertigoSyncProjectReadinessMessage")
+                && !body.contains("project_mode = PROJECT.mode")
+                && !body.contains("project_message = PROJECT.message")
+                && !body.contains("project_blocked = PROJECT.blocked")
+                && !body.contains("builders_enabled = BUILDERS.enabled")
+                && !body.contains("time_travel_active = HISTORY.active"),
+            "plugin source module must not shadow server-owned readiness outputs or publish project-owned readiness heuristics"
+        );
+
+        let loop_start = source
+            .find("-- ─── State Reporting Loop (3s timer, independent of sync) ────────────────────")
+            .expect("state reporting loop should exist");
+        let loop_end = source
+            .find("-- ─── Managed Index Reporting Loop (30s timer) ────────────────────────────────")
+            .expect("managed index reporting loop should exist");
+        let loop_body = &source[loop_start..loop_end];
+        assert!(
+            loop_body.contains("Runtime.reportPluginState()"),
+            "plugin source module should keep state reporting active even when disconnected or errored"
         );
         assert!(
-            source.contains("VertigoSyncPreviewInvalidationEpoch"),
-            "plugin source module should expose a generic preview invalidation epoch for geometry-affecting history transitions"
+            !loop_body.contains("currentStatus == \"connected\""),
+            "plugin source module should not gate state reporting on connected status"
+        );
+
+        let command_start = source
+            .find("local function processPluginCommands(commands: { any })")
+            .expect("plugin command processor should exist");
+        let command_end = source[command_start..]
+            .find("-- ─── State Reporting (POST to server, never crashes, never logs on failure) ─")
+            .map(|offset| command_start + offset)
+            .expect("state reporting section should follow the command processor");
+        let command_body = &source[command_start..command_end];
+        let busy_true = command_body
+            .find("pluginCommandBusy = true")
+            .expect("busy flag should be raised before command execution");
+        let busy_flush = command_body
+            .find("Runtime.reportPluginState(true)")
+            .expect("busy fact should be force-published while commands are in flight");
+        let busy_false = command_body
+            .rfind("pluginCommandBusy = false")
+            .expect("busy flag should be cleared after command execution");
+        assert!(
+            busy_true < busy_flush && busy_flush < busy_false,
+            "plugin command busy facts should be published while command execution is in flight"
+        );
+        assert!(
+            command_body.contains("Runtime.updatePluginFactAttributes()"),
+            "plugin command busy transitions should update observable workspace facts"
         );
     }
 
