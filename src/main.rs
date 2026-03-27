@@ -1987,7 +1987,15 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
         let segments: Vec<&str> = mapping.instance_path.split('.').collect();
 
         let mut parent_ref = data_model_ref;
+        let mut current_instance_path = String::new();
         for (i, segment) in segments.iter().enumerate() {
+            if current_instance_path.is_empty() {
+                current_instance_path.push_str(segment);
+            } else {
+                current_instance_path.push('.');
+                current_instance_path.push_str(segment);
+            }
+
             let existing = dom.get_by_ref(parent_ref).and_then(|inst| {
                 inst.children()
                     .iter()
@@ -2002,18 +2010,24 @@ fn command_build(root: &Path, output: &Path, project: &Path, _binary_models: boo
             parent_ref = if let Some(existing_ref) = existing {
                 existing_ref
             } else {
-                let class = if i == 0 {
-                    mapping.class_name.as_str()
-                } else if i == segments.len() - 1 {
-                    let fs_full = project_root.join(&mapping.fs_path);
-                    if fs_full.is_dir() {
-                        resolve_container_class(&fs_full)
-                    } else {
-                        resolve_instance_class(&mapping.fs_path)
-                    }
-                } else {
-                    segment
-                };
+                let class = tree
+                    .node_classes
+                    .get(&current_instance_path)
+                    .map(|value| value.as_str())
+                    .unwrap_or_else(|| {
+                        if i == 0 {
+                            mapping.class_name.as_str()
+                        } else if i == segments.len() - 1 {
+                            let fs_full = project_root.join(&mapping.fs_path);
+                            if fs_full.is_dir() {
+                                resolve_container_class(&fs_full)
+                            } else {
+                                resolve_instance_class(&mapping.fs_path)
+                            }
+                        } else {
+                            segment
+                        }
+                    });
 
                 let mut builder = InstanceBuilder::new(class).with_name(*segment);
 
@@ -3732,6 +3746,7 @@ mod tests {
                 name: "Game".to_string(),
                 project_id: "proj-123".to_string(),
                 mappings: vec![],
+                node_classes: std::collections::BTreeMap::new(),
                 glob_ignore_paths: vec![],
                 emit_legacy_scripts: true,
                 serve_port: Some(34872),
@@ -3930,6 +3945,16 @@ mod tests {
                 || PLUGIN_SOURCE.contains("local function isManagedMutationInstance"),
             "embedded plugin should keep generic edit-preview readiness and managed-mutation guards"
         );
+        assert!(
+            PLUGIN_SOURCE.contains("return false, \"snapshot_pending\""),
+            "embedded plugin should keep edit preview blocked until the initial snapshot is reconciled"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains(
+                "lastHash == nil or resyncRequested or HISTORY.busy or fetchInFlight > 0"
+            ),
+            "embedded plugin should gate edit preview bootstrap on settled snapshot state"
+        );
     }
 
     #[test]
@@ -3960,9 +3985,10 @@ mod tests {
             .expect("instance pool initialization should follow state reporting");
         let body = &PLUGIN_SOURCE[state_reporting_start..state_reporting_end];
         let preview_project_helper_start = PLUGIN_SOURCE
-            .find("local function decodePreviewProjectFacts()")
+            .find("local function decodePreviewProjectTelemetry()")
             .expect("plugin preview project decoder should exist");
-        let preview_project_helper_body = &PLUGIN_SOURCE[preview_project_helper_start..state_reporting_end];
+        let preview_project_helper_body =
+            &PLUGIN_SOURCE[preview_project_helper_start..state_reporting_end];
 
         assert!(
             body.contains("connection = {"),
@@ -3997,9 +4023,10 @@ mod tests {
         );
         assert!(
             body.contains("preview_project = previewProjectFacts")
+                && body.contains("preview_project_snapshot = previewProjectSnapshot")
                 && preview_project_helper_body.contains("VertigoPreviewTelemetryJson")
                 && preview_project_helper_body.contains("HttpService:JSONDecode"),
-            "embedded plugin should forward canonical preview_project telemetry from Workspace"
+            "embedded plugin should forward canonical preview_project facts and snapshot telemetry from Workspace"
         );
         assert!(
             !body.contains("ready =")
@@ -4021,10 +4048,14 @@ mod tests {
         );
 
         let loop_start = PLUGIN_SOURCE
-            .find("-- ─── State Reporting Loop (3s timer, independent of sync) ────────────────────")
+            .find(
+                "-- ─── State Reporting Loop (3s timer, independent of sync) ────────────────────",
+            )
             .expect("state reporting loop should exist");
         let loop_end = PLUGIN_SOURCE
-            .find("-- ─── Managed Index Reporting Loop (30s timer) ────────────────────────────────")
+            .find(
+                "-- ─── Managed Index Reporting Loop (30s timer) ────────────────────────────────",
+            )
             .expect("managed index reporting loop should exist");
         let loop_body = &PLUGIN_SOURCE[loop_start..loop_end];
         assert!(
@@ -4049,9 +4080,10 @@ mod tests {
             .expect("instance pool initialization should follow state reporting");
         let body = &source[state_reporting_start..state_reporting_end];
         let preview_project_helper_start = source
-            .find("local function decodePreviewProjectFacts()")
+            .find("local function decodePreviewProjectTelemetry()")
             .expect("plugin preview project decoder should exist");
-        let preview_project_helper_body = &source[preview_project_helper_start..state_reporting_end];
+        let preview_project_helper_body =
+            &source[preview_project_helper_start..state_reporting_end];
         assert!(
             body.contains("connection = {"),
             "plugin source module should publish a connection fact envelope"
@@ -4085,9 +4117,10 @@ mod tests {
         );
         assert!(
             body.contains("preview_project = previewProjectFacts")
+                && body.contains("preview_project_snapshot = previewProjectSnapshot")
                 && preview_project_helper_body.contains("VertigoPreviewTelemetryJson")
                 && preview_project_helper_body.contains("HttpService:JSONDecode"),
-            "plugin source module should forward canonical preview_project telemetry from Workspace"
+            "plugin source module should forward canonical preview_project facts and snapshot telemetry from Workspace"
         );
         assert!(
             !body.contains("ready =")
@@ -4109,10 +4142,14 @@ mod tests {
         );
 
         let loop_start = source
-            .find("-- ─── State Reporting Loop (3s timer, independent of sync) ────────────────────")
+            .find(
+                "-- ─── State Reporting Loop (3s timer, independent of sync) ────────────────────",
+            )
             .expect("state reporting loop should exist");
         let loop_end = source
-            .find("-- ─── Managed Index Reporting Loop (30s timer) ────────────────────────────────")
+            .find(
+                "-- ─── Managed Index Reporting Loop (30s timer) ────────────────────────────────",
+            )
             .expect("managed index reporting loop should exist");
         let loop_body = &source[loop_start..loop_end];
         assert!(
@@ -4199,6 +4236,52 @@ mod tests {
     }
 
     #[test]
+    fn plugin_source_module_skips_project_bootstrap_preview_for_non_preview_runall_specs() {
+        let source = std::fs::read_to_string("assets/plugin_src/00_main.lua")
+            .expect("plugin source module should be readable");
+        assert!(
+            source.contains("function Runtime.shouldSkipProjectBootstrapEditPreviewBuild"),
+            "plugin source module should expose an explicit project_bootstrap gate for isolated non-preview RunAll specs"
+        );
+        assert!(
+            source.contains("ServerScriptService.Tests.RunAllConfig")
+                && source.contains("specNameFilter")
+                && source.contains("string.find(specNameFilter, \"Preview\", 1, true)"),
+            "plugin source module should detect isolated non-preview RunAll spec filters from project state"
+        );
+        assert!(
+            source.contains(
+                "Runtime.recordEditPreviewSkip(\"project_bootstrap\", \"spec_filter_non_preview\")"
+            ) && source.contains("Runtime.scheduleEditPreviewBuild(\"project_bootstrap\")"),
+            "plugin source module should skip only the bootstrap preview build for isolated non-preview specs while preserving the normal bootstrap path"
+        );
+    }
+
+    #[test]
+    fn plugin_source_module_suppresses_background_preview_during_runall_suite_execution() {
+        let source = std::fs::read_to_string("assets/plugin_src/00_main.lua")
+            .expect("plugin source module should be readable");
+        assert!(
+            source.contains("function Runtime.isRunAllSuiteActive")
+                && source.contains("Workspace:GetAttribute(\"VertigoSyncRunAllActive\") == true"),
+            "plugin source module should expose a workspace-driven RunAll suite guard for background preview work"
+        );
+        assert!(
+            source.contains("return false, \"runall_suite_active\""),
+            "plugin source module should reject background edit-preview readiness while the RunAll suite guard is active"
+        );
+        assert!(
+            source.contains("Workspace:GetAttributeChangedSignal(\"VertigoSyncRunAllActive\")")
+                && source.contains("Runtime.cancelPendingEditPreviewBuild(\"runall_suite_active\")"),
+            "plugin source module should cancel queued preview work when the RunAll suite guard activates"
+        );
+        assert!(
+            source.contains("PROJECT.editPreview.initialBuildQueued = false"),
+            "plugin source module should re-arm the bootstrap preview build after the RunAll suite guard clears"
+        );
+    }
+
+    #[test]
     fn embedded_plugin_filters_non_geometry_edit_preview_source_churn() {
         assert!(
             PLUGIN_SOURCE.contains("function Runtime.isEditPreviewGeometryAffectingInstance"),
@@ -4210,6 +4293,48 @@ mod tests {
                 && PLUGIN_SOURCE.contains("fullName == \"Lighting\"")
                 && PLUGIN_SOURCE.contains("non_geometry_source"),
             "embedded plugin should suppress non-geometry ImportService source churn from preview rebuild triggers"
+        );
+    }
+
+    #[test]
+    fn embedded_plugin_skips_project_bootstrap_preview_for_non_preview_runall_specs() {
+        assert!(
+            PLUGIN_SOURCE.contains("function Runtime.shouldSkipProjectBootstrapEditPreviewBuild"),
+            "embedded plugin should expose an explicit project_bootstrap gate for isolated non-preview RunAll specs"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("ServerScriptService.Tests.RunAllConfig")
+                && PLUGIN_SOURCE.contains("specNameFilter")
+                && PLUGIN_SOURCE.contains("string.find(specNameFilter, \"Preview\", 1, true)"),
+            "embedded plugin should detect isolated non-preview RunAll spec filters from project state"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains(
+                "Runtime.recordEditPreviewSkip(\"project_bootstrap\", \"spec_filter_non_preview\")"
+            ) && PLUGIN_SOURCE.contains("Runtime.scheduleEditPreviewBuild(\"project_bootstrap\")"),
+            "embedded plugin should skip only the bootstrap preview build for isolated non-preview specs while preserving the normal bootstrap path"
+        );
+    }
+
+    #[test]
+    fn embedded_plugin_suppresses_background_preview_during_runall_suite_execution() {
+        assert!(
+            PLUGIN_SOURCE.contains("function Runtime.isRunAllSuiteActive")
+                && PLUGIN_SOURCE.contains("Workspace:GetAttribute(\"VertigoSyncRunAllActive\") == true"),
+            "embedded plugin should expose a workspace-driven RunAll suite guard for background preview work"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("return false, \"runall_suite_active\""),
+            "embedded plugin should reject background edit-preview readiness while the RunAll suite guard is active"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("Workspace:GetAttributeChangedSignal(\"VertigoSyncRunAllActive\")")
+                && PLUGIN_SOURCE.contains("Runtime.cancelPendingEditPreviewBuild(\"runall_suite_active\")"),
+            "embedded plugin should cancel queued preview work when the RunAll suite guard activates"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("PROJECT.editPreview.initialBuildQueued = false"),
+            "embedded plugin should re-arm the bootstrap preview build after the RunAll suite guard clears"
         );
     }
 
@@ -4500,6 +4625,61 @@ mod tests {
         assert!(
             output.contains("Keep.lua") || output.contains("Keep"),
             "expected kept file to remain in rbxlx output"
+        );
+    }
+
+    #[test]
+    fn build_preserves_service_class_for_unmapped_parent_nodes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let project_path = root.join("default.project.json");
+        let output_path = root.join("out/test.rbxlx");
+        let starter_player_scripts = root.join("src/StarterPlayer/StarterPlayerScripts");
+        fs::create_dir_all(&starter_player_scripts).expect("create starter player source dir");
+        fs::write(
+            starter_player_scripts.join("Bootstrap.client.luau"),
+            "return nil",
+        )
+        .expect("write local script");
+
+        fs::write(
+            &project_path,
+            serde_json::to_vec_pretty(&json!({
+                "name": "StarterPlayerBuild",
+                "tree": {
+                    "$className": "DataModel",
+                    "StarterPlayer": {
+                        "$className": "StarterPlayer",
+                        "StarterPlayerScripts": {
+                            "$className": "StarterPlayerScripts",
+                            "$path": "src/StarterPlayer/StarterPlayerScripts"
+                        }
+                    }
+                }
+            }))
+            .expect("serialize project"),
+        )
+        .expect("write project");
+
+        command_build(root, &output_path, Path::new("default.project.json"), false)
+            .expect("build project with starter player");
+
+        let output = fs::read_to_string(&output_path).expect("read built rbxlx");
+        assert!(
+            output.contains("<Item class=\"StarterPlayer\"")
+                && output.contains("<string name=\"Name\">StarterPlayer</string>"),
+            "build should preserve StarterPlayer as the top-level service"
+        );
+        assert!(
+            output.contains("<Item class=\"StarterPlayerScripts\"")
+                && output.contains("<string name=\"Name\">StarterPlayerScripts</string>"),
+            "build should preserve StarterPlayerScripts as the nested child service"
+        );
+        assert!(
+            !output.contains(
+                "<Item class=\"StarterPlayerScripts\" referent=\"8076\">\n    <Properties>\n      <string name=\"Name\">StarterPlayer</string>"
+            ),
+            "build should not invert StarterPlayer and StarterPlayerScripts"
         );
     }
 }

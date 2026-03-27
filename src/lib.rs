@@ -818,8 +818,99 @@ impl ReadinessState {
 
     fn full_bake_result_is_ready(project: &PreviewProjectFullBakeFacts) -> Option<bool> {
         let active = project.active?;
-        let last_result = project.last_result.as_ref()?;
+        let last_result = project.last_result.as_ref().cloned().flatten();
         Some(!active && last_result.as_deref() == Some("success"))
+    }
+
+    fn replace_non_ready_record(
+        &mut self,
+        target: ReadinessTarget,
+        code: &str,
+        reason: Option<String>,
+    ) -> Result<bool, ReadinessRejection> {
+        let current = self.current_readiness(target);
+        if !current.ready
+            && current.status_class == ReadinessStatusClass::Transient
+            && current.code == code
+            && current.reason == reason
+        {
+            return Ok(false);
+        }
+
+        let record = Self::non_ready_record(
+            target,
+            &self.incarnation_id,
+            current.epoch,
+            ReadinessStatusClass::Transient,
+            code,
+            reason,
+        );
+        self.update_readiness(record)?;
+        Ok(true)
+    }
+
+    fn preview_pending_record(
+        preview: &PreviewProjectPreviewFacts,
+    ) -> (&'static str, Option<String>) {
+        if preview.build_active == Some(true) {
+            return (
+                "preview_build_active",
+                Some("preview_build_active".to_string()),
+            );
+        }
+
+        if preview.state_apply_pending == Some(true) {
+            return (
+                "preview_state_apply_pending",
+                Some("preview_state_apply_pending".to_string()),
+            );
+        }
+
+        if let Some(sync_state) = preview.sync_state.as_deref() {
+            if sync_state != "idle" {
+                return (
+                    "preview_sync_pending",
+                    Some(format!("preview_sync_{sync_state}")),
+                );
+            }
+        }
+
+        (
+            "preview_not_settled",
+            Some("preview_not_settled".to_string()),
+        )
+    }
+
+    fn full_bake_start_pending_record(
+        full_bake: &PreviewProjectFullBakeFacts,
+    ) -> (&'static str, Option<String>) {
+        if full_bake.active == Some(true) {
+            return ("full_bake_active", Some("full_bake_active".to_string()));
+        }
+
+        (
+            "full_bake_start_pending",
+            Some("full_bake_start_pending".to_string()),
+        )
+    }
+
+    fn full_bake_result_pending_record(
+        full_bake: &PreviewProjectFullBakeFacts,
+    ) -> (&'static str, Option<String>) {
+        if full_bake.active == Some(true) {
+            return ("full_bake_active", Some("full_bake_active".to_string()));
+        }
+
+        match full_bake.last_result.as_ref() {
+            Some(Some(result)) if !result.trim().is_empty() => (
+                "full_bake_result_pending",
+                Some(format!("full_bake_result_{}", result.trim())),
+            ),
+            _ => (
+                "full_bake_result_pending",
+                Some("full_bake_result_pending".to_string()),
+            ),
+        }
     }
 
     pub fn merge_plugin_state_facts(
@@ -849,10 +940,8 @@ impl ReadinessState {
 
         if let Some(project) = facts.preview_project.as_ref() {
             let project_signature = serde_json::to_string(project).unwrap_or_default();
-            let project_is_fresh = self
-                .last_project_signature
-                .as_deref()
-                != Some(project_signature.as_str());
+            let project_is_fresh =
+                self.last_project_signature.as_deref() != Some(project_signature.as_str());
             if project_is_fresh {
                 self.last_project_signature = Some(project_signature);
 
@@ -866,6 +955,13 @@ impl ReadinessState {
                             } else {
                                 self.invalidate_target(ReadinessTarget::Preview);
                             }
+                        } else if !preview_ready {
+                            let (code, reason) = Self::preview_pending_record(preview_section);
+                            changed |= self.replace_non_ready_record(
+                                ReadinessTarget::Preview,
+                                code,
+                                reason,
+                            )?;
                         }
                     }
                 }
@@ -882,6 +978,14 @@ impl ReadinessState {
                             } else {
                                 self.invalidate_target(ReadinessTarget::FullBakeStart);
                             }
+                        } else if !full_bake_start_ready {
+                            let (code, reason) =
+                                Self::full_bake_start_pending_record(full_bake_section);
+                            changed |= self.replace_non_ready_record(
+                                ReadinessTarget::FullBakeStart,
+                                code,
+                                reason,
+                            )?;
                         }
                     }
 
@@ -893,8 +997,8 @@ impl ReadinessState {
                             let full_bake_start =
                                 self.current_readiness(ReadinessTarget::FullBakeStart);
                             if edit_sync.ready && full_bake_start.ready {
-                                let _ =
-                                    self.record_successful_full_bake_start_for_current_incarnation();
+                                let _ = self
+                                    .record_successful_full_bake_start_for_current_incarnation();
                             }
                         }
 
@@ -906,6 +1010,14 @@ impl ReadinessState {
                             } else {
                                 self.invalidate_target(ReadinessTarget::FullBakeResult);
                             }
+                        } else if !full_bake_result_ready {
+                            let (code, reason) =
+                                Self::full_bake_result_pending_record(full_bake_section);
+                            changed |= self.replace_non_ready_record(
+                                ReadinessTarget::FullBakeResult,
+                                code,
+                                reason,
+                            )?;
                         }
                     }
                 }
@@ -2134,11 +2246,7 @@ impl ServerState {
         queue.drain(..).collect()
     }
 
-    fn record_plugin_command_rejection(
-        &self,
-        command_id: &str,
-        rejection: ReadinessRejection,
-    ) {
+    fn record_plugin_command_rejection(&self, command_id: &str, rejection: ReadinessRejection) {
         let mut acks = self
             .plugin_command_acks
             .lock()
@@ -2169,10 +2277,7 @@ impl ServerState {
         for command in drained {
             if let Some(readiness) = &command.readiness {
                 let expectation = readiness.to_readiness_expectation();
-                match self.validate_readiness_expectation(
-                    readiness.expected_target,
-                    &expectation,
-                ) {
+                match self.validate_readiness_expectation(readiness.expected_target, &expectation) {
                     Ok(()) => accepted.push(command),
                     Err(rejection) => {
                         self.record_plugin_command_rejection(&command.id, rejection);

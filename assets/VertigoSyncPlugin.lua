@@ -840,6 +840,11 @@ function Runtime.isEditPreviewSuspended(): (boolean, string?)
 	return false, nil
 end
 
+@native
+function Runtime.isRunAllSuiteActive(): boolean
+	return Workspace:GetAttribute("VertigoSyncRunAllActive") == true
+end
+
 local pluginCommandBusy: boolean = false
 
 function Runtime.updatePluginFactAttributes()
@@ -1997,9 +2002,15 @@ function Runtime.isEditPreviewReady(): (boolean, string?)
 	if suspended then
 		return false, suspendReason or "suspended"
 	end
+	if Runtime.isRunAllSuiteActive() then
+		return false, "runall_suite_active"
+	end
 	local ready, code, _message = Runtime.evaluateProjectReadiness()
 	if not ready then
 		return false, code
+	end
+	if lastHash == nil or resyncRequested or HISTORY.busy or fetchInFlight > 0 then
+		return false, "snapshot_pending"
 	end
 	return true, nil
 end
@@ -2017,6 +2028,25 @@ function Runtime.recordEditPreviewSkip(reason: string, context: string)
 	editPreview.lastSkipSignature = signature
 	editPreview.lastSkipAt = now
 	info(string.format("Skipping preview rebuild (%s, %s): mode=%s", reason, context, mode))
+end
+
+function Runtime.shouldSkipProjectBootstrapEditPreviewBuild(): boolean
+	local runAllConfig = Runtime.findByInstancePath("ServerScriptService.Tests.RunAllConfig")
+	if runAllConfig == nil or not runAllConfig:IsA("ModuleScript") then
+		return false
+	end
+
+	local ok, config = pcall(require, runAllConfig)
+	if not ok or type(config) ~= "table" then
+		return false
+	end
+
+	local specNameFilter = (config :: any).specNameFilter
+	if type(specNameFilter) ~= "string" or specNameFilter == "" then
+		return false
+	end
+
+	return string.find(specNameFilter, "Preview", 1, true) == nil
 end
 
 function Runtime.cancelPendingEditPreviewBuild(reason: string)
@@ -2306,29 +2336,33 @@ function Runtime.tickEditPreview()
 	local ready = Runtime.isEditPreviewReady()
 	if not editPreview.initialBuildQueued and ready then
 		editPreview.initialBuildQueued = true
-		Runtime.scheduleEditPreviewBuild("project_bootstrap")
+		if Runtime.shouldSkipProjectBootstrapEditPreviewBuild() then
+			Runtime.recordEditPreviewSkip("project_bootstrap", "spec_filter_non_preview")
+		else
+			Runtime.scheduleEditPreviewBuild("project_bootstrap")
+		end
 	end
 end
 
-local function decodePreviewProjectFacts(): { [string]: any }?
+local function decodePreviewProjectTelemetry(): ({ [string]: any }?, { [string]: any }?)
 	local encoded: any = Workspace:GetAttribute("VertigoPreviewTelemetryJson")
 	if type(encoded) ~= "string" or encoded == "" then
-		return nil
+		return nil, nil
 	end
 
 	local decodeOk, decoded = pcall(function()
 		return HttpService:JSONDecode(encoded)
 	end)
 	if not decodeOk or type(decoded) ~= "table" then
-		return nil
+		return nil, nil
 	end
 
 	local projectFacts: any = decoded.projectFacts
 	if type(projectFacts) ~= "table" then
-		return nil
+		return decoded, nil
 	end
 
-	return projectFacts
+	return decoded, projectFacts
 end
 
 function Runtime.reportPluginState(force: boolean?)
@@ -2340,7 +2374,7 @@ function Runtime.reportPluginState(force: boolean?)
 
 	local queueDepth: number = math.max(#pendingQueue - pendingQueueHead + 1, 0)
 	local fetchQueueDepth: number = math.max(#fetchQueue - fetchQueueHead + 1, 0)
-	local previewProjectFacts = decodePreviewProjectFacts()
+	local previewProjectSnapshot, previewProjectFacts = decodePreviewProjectTelemetry()
 
 	local payload: { [string]: any } = {
 		plugin_version = CORE.PLUGIN_VERSION,
@@ -2356,6 +2390,7 @@ function Runtime.reportPluginState(force: boolean?)
 			},
 		},
 		preview_project = previewProjectFacts,
+		preview_project_snapshot = previewProjectSnapshot,
 		connection = {
 			sync_status = currentStatus,
 			transport_mode = transportMode,
@@ -7006,6 +7041,15 @@ Workspace:GetAttributeChangedSignal("VertigoSyncEditPreviewSuspended"):Connect(f
 	if Workspace:GetAttribute("VertigoSyncEditPreviewSuspended") == true then
 		Runtime.cancelPendingEditPreviewBuild("workspace_suspended")
 		Runtime.clearEditPreviewWatchers()
+	else
+		PROJECT.editPreview.nextRootRefreshAt = 0.0
+		PROJECT.editPreview.initialBuildQueued = false
+	end
+end)
+
+Workspace:GetAttributeChangedSignal("VertigoSyncRunAllActive"):Connect(function()
+	if Workspace:GetAttribute("VertigoSyncRunAllActive") == true then
+		Runtime.cancelPendingEditPreviewBuild("runall_suite_active")
 	else
 		PROJECT.editPreview.nextRootRefreshAt = 0.0
 		PROJECT.editPreview.initialBuildQueued = false

@@ -900,7 +900,7 @@ mod readiness_contract_test {
 
         #[tokio::test]
         async fn readiness_contract_test_preview_project_facts_drive_preview_and_full_bake_readiness()
-        {
+         {
             let (_root, state) = test_server_state();
             let (base_url, server) = spawn_server(state.clone()).await;
             let client = Client::new();
@@ -942,12 +942,20 @@ mod readiness_contract_test {
                 "expected project facts to drive preview readiness once edit_sync is satisfied"
             );
             assert_eq!(
-                get_json(&client, &format!("{base_url}/readiness?target=full_bake_start")).await["ready"],
+                get_json(
+                    &client,
+                    &format!("{base_url}/readiness?target=full_bake_start")
+                )
+                .await["ready"],
                 true,
                 "expected settled project facts to make full_bake_start ready when prerequisites are met"
             );
             assert_eq!(
-                get_json(&client, &format!("{base_url}/readiness?target=full_bake_result")).await["ready"],
+                get_json(
+                    &client,
+                    &format!("{base_url}/readiness?target=full_bake_result")
+                )
+                .await["ready"],
                 false,
                 "expected full_bake_result to remain false until a successful result is reported"
             );
@@ -956,8 +964,71 @@ mod readiness_contract_test {
         }
 
         #[tokio::test]
+        async fn readiness_contract_test_initial_non_ready_project_facts_replace_bootstrap_plugin_unavailable()
+         {
+            let (_root, state) = test_server_state();
+            let (base_url, server) = spawn_server(state.clone()).await;
+            let client = Client::new();
+
+            let status = post_status(
+                &client,
+                &format!("{base_url}/plugin/state"),
+                &serde_json::json!({
+                    "preview_runtime": {
+                        "studio_connected": true,
+                        "plugin_attached": true,
+                        "project_loaded": true,
+                        "sync_status": "connected"
+                    },
+                    "preview_project": {
+                        "preview": {
+                            "build_active": true,
+                            "state_apply_pending": false,
+                            "sync_state": "scheduled"
+                        },
+                        "full_bake": {
+                            "active": false,
+                            "last_result": null
+                        }
+                    }
+                }),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::NO_CONTENT);
+
+            let preview = get_json(&client, &format!("{base_url}/readiness?target=preview")).await;
+            assert_eq!(preview["ready"], false);
+            assert_ne!(
+                preview["code"], "plugin_unavailable",
+                "expected initial preview project facts to replace the bootstrap plugin_unavailable record"
+            );
+            assert_ne!(
+                preview["reason"], "plugin_unavailable",
+                "expected initial preview project facts to replace the bootstrap plugin_unavailable reason"
+            );
+
+            let full_bake_result = get_json(
+                &client,
+                &format!("{base_url}/readiness?target=full_bake_result"),
+            )
+            .await;
+            assert_eq!(full_bake_result["ready"], false);
+            assert_ne!(
+                full_bake_result["code"], "plugin_unavailable",
+                "expected initial full_bake project facts to replace the bootstrap plugin_unavailable record"
+            );
+            assert_ne!(
+                full_bake_result["reason"], "plugin_unavailable",
+                "expected initial full_bake project facts to replace the bootstrap plugin_unavailable reason"
+            );
+
+            server.abort();
+        }
+
+        #[tokio::test]
         async fn readiness_contract_test_prerequisite_invalidation_keeps_dependent_targets_false_even_with_stale_project_facts()
-        {
+         {
             let (_root, state) = test_server_state();
             let (base_url, server) = spawn_server(state.clone()).await;
             let client = Client::new();
@@ -991,12 +1062,15 @@ mod readiness_contract_test {
                 true
             );
             assert_eq!(
-                get_json(&client, &format!("{base_url}/readiness?target=full_bake_start")).await["ready"],
+                get_json(
+                    &client,
+                    &format!("{base_url}/readiness?target=full_bake_start")
+                )
+                .await["ready"],
                 true
             );
 
-            state
-                .advance_readiness_epoch_if_invalidated(ReadinessTarget::EditSync, true);
+            state.advance_readiness_epoch_if_invalidated(ReadinessTarget::EditSync, true);
 
             assert_eq!(
                 post_status(&client, &format!("{base_url}/plugin/state"), &ready_payload).await,
@@ -1009,12 +1083,20 @@ mod readiness_contract_test {
                 "expected stale project facts not to resurrect preview readiness after a prerequisite invalidation"
             );
             assert_eq!(
-                get_json(&client, &format!("{base_url}/readiness?target=full_bake_start")).await["ready"],
+                get_json(
+                    &client,
+                    &format!("{base_url}/readiness?target=full_bake_start")
+                )
+                .await["ready"],
                 false,
                 "expected stale project facts not to resurrect full_bake_start readiness after a prerequisite invalidation"
             );
             assert_eq!(
-                get_json(&client, &format!("{base_url}/readiness?target=full_bake_result")).await["ready"],
+                get_json(
+                    &client,
+                    &format!("{base_url}/readiness?target=full_bake_result")
+                )
+                .await["ready"],
                 false,
                 "expected stale project facts not to resurrect full_bake_result readiness after a prerequisite invalidation"
             );
@@ -1049,11 +1131,17 @@ mod readiness_contract_test {
             });
 
             assert_eq!(
-                post_status(&client, &format!("{base_url}/plugin/state"), &settled_payload).await,
+                post_status(
+                    &client,
+                    &format!("{base_url}/plugin/state"),
+                    &settled_payload
+                )
+                .await,
                 StatusCode::NO_CONTENT
             );
 
-            let initial_preview = get_json(&client, &format!("{base_url}/readiness?target=preview")).await;
+            let initial_preview =
+                get_json(&client, &format!("{base_url}/readiness?target=preview")).await;
             assert_eq!(initial_preview["ready"], true);
             let initial_epoch = initial_preview["epoch"].as_u64().expect("preview epoch");
 
@@ -1079,11 +1167,17 @@ mod readiness_contract_test {
             });
 
             assert_eq!(
-                post_status(&client, &format!("{base_url}/plugin/state"), &state_only_churn).await,
+                post_status(
+                    &client,
+                    &format!("{base_url}/plugin/state"),
+                    &state_only_churn
+                )
+                .await,
                 StatusCode::NO_CONTENT
             );
 
-            let updated_preview = get_json(&client, &format!("{base_url}/readiness?target=preview")).await;
+            let updated_preview =
+                get_json(&client, &format!("{base_url}/readiness?target=preview")).await;
             assert_eq!(updated_preview["ready"], true);
             assert_eq!(
                 updated_preview["epoch"].as_u64().expect("preview epoch"),
@@ -1099,9 +1193,9 @@ mod readiness_contract_test {
         use super::super::*;
         use std::sync::Arc;
 
+        use axum::Json;
         use axum::extract::State;
         use axum::http::StatusCode;
-        use axum::Json;
         use reqwest::Client;
         use serde_json::Value;
         use tempfile::tempdir;
@@ -1322,7 +1416,8 @@ mod readiness_contract_test {
                 validation_sink ^= ready_expectation.epoch;
                 black_box(validation_sink);
             }
-            let validation_ns_per_op = validation_start.elapsed().as_nanos() as f64 / iterations as f64;
+            let validation_ns_per_op =
+                validation_start.elapsed().as_nanos() as f64 / iterations as f64;
 
             state.rotate_readiness_incarnation("studio_restart");
             let stale_current = state.current_readiness(ReadinessTarget::Preview);

@@ -3928,10 +3928,7 @@ mod tests {
             )
             .await;
 
-            assert!(matches!(
-                result,
-                Err((StatusCode::PRECONDITION_FAILED, _))
-            ));
+            assert!(matches!(result, Err((StatusCode::PRECONDITION_FAILED, _))));
         });
     }
 

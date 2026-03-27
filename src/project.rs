@@ -19,6 +19,10 @@ pub struct ProjectTree {
     pub name: String,
     pub project_id: String,
     pub mappings: Vec<PathMapping>,
+    /// Roblox class name for every declared project tree node keyed by
+    /// instance path, including ancestor nodes without a direct `$path`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_classes: BTreeMap<String, String>,
     /// Glob patterns for paths to exclude from the snapshot (Rojo-compatible).
     #[serde(default)]
     pub glob_ignore_paths: Vec<String>,
@@ -205,6 +209,7 @@ fn parse_project_str(content: &str, source_path: &Path) -> Result<ProjectTree> {
         .with_context(|| format!("failed to parse project json {}", source_path.display()))?;
 
     let mut mappings = Vec::new();
+    let mut node_classes = BTreeMap::new();
     let root_class = raw
         .tree
         .class_name
@@ -233,15 +238,17 @@ fn parse_project_str(content: &str, source_path: &Path) -> Result<ProjectTree> {
             &child_name.clone(),
             root_ignore,
             &mut mappings,
+            &mut node_classes,
         );
     }
 
-    let project_id = resolve_project_id(&raw, source_path, &mappings);
+    let project_id = resolve_project_id(&raw, source_path, &mappings, &node_classes);
 
     Ok(ProjectTree {
         name: raw.name,
         project_id,
         mappings,
+        node_classes,
         glob_ignore_paths: raw.glob_ignore_paths,
         emit_legacy_scripts: raw.emit_legacy_scripts,
         serve_port: raw.serve_port,
@@ -292,7 +299,12 @@ fn parse_project_str(content: &str, source_path: &Path) -> Result<ProjectTree> {
     })
 }
 
-fn resolve_project_id(raw: &RawProject, source_path: &Path, mappings: &[PathMapping]) -> String {
+fn resolve_project_id(
+    raw: &RawProject,
+    source_path: &Path,
+    mappings: &[PathMapping],
+    node_classes: &BTreeMap<String, String>,
+) -> String {
     let explicit = raw
         .project_id
         .as_deref()
@@ -329,6 +341,12 @@ fn resolve_project_id(raw: &RawProject, source_path: &Path, mappings: &[PathMapp
         hasher.update(if mapping.ignore_unknown { b"1" } else { b"0" });
         hasher.update(b"\0");
     }
+    for (instance_path, class_name) in node_classes {
+        hasher.update(instance_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(class_name.as_bytes());
+        hasher.update(b"\0");
+    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -338,6 +356,7 @@ fn walk_tree_node(
     instance_path: &str,
     parent_ignore: bool,
     mappings: &mut Vec<PathMapping>,
+    node_classes: &mut BTreeMap<String, String>,
 ) {
     let Some(obj) = value.as_object() else {
         return;
@@ -348,6 +367,8 @@ fn walk_tree_node(
         .and_then(|v| v.as_str())
         .unwrap_or(node_name)
         .to_string();
+
+    node_classes.insert(instance_path.to_string(), class_name.clone());
 
     let ignore_unknown = obj
         .get("$ignoreUnknownInstances")
@@ -389,6 +410,7 @@ fn walk_tree_node(
             &child_instance_path,
             ignore_unknown,
             mappings,
+            node_classes,
         );
     }
 }
@@ -1028,6 +1050,34 @@ mod tests {
             &PathBuf::from("b/default.project.json"),
         )
         .unwrap();
+        assert_ne!(left.project_id, right.project_id);
+    }
+
+    #[test]
+    fn derived_project_id_changes_with_node_class_only_changes() {
+        let module_project = r#"{
+            "name": "class-drift",
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "$className": "Folder",
+                    "Server": { "$path": "src/Server" }
+                }
+            }
+        }"#;
+        let service_project = r#"{
+            "name": "class-drift",
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "$className": "ServerScriptService",
+                    "Server": { "$path": "src/Server" }
+                }
+            }
+        }"#;
+        let path = PathBuf::from("class-drift.project.json");
+        let left = parse_project_str(module_project, &path).unwrap();
+        let right = parse_project_str(service_project, &path).unwrap();
         assert_ne!(left.project_id, right.project_id);
     }
 

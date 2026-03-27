@@ -1,5 +1,12 @@
 # Build
 target/
+**/target/
+out/
+**/out/
+dist/
+**/dist/
+build/
+**/build/
 benchmark-results/
 
 # Editor files
@@ -16,6 +23,22 @@ benchmark-results/
 .env
 .env.local
 .env.*.local
+.venv/
+**/.venv/
+node_modules/
+**/node_modules/
+coverage/
+**/coverage/
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+**/.mypy_cache/
+.ruff_cache/
+**/.ruff_cache/
+.next/
+**/.next/
+.turbo/
+**/.turbo/
 
 # OS files
 .DS_Store

@@ -394,6 +394,7 @@ mod tests {
         let tree = ProjectTree {
             name: "test-project".to_string(),
             project_id: "test-project".to_string(),
+            node_classes: BTreeMap::new(),
             glob_ignore_paths: vec![],
             emit_legacy_scripts: true,
             serve_port: None,
@@ -520,6 +521,7 @@ mod tests {
         let tree = ProjectTree {
             name: "test".to_string(),
             project_id: "test".to_string(),
+            node_classes: BTreeMap::new(),
             glob_ignore_paths: vec![],
             emit_legacy_scripts: true,
             serve_port: None,
@@ -583,6 +585,7 @@ mod tests {
         let tree = ProjectTree {
             name: "test".to_string(),
             project_id: "test".to_string(),
+            node_classes: BTreeMap::new(),
             glob_ignore_paths: vec![],
             emit_legacy_scripts: true,
             serve_port: None,
