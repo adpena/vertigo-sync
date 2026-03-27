@@ -4282,6 +4282,22 @@ mod tests {
     }
 
     #[test]
+    fn plugin_source_module_distinguishes_cancelled_preview_results_from_completed_rebuilds() {
+        let source = std::fs::read_to_string("assets/plugin_src/00_main.lua")
+            .expect("plugin source module should be readable");
+        assert!(
+            source.contains("VertigoPreviewLastBuildStatus")
+                && source.contains("explicitStatus == \"completed\" or explicitStatus == \"cancelled\" or explicitStatus == \"deferred\""),
+            "plugin source module should classify explicit builder result statuses before reporting preview outcomes"
+        );
+        assert!(
+            source.contains("Preview rebuilt (%s) in %d ms (mode=%s)")
+                && source.contains("Preview rebuild %s (%s) in %d ms (mode=%s)"),
+            "plugin source module should log cancelled or deferred preview outcomes without claiming a successful rebuild"
+        );
+    }
+
+    #[test]
     fn embedded_plugin_filters_non_geometry_edit_preview_source_churn() {
         assert!(
             PLUGIN_SOURCE.contains("function Runtime.isEditPreviewGeometryAffectingInstance"),
@@ -4335,6 +4351,22 @@ mod tests {
         assert!(
             PLUGIN_SOURCE.contains("PROJECT.editPreview.initialBuildQueued = false"),
             "embedded plugin should re-arm the bootstrap preview build after the RunAll suite guard clears"
+        );
+    }
+
+    #[test]
+    fn embedded_plugin_distinguishes_cancelled_preview_results_from_completed_rebuilds() {
+        assert!(
+            PLUGIN_SOURCE.contains("VertigoPreviewLastBuildStatus")
+                && PLUGIN_SOURCE.contains(
+                    "explicitStatus == \"completed\" or explicitStatus == \"cancelled\" or explicitStatus == \"deferred\""
+                ),
+            "embedded plugin should classify explicit builder result statuses before reporting preview outcomes"
+        );
+        assert!(
+            PLUGIN_SOURCE.contains("Preview rebuilt (%s) in %d ms (mode=%s)")
+                && PLUGIN_SOURCE.contains("Preview rebuild %s (%s) in %d ms (mode=%s)"),
+            "embedded plugin should log cancelled or deferred preview outcomes without claiming a successful rebuild"
         );
     }
 

@@ -2248,14 +2248,27 @@ function Runtime.runEditPreviewBuild(reason: string)
 	local elapsedMs = math.floor((os.clock() - startedAt) * 1000 + 0.5)
 
 	if ok then
+		local buildStatus = "completed"
+		if type(resultOrErr) == "table" then
+			local explicitStatus = (resultOrErr :: any).status
+			if explicitStatus == "completed" or explicitStatus == "cancelled" or explicitStatus == "deferred" then
+				buildStatus = explicitStatus
+			end
+		end
 		editPreview.consecutiveFailures = 0
 		Workspace:SetAttribute("VertigoPreviewLastBuildError", "")
-		Workspace:SetAttribute("VertigoPreviewLastBuildDurationMs", elapsedMs)
-		Workspace:SetAttribute("VertigoPreviewLastBuildEpoch", os.time())
-		Workspace:SetAttribute("VertigoPreviewLastBuildReason", reason)
-		info(string.format("Preview rebuilt (%s) in %d ms (mode=%s)", reason, elapsedMs, describeStudioMode()))
+		Workspace:SetAttribute("VertigoPreviewLastBuildStatus", buildStatus)
+		if buildStatus == "completed" then
+			Workspace:SetAttribute("VertigoPreviewLastBuildDurationMs", elapsedMs)
+			Workspace:SetAttribute("VertigoPreviewLastBuildEpoch", os.time())
+			Workspace:SetAttribute("VertigoPreviewLastBuildReason", reason)
+			info(string.format("Preview rebuilt (%s) in %d ms (mode=%s)", reason, elapsedMs, describeStudioMode()))
+		else
+			info(string.format("Preview rebuild %s (%s) in %d ms (mode=%s)", buildStatus, reason, elapsedMs, describeStudioMode()))
+		end
 	else
 		editPreview.consecutiveFailures += 1
+		Workspace:SetAttribute("VertigoPreviewLastBuildStatus", "failed")
 		Workspace:SetAttribute("VertigoPreviewLastBuildError", tostring(resultOrErr))
 		warnMsg(string.format(
 			"Preview rebuild failed (%s) mode=%s failure=%d: %s",
